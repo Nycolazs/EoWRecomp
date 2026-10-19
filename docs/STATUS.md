@@ -1,6 +1,6 @@
 # Status
 
-Atualizado: 2026-10-19 (sessão 1).
+Atualizado: 2026-10-19 (sessão 2).
 
 ## Jogo fixado (único build suportado)
 
@@ -26,36 +26,48 @@ Build IDs dos módulos (endereços de patches/HLE valem só para estes):
 
 RomFS: 10 963 arquivos, 8 032 371 686 bytes (todos com magic válido: FRES, BNTX, MsgS, FSTM, SARC, FSHA, webm…).
 
-## Marco atual: M4 alcançado (Linux / Vulkan); M5 em andamento
+## Marco atual: M4 concluído, M5 parcial (Linux / Vulkan)
 
-Comprovado por screenshot (`EOWRECOMP_SHOT_AT`, `build/frames/`): o jogo inicializa, carrega, toca a abertura
-(masmorra do prólogo: Link, moblins, tochas, piso texturizado) e renderiza corretamente no Vulkan (Intel Iris Xe,
-Mesa ANV). Backend testado: **Vulkan no Linux**. Metal não foi tocado nem testado.
+Comprovado por screenshot (`EOWRECOMP_SHOT_AT`, capturas em `docs/screenshots/`): o jogo inicializa, toca a abertura
+(masmorra do prólogo, Link e os moblins), entra na **primeira cena controlável** (HUD com corações e itens) e
+**responde a input** (input roteirizado `EOWRECOMP_INPUT`: Link anda pelo corredor, entra na sala; prompts
+"Swing sword", "Place / Toss" aparecem). Execução de 330 s / 2.819 frames sem travar. Backend testado: **Vulkan no
+Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
 
 ### Funciona
-- M1: geração dos 4 módulos sem `Unsupported`; lifter com LDXP/STXP, CAS/CASP, LSE (testado contra Unicorn).
-- M2/M3: boot pelo `nn::init::Start` do SDK 16.2, serviços (sm via TIPC, fs, acc, hid, am, time, audren REV11),
-  primeiro `nvnQueuePresentTexture`, threads, áudio (renderer abre; mixes/efeitos aceitos pelo SDK).
-- M4: imagem correta da cena de abertura.
+- M1: geração dos 4 módulos sem `Unsupported` (296 mil funções); lifter com LDXP/STXP, CAS/CASP, LSE (testado contra
+  Unicorn); jump tables resolvidas também em funções divididas.
+- M2/M3: boot pelo `nn::init::Start` do SDK 16.2 (3 callbacks), sm via TIPC, fs (RomFS original), acc, hid, am, time,
+  audren REV11 (abre e é aceito pelo SDK), threads, mutex/condvar com a semântica do Horizon.
+- M4: imagem correta da abertura. M5 (parcial): primeira cena jogável com input.
+
+### Corrigido nesta sessão (cada um com a causa achada no código do jogo / SDK)
+- Z-cull com tamanho 0; NVNsamplerBuilder maior que os 0x40 bytes que o jogo reserva (sobrescrevia a pilha);
+  memória de comandos NVN (sombra 8x); revisão REV11 do áudio (status de efeito 0x90); `VFormatString` (jump table
+  em função dividida); cabeçalho de 0x100 bytes dos compute shaders do NVN novo; tradutor Maxwell: BFE.BREV,
+  HSETP2/HSET2 imediatos, VOTE, RED, LEA.HI, FLO.SH/.INV (o FLO errado fazia o laço de luzes rodar demais);
+  laços estruturados nos shaders; timeout do `WaitProcessWideKeyAtomic` não readquire o mutex (travava a thread
+  principal após ~1.200 frames).
 
 ### Problemas abertos (por prioridade)
-1. **Desempenho de GPU**: ~7–12 fps na abertura numa Iris Xe; um único material (fs `72ee66f300`, com laço)
-   custa ~87 ms de 126 ms por frame. Causa: a máquina de estados `for { switch (pc) }` dos shaders com laço
-   (registradores vivos na aresta de volta → spill). Próximo passo: estruturar laços (PBK/BRK/BRA para trás →
-   `do { } while (true)`) no `maxwell/translate.c`. Shaders só com desvios para frente já saem sem o laço.
-2. **Estabilidade**: houve travamentos (~frame 1600–1900) e um `vkWaitSemaphores: device lost` numa execução
-   com um shader pulado. A investigar depois do item 1 (frames muito longos podem disparar o watchdog da GPU).
-3. Dois compute shaders ainda não traduzem (RED com min/max assinado; `SUST` `eb20…`): 128 dispatches pulados.
-4. Input e áudio ainda não verificados a ouvido/jogando; save ainda não testado (diretório monta).
+1. **Desempenho de GPU**: ~9–12 fps na abertura numa Iris Xe. O material mais caro (fs `72ee66f300`, laço de
+   luzes) ainda domina o passe principal; medir de novo sem outra carga na máquina (as últimas medidas tiveram a
+   compilação do Windows em paralelo). Ferramentas: `EOWRECOMP_VK_PROF=1`, `EOWRECOMP_GPUPROF_AT=<frame>`,
+   `EOWRECOMP_SKIP_FSHASH=<hash>`, `EOWRECOMP_SHADER_GUARD=<n>`, `EOWRECOMP_SAVE_MSL=1` (GLSL em `build/glsl/`).
+2. **Artefato**: faixa escura vertical do topo da tela até o Link na abertura. Próximo passo: `EOWRECOMP_DEBUG_FRAME`
+   (imagens por passe) para achar o draw.
+3. Dois compute shaders sem tradução (RED com min/max assinado; `SUST` `eb20…`): 128 dispatches pulados.
+4. Áudio não verificado a ouvido; save não testado (o diretório monta).
+5. **Windows**: o `.exe` cruzado linka (7 exports para a DLL do jogo); a compilação da `eowgame.dll` foi
+   interrompida a pedido do usuário em 44%. Rodar `tools/windows/build.sh all` de novo (só recompila o que falta) e
+   testar no Windows.
 
 ### Como testar (Linux)
-- `tools/run.sh` (SECS=60; janela oculta; `SHOW=1` mostra) — log em `build/run.log`, pilha do jogo resolvida.
-- Screenshots: `EOWRECOMP_SHOT_AT=300,600,900` (imagem do jogo) → `build/frames/`.
-- Desempenho: `EOWRECOMP_VK_PROF=1` (tempo de CPU/GPU na linha de fps), `EOWRECOMP_GPUPROF_AT=<frame>` (GPU por passe).
-
-### Windows
-- `tools/windows/build.sh all` gera `build/win/dist/EoWRecomp/` (exe + `eowgame.dll` + DLLs). Ainda não executado
-  no Windows: é o próximo teste do usuário (ver instruções no relatório da sessão).
+- `tools/run.sh` (SECS=60; janela oculta; `SHOW=1` mostra) — log em `build/run.log`, pilha do jogo resolvida
+  (`tools/symgame.py`).
+- Screenshots: `EOWRECOMP_SHOT_AT=300,600,900` → `build/frames/`. Input roteirizado:
+  `EOWRECOMP_INPUT="1550:STICK_UP:150,1820:A:10"` (frame:botão:duração).
+- Travamentos: rodar dentro do `gdb` e mandar `SIGINT` (o `ptrace_scope` impede anexar depois).
 
 ### Como compilar (Linux, sem sudo)
 1. `tools/venv` (Python: capstone, unicorn, lz4, cryptography, pillow).

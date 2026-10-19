@@ -9,7 +9,10 @@ estado atual e próximo passo: `docs/STATUS.md` (leia antes de começar).
 - **Nenhum arquivo da Nintendo entra no repositório**: nada de `extracted/`, `generated/`, chaves, XCI/NSP/NCA/NSO,
   fontes do sistema, texturas, modelos, música, texto ou qualquer asset — nem "um arquivo só para teste".
   O `.gitignore` cobre isso; confira com `git status --ignored` antes de cada commit.
-- Os arquivos do usuário ficam em `/home/nycolas/Downloads/data` (sempre entre aspas: o nome tem espaços).
+  Exceção: capturas de tela do jogo rodando (`docs/screenshots/`, JPEG) para documentar o progresso, como faz o
+  LASRecomp — nunca arquivos extraídos.
+- Os arquivos do usuário (XCI, `prod.keys`) ficam numa pasta própria, fora do repositório (o caminho local está na
+  memória do agente, não aqui).
   **Só leitura.** Nunca copiar o XCI nem as chaves para dentro do repo. Não pedir, procurar nem sugerir fontes
   para esses arquivos.
 - Extração: `tools/nca_extract.py` (o hactool não lê o RomFS comprimido deste NCA) para `extracted/`

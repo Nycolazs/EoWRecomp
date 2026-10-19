@@ -34,6 +34,11 @@ generated-*/
 *.zs
 # ---- build output, caches, saves and settings
 build/
+*.o
+*.so
+*.dll
+*.exe
+*.dylib
 /cache/
 save/
 /eowrecomp.ini
