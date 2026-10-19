@@ -654,6 +654,8 @@ NVN(nvnQueueAcquireTexture) {
 NVN(nvnQueuePresentTexture) {
     NvnWindow *w = HOST(NvnWindow, A(1));
     int i = (int)A(2);
+    static int first = 1;  // (milestone marker: the game got as far as showing a frame)
+    if (first) { first = 0; LOG("[nvn] first nvnQueuePresentTexture (window %llx, texture %d of %d)\n", A(1), i, w->num); }
     if (i >= 0 && i < w->num) backend_present(HOST(NvnTexture, w->textures[i]));
 }
 

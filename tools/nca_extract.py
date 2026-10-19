@@ -1,6 +1,6 @@
 """Extract ExeFS and RomFS from a program NCA (NCA3), including compressed sections.
 
-Usage: nca_extract.py <prod.keys> <program.nca> <outdir> [--no-romfs] [--info]
+Usage: nca_extract.py <prod.keys> <program.nca> <outdir> [--no-romfs] [--romfs-image] [--info]
 
 hactool (SciresM) can't read this game's program NCA: its RomFS section is stored through the BucketTree
 compression layer (LZ4 blocks, firmware 12+), and hactool aborts on it before writing even the ExeFS. Layout as in
@@ -8,7 +8,9 @@ Atmosphere's fssystem (NcaFileSystemDriver, CompressedStorage, BucketTree) and S
   AES-CTR decrypted section -> IVFC / SHA-256 hash layers -> CompressedStorage -> RomFS / PFS0.
 The compression layer sits on top of the integrity layer: its table offset and its physical offsets are relative to
 the hash layers' data region, and its virtual space is the file system itself.
-Hashes are not verified. Writes <outdir>/exefs/<files> and <outdir>/romfs/<tree>.
+Hashes are not verified. Writes <outdir>/exefs/<files> and <outdir>/romfs/<tree>; --romfs-image also writes the
+RomFS image itself as <outdir>/romfs.bin (what runtime/services/fs.c serves the game: the original image, byte for
+byte, instead of one rebuilt from the tree).
 """
 import argparse
 import os
@@ -244,6 +246,7 @@ def main():
     ap.add_argument('outdir')
     ap.add_argument('--no-romfs', action='store_true')
     ap.add_argument('--info', action='store_true')
+    ap.add_argument('--romfs-image', action='store_true')
     a = ap.parse_args()
     nca = Nca(a.nca, load_keys(a.keys))
     print(f'title {nca.title_id:016x}  content type {nca.content_type}  sdk {nca.sdk >> 24}.{(nca.sdk >> 16) & 0xFF}.'
@@ -266,6 +269,14 @@ def main():
             print(f'  romfs compression table: {len(v.comp.entries)} entries')
         n, total = extract_romfs(v, 0, os.path.join(a.outdir, 'romfs'))
         print(f'  romfs: {n} files, {total} bytes')
+    if a.romfs_image:
+        rom = nca.sections[1]
+        v = View(rom)
+        size = v.comp.end if v.comp else data_region(rom)[1]
+        with open(os.path.join(a.outdir, 'romfs.bin'), 'wb') as f:
+            for off in range(0, size, 64 << 20):
+                f.write(v.read(off, min(64 << 20, size - off)))
+        print(f'  romfs.bin: {size} bytes')
 
 
 if __name__ == '__main__':

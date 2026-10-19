@@ -755,6 +755,12 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         case 16: case 17: v = 0; break;
         case 18: v = 0x01008CF01BAAC000ull; break;  // program id: Echoes of Wisdom
         case 20: v = 0; break;
+        // (Switchbrew SVC GetInfo: types newer SDKs may ask for)
+        case 23: v = 1; break;            // IsApplication
+        case 24: v = 0x100; break;        // FreeThreadCount (plenty: threads are host threads)
+        case 25: v = rt_ticks(); break;   // ThreadTickCount (an upper bound: the time since boot)
+        case 26: v = 1; break;            // IsSvcPermitted
+        case 28: v = 0; break;            // AliasRegionExtraSize (firmware 18+)
         default: r = R_INVALID_ENUM; LOG("[kernel] GetInfo unknown id %u/%llu\n", id0, x[3]);
         }
         x[0] = r;

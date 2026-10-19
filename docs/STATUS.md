@@ -26,26 +26,33 @@ Build IDs dos módulos (endereços de patches/HLE valem só para estes):
 
 RomFS: 10 963 arquivos, 8 032 371 686 bytes (todos com magic válido: FRES, BNTX, MsgS, FSTM, SARC, FSHA, webm…).
 
-## Marco atual: M0 — base montada (antes do M1)
+## Marco atual: M1 concluído, M2 em andamento
 
-Feito:
-- LASRecomp (`d23597d`) copiado como base, licença MIT e crédito mantidos; partes do LA removidas (randomizer,
-  `third_party/LAS-Randomizer`, `tools/rando`, HLE de gameplay, abas de randomizer/warp/save editor, texpatch,
-  imagens e ícone do LAS); renomeado (`eowrecomp`, `eowgame`, `eowgen`, prefixo `EOWRECOMP_`, `eowrecomp.ini`);
-  `tools/patches.py` zerado (só o mecanismo com `expect()`); verificador de updates desativado; `GetInfo` com o
-  title ID do EoW.
-- Extração: XCI → NCAs com hactool (compilado do fonte); ExeFS/RomFS com `tools/nca_extract.py` (novo — o
-  hactool não lê o RomFS comprimido). Arquivos em `extracted/{exefs,romfs,nca,meta,control}` (ignorados pelo git).
-- `tools/venv` com capstone 5.0.9, unicorn 2.1.4, lz4 4.4.5, cryptography.
+### M1 — comprovado
+- `make gen` gera C para os 4 módulos (`main`, `subsdk0` glslc, `subsdk1` multimedia, `sdk`) **sem nenhum
+  `Unsupported`**: 296 mil funções, 84 s. Medido com `tools/inventory.py --lift` e o log do gerador.
+- Lifter: pares exclusivos (LDXP/STXP), CAS/CASP e atômicos LSE implementados; `tools/test_lift.py` contra o
+  Unicorn: 127 codificações novas + 3000 aleatórias por módulo, 0 falhas.
+- Jump tables: corrigida a divisão de funções nas bases de tabela (main: 963 resolvidas, eram 71).
 
-Não funciona / pendente:
-- **O runtime não compila ainda**: ainda há referências em C ao que foi removido (rando, warp, texpatch, abas do
-  menu) e a máquina Linux não tem clang/lld/SDL3/Vulkan/shaderc instalados. Corte dessas referências: no M2, com
-  compilador para validar.
-- `docs/linux.md` e `docs/BUILD-windows.md` são do LAS (só renomeados); revisar quando o build existir.
-- Nada foi commitado (aguardando aprovação).
+### M2 — estado
+- O runtime compila e linka no Linux (`build/eowrecomp`) e no Windows por cross-compilação
+  (`tools/windows/build.sh` → `build/win/dist/EoWRecomp/eowrecomp.exe`). Nenhum dos dois foi executado ainda.
+- Boot adaptado ao SDK 16.2: `nn::init::Start` com 3 callbacks; `sm:` via TIPC; `GetInfo` com os tipos novos.
+- Em andamento: compilação da biblioteca do jogo (`build/eowgame.so`, ~900 MB de C, ~1 h em 12 núcleos).
+- Próximo: rodar `tools/run.sh` (janela oculta) e seguir os logs de SVC/serviços até o primeiro
+  `nvnQueuePresentTexture` (marcado no log como `[nvn] first nvnQueuePresentTexture`).
 
-## Próximo passo: M1
-1. Inventário medido → `docs/GAP.md` (módulos, símbolos, imports por origem, NVN, serviços IPC, SVCs).
-2. `gen.py` para os 4 módulos (bases novas: `main` não cabe antes de `0x7004000000`), lifter com `LDXP/STXP`
-   e LSE; meta: zero `Unsupported` ou lista justificada.
+### Como compilar (Linux, sem sudo)
+1. `tools/venv` (Python) e `build/zig-full` (zig 0.17.0, hash conferido; clang 22 + lld).
+2. Dependências: `apt-get download` dos pacotes -dev (SDL3, Vulkan, shaderc, FFmpeg, VMA) extraídos em
+   `build/sysroot`, e o prefixo `build/deps-linux` (ver o histórico da sessão 2 em git log).
+3. `PATH=$PWD/build/bin:$PATH make -j12 DEPS=$PWD/build/deps-linux GENARCH=-mcpu=x86_64_v3`
+   (`build/bin/clang` e `clang++` são wrappers de `zig cc` / `zig c++`).
+4. `tools/run.sh` (SECS=30, SHOW=1 para ver a janela).
+
+### Pendências conhecidas
+- `docs/linux.md` / `docs/BUILD-windows.md` ainda são do LAS.
+- Jump tables: funções com tabela ainda levam o fallback "todas as instruções" (correto, porém pesado);
+  otimizar depois de haver profiling.
+- Widescreen, ícones de botão, menu sem abas específicas do EoW: M7.
