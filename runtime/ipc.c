@@ -83,6 +83,38 @@ static uint64_t buf_addr(const uint32_t *w) {
     return w[1] | ((uint64_t)(w[2] >> 28) << 32) | ((uint64_t)((w[2] >> 2) & 7) << 36);
 }
 
+// TIPC (the "tiny IPC" Horizon 12 added; SDK 12+ talks to sm: with it): the message type is 16 + the command id,
+// 15 closes the session; the raw data words follow the header directly (no SFCI / SFCO header, no padding, no
+// domains). The reply: result in the first raw word, then the output data; handles in the special header.
+static int tipc_request(Cpu *c, KSession *sess, uint32_t handle, IpcReq *req, uint32_t *raw, uint32_t raw_words) {
+    uint32_t *msg = (uint32_t *)(uintptr_t)c->tpidrro;
+    if (req->type == 15) {
+        LOG("[ipc] close session %s (handle %x, tipc)\n", sess->svc->name, handle);
+        service_release(sess->svc);
+        return 0;
+    }
+    IpcResp resp = {0};
+    req->cmd = req->type - 16;
+    req->data = (const uint8_t *)raw;
+    req->data_size = raw_words * 4;
+    sess->svc->handler(sess->svc, req, &resp);
+    for (int i = 0; i < resp.nobjects; i++) resp.move_handles[resp.nmove++] = session_new(resp.objects[i]);
+    memset(msg, 0, 0x100);
+    uint32_t data_words = 1 + (resp.data_size + 3) / 4;
+    int has_handles = resp.ncopy || resp.nmove;
+    msg[0] = req->type;
+    msg[1] = data_words | (has_handles ? 0x80000000u : 0);
+    uint32_t *q = msg + 2;
+    if (has_handles) {
+        *q++ = (resp.ncopy << 1) | (resp.nmove << 5);
+        for (int i = 0; i < resp.ncopy; i++) *q++ = resp.copy_handles[i];
+        for (int i = 0; i < resp.nmove; i++) *q++ = resp.move_handles[i];
+    }
+    q[0] = resp.result;
+    memcpy(q + 1, resp.data, resp.data_size);
+    return 0;
+}
+
 int ipc_handle_request(Cpu *c, uint32_t handle) {
     KObject *o = handle_get(handle);
     if (!o || o->type != KOBJ_SESSION) {
@@ -134,6 +166,7 @@ int ipc_handle_request(Cpu *c, uint32_t handle) {
         req.nc = ncd;
     }
 
+    if (req.type >= 15) return tipc_request(c, sess, handle, &req, raw, raw_words);
     if (req.type == 2) {  // close
         LOG("[ipc] close session %s (handle %x)\n", sess->svc->name, handle);
         if (!sess->domain) service_release(sess->svc);  // (a domain's objects stay: closed one by one)

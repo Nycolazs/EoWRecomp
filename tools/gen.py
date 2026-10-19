@@ -450,6 +450,23 @@ class Module:
 from patches import PATCHES
 
 
+def adr_feeds_br(m, i, rd, window=6):
+    """ADR whose register reaches a `br` within a few instructions: the base of a compact jump table's cases
+    (LLVM: adr xB, cases ; ldrb/ldrh wO, [table, idx] ; add xB, xB, xO, lsl #2 ; br xB), code inside the same
+    function - not a callback. Treating it as a function start split the function at its cases, so its table
+    couldn't be resolved (main: 71 tables resolved, 1832 left to the all-instruction fallback)."""
+    regs = {rd}
+    for k in range(i + 1, min(i + 1 + window, len(m.words))):
+        w = m.words[k]
+        if (w & 0xFFFFFC1F) == 0xD61F0000:  # br xN
+            return ((w >> 5) & 31) in regs
+        if (w & 0x7F200000) == 0x0B000000 and ((w >> 5) & 31) in regs:  # add (shifted register) from a tracked reg
+            regs.add(w & 31)
+        elif (w & 31) in regs and (w & 0x7F200000) != 0x0B000000:
+            regs.discard(w & 31)  # (overwritten by something else)
+    return False
+
+
 def write_if_changed(path, text):
     """Leaves unchanged chunks untouched so make only recompiles what a patch affected."""
     try:
@@ -504,7 +521,7 @@ def main():
             imm = ((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)
             if imm & (1 << 20):
                 imm -= 1 << 21
-            if m.in_text(pc + imm):
+            if m.in_text(pc + imm) and not adr_feeds_br(m, i, w & 31):
                 start_set.add(pc + imm)
         elif (w & 0x9F000000) == 0x90000000:  # ADRP
             imm = ((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)

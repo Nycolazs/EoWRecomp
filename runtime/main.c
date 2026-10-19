@@ -20,8 +20,9 @@ static void run_array(Cpu *c, uint64_t arr, uint64_t size) {
     }
 }
 
-// nn::init::Start calls x2 right after nnosInitialize and x3 after nninitStartup, just before
-// nnMain: SDK constructors run early, the game's run once nninitStartup has set up its heap.
+// nn::init::Start (SDK 16.2: Start(ulong, ulong, init_sdk, init, fini)) runs _init_libc0, nnosInitialize, x2,
+// _init_libc1, nninitInitializeSdkModule, nninitStartup, _init_libc2, x3, nnMain, x4, nninitFinalizeSdkModule,
+// nnosQuickExit: SDK constructors run early, the other modules' once nninitStartup has set up the game's heap.
 // rtld runs a module's DT_INIT, which registers it (and its TLS template) with musl via
 // __nnmusl_init_dso and then runs its init_array; fall back to the array if there is no DT_INIT.
 static void module_init(Cpu *c, Module *m) {
@@ -36,6 +37,8 @@ static void rtld_init_main(Cpu *c) {
     for (int i = g_nmodules - 1; i >= 0; i--)
         if (strcmp(g_modules[i].name, "sdk")) module_init(c, &g_modules[i]);
 }
+// After nnMain returns: the game is quitting (nnosQuickExit follows); destructors aren't worth running.
+static void rtld_fini(Cpu *c) { (void)c; LOG("nnMain returned\n"); }
 
 // Claim the guest address range before anything else can map there. The host allocator places
 // regions at random addresses in the same window; on a collision, re-exec for a fresh layout.
@@ -148,12 +151,13 @@ static void boot(const char *root) {
     }
     LOG("main thread: prio %d, stack 0x%x\n", prio, stack_size);
 
-    uint64_t start = loader_find_symbol("_ZN2nn4init5StartEmmPFvvES2_");
+    uint64_t start = loader_find_symbol("_ZN2nn4init5StartEmmPFvvES2_S2_");
     if (!start) FATAL("nn::init::Start not found\n");
     uint64_t init_fn = hle_register("<rtld_init_sdk>", rtld_init_sdk);
-    uint64_t fini_fn = hle_register("<rtld_init_main>", rtld_init_main);
+    uint64_t main_fn = hle_register("<rtld_init_main>", rtld_init_main);
+    uint64_t fini_fn = hle_register("<rtld_fini>", rtld_fini);
     KThread *t = kernel_create_main_thread(start, stack_size, prio);
-    kernel_run_main(t, t->handle, 0, init_fn, fini_fn);  // nn::init::Start(thread_handle, args_region, init, fini)
+    kernel_run_main(t, t->handle, 0, init_fn, main_fn, fini_fn);  // nn::init::Start(thread, args, init_sdk, init, fini)
 }
 
 int main(int argc, char **argv) {

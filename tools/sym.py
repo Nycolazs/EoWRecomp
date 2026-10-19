@@ -7,7 +7,12 @@ import sys
 import capstone
 from nso import Nso
 
-MODS = [('main', 0x7000000000), ('sdk', 0x7004000000)]
+import os
+import re
+
+# the game's modules and their bases, from runtime/modules.h
+_MH = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'runtime', 'modules.h')).read()
+MODS = [(m, int(b, 16)) for m, b in re.findall(r'X\((\w+), (0x[0-9A-Fa-f]+)ull\)', _MH)]
 _cache = {}
 
 
