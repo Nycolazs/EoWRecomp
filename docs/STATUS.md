@@ -44,9 +44,9 @@ RomFS: 10 963 arquivos, 8 032 371 686 bytes (todos com magic válido: FRES, BNTX
   `nvnQueuePresentTexture` (marcado no log como `[nvn] first nvnQueuePresentTexture`).
 
 ### Como compilar (Linux, sem sudo)
-1. `tools/venv` (Python) e `build/zig-full` (zig 0.17.0, hash conferido; clang 22 + lld).
-2. Dependências: `apt-get download` dos pacotes -dev (SDL3, Vulkan, shaderc, FFmpeg, VMA) extraídos em
-   `build/sysroot`, e o prefixo `build/deps-linux` (ver o histórico da sessão 2 em git log).
+1. `tools/venv` (Python: capstone, unicorn, lz4, cryptography).
+2. `tools/linux/dev_deps.sh`: zig 0.17.0 (clang 22 + lld, hash conferido) e os pacotes -dev (SDL3, Vulkan, shaderc,
+   FFmpeg, VMA) via `apt-get download`, sem instalar nada no sistema.
 3. `PATH=$PWD/build/bin:$PATH make -j12 DEPS=$PWD/build/deps-linux GENARCH=-mcpu=x86_64_v3`
    (`build/bin/clang` e `clang++` são wrappers de `zig cc` / `zig c++`).
 4. `tools/run.sh` (SECS=30, SHOW=1 para ver a janela).
