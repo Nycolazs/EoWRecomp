@@ -16,7 +16,8 @@ typedef struct __attribute__((aligned(16))) Cpu {
     void *thread;            // 312: runtime thread object
     uint64_t fpcr;           // 320: guest FPCR/FPSR (portable FP/SIMD lowering only; the asm path uses the host's)
     uint64_t fpsr;           // 328
-    uint8_t _pad[512 - 336];
+    uint64_t excl_hi;        // 336: upper half of an exclusive pair (LDXP)
+    uint8_t _pad[512 - 344];
     __uint128_t v[32];       // 512
 } Cpu;
 
@@ -25,6 +26,7 @@ _Static_assert(offsetof(Cpu, pc) == 264, "pc");
 _Static_assert(offsetof(Cpu, nzcv) == 272, "nzcv");
 _Static_assert(offsetof(Cpu, fpcr) == 320, "fpcr");
 _Static_assert(offsetof(Cpu, fpsr) == 328, "fpsr");
+_Static_assert(offsetof(Cpu, excl_hi) == 336, "excl_hi");
 _Static_assert(offsetof(Cpu, v) == 512, "v");
 
 typedef void (*GuestFn)(Cpu *);
@@ -95,6 +97,71 @@ EXCL(8, uint8_t)
 EXCL(16, uint16_t)
 EXCL(32, uint32_t)
 EXCL(64, uint64_t)
+
+// 128-bit exclusive pair (LDXP / STXP of two X registers): the monitor holds both halves, the store is one 16-byte
+// compare-and-swap (cmpxchg16b on x86-64: x86-64-v2 and up; LDXP itself needs 16-byte alignment on the Switch).
+typedef unsigned __int128 u128;
+static inline void ldxp64(Cpu *c, uint64_t a, uint64_t *lo, uint64_t *hi) {
+    u128 v = __atomic_load_n((u128 *)(uintptr_t)a, __ATOMIC_ACQUIRE);
+    c->excl_addr = a;
+    c->excl_val = *lo = (uint64_t)v;
+    c->excl_hi = *hi = (uint64_t)(v >> 64);
+}
+static inline uint32_t stxp64(Cpu *c, uint64_t a, uint64_t lo, uint64_t hi) {
+    if (c->excl_addr != a) return 1;
+    c->excl_addr = ~0ull;
+    u128 expected = ((u128)c->excl_hi << 64) | c->excl_val;
+    return !__atomic_compare_exchange_n((u128 *)(uintptr_t)a, &expected, ((u128)hi << 64) | lo, 0, __ATOMIC_SEQ_CST,
+                                        __ATOMIC_SEQ_CST);
+}
+
+// ---- ARMv8.1 LSE (the SDK's outline atomics): CAS / CASP return the old value; LD<op> / SWP return the old value
+#define LSE_IMPL(N, T, S)                                                                                         \
+    static inline uint64_t cas##N(uint64_t a, uint64_t expect, uint64_t v) {                                     \
+        T e = (T)expect;                                                                                          \
+        __atomic_compare_exchange_n((T *)(uintptr_t)a, &e, (T)v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);         \
+        return e;                                                                                                 \
+    }                                                                                                             \
+    static inline uint64_t ldadd##N(uint64_t a, uint64_t v) { return __atomic_fetch_add((T *)(uintptr_t)a, (T)v, __ATOMIC_SEQ_CST); } \
+    static inline uint64_t ldclr##N(uint64_t a, uint64_t v) { return __atomic_fetch_and((T *)(uintptr_t)a, (T)~v, __ATOMIC_SEQ_CST); } \
+    static inline uint64_t ldeor##N(uint64_t a, uint64_t v) { return __atomic_fetch_xor((T *)(uintptr_t)a, (T)v, __ATOMIC_SEQ_CST); } \
+    static inline uint64_t ldset##N(uint64_t a, uint64_t v) { return __atomic_fetch_or((T *)(uintptr_t)a, (T)v, __ATOMIC_SEQ_CST); }  \
+    static inline uint64_t swp##N(uint64_t a, uint64_t v) { return __atomic_exchange_n((T *)(uintptr_t)a, (T)v, __ATOMIC_SEQ_CST); }  \
+    static inline uint64_t ldsmax##N(uint64_t a, uint64_t v) {                                                    \
+        T o = __atomic_load_n((T *)(uintptr_t)a, __ATOMIC_RELAXED);                                               \
+        while (!__atomic_compare_exchange_n((T *)(uintptr_t)a, &o, (S)o > (S)v ? o : (T)v, 1, __ATOMIC_SEQ_CST,  \
+                                            __ATOMIC_RELAXED)) {}                                                 \
+        return o;                                                                                                 \
+    }                                                                                                             \
+    static inline uint64_t ldsmin##N(uint64_t a, uint64_t v) {                                                    \
+        T o = __atomic_load_n((T *)(uintptr_t)a, __ATOMIC_RELAXED);                                               \
+        while (!__atomic_compare_exchange_n((T *)(uintptr_t)a, &o, (S)o < (S)v ? o : (T)v, 1, __ATOMIC_SEQ_CST,  \
+                                            __ATOMIC_RELAXED)) {}                                                 \
+        return o;                                                                                                 \
+    }                                                                                                             \
+    static inline uint64_t ldumax##N(uint64_t a, uint64_t v) {                                                    \
+        T o = __atomic_load_n((T *)(uintptr_t)a, __ATOMIC_RELAXED);                                               \
+        while (!__atomic_compare_exchange_n((T *)(uintptr_t)a, &o, o > (T)v ? o : (T)v, 1, __ATOMIC_SEQ_CST,     \
+                                            __ATOMIC_RELAXED)) {}                                                 \
+        return o;                                                                                                 \
+    }                                                                                                             \
+    static inline uint64_t ldumin##N(uint64_t a, uint64_t v) {                                                    \
+        T o = __atomic_load_n((T *)(uintptr_t)a, __ATOMIC_RELAXED);                                               \
+        while (!__atomic_compare_exchange_n((T *)(uintptr_t)a, &o, o < (T)v ? o : (T)v, 1, __ATOMIC_SEQ_CST,     \
+                                            __ATOMIC_RELAXED)) {}                                                 \
+        return o;                                                                                                 \
+    }
+LSE_IMPL(8, uint8_t, int8_t)
+LSE_IMPL(16, uint16_t, int16_t)
+LSE_IMPL(32, uint32_t, int32_t)
+LSE_IMPL(64, uint64_t, int64_t)
+
+static inline void casp64(uint64_t a, uint64_t elo, uint64_t ehi, uint64_t lo, uint64_t hi, uint64_t *olo, uint64_t *ohi) {
+    u128 e = ((u128)ehi << 64) | elo;
+    __atomic_compare_exchange_n((u128 *)(uintptr_t)a, &e, ((u128)hi << 64) | lo, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    *olo = (uint64_t)e;
+    *ohi = (uint64_t)(e >> 64);
+}
 
 // ---- flags (packed NZCV in bits 31..28)
 #define FLAG_N(c) (((c)->nzcv >> 31) & 1)

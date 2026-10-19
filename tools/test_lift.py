@@ -1,8 +1,13 @@
 """Differential test: lifted C vs Unicorn, one instruction at a time.
 
 Usage: test_lift.py <nso> <base> [count] [seed]
+
+Environment: SIMD=asm|c (default: asm on AArch64 hosts, c elsewhere), CC (default clang), ONLY=<regex> (only
+encodings whose disassembly matches, e.g. ONLY='^(ld|st)a?xp|^cas|^swp|^ld(add|clr|eor|set|[su]max|[su]min)').
 """
-import hashlib
+import platform
+import re
+import zlib
 import os
 import random
 import struct
@@ -108,7 +113,7 @@ def run_unicorn(mu, n, w, pc, state, buf0):
     onz = mu.reg_read(A.UC_ARM64_REG_NZCV) & 0xF0000000
     ov = [mu.reg_read(A.UC_ARM64_REG_Q0 + i) for i in range(32)]
     opc = mu.reg_read(A.UC_ARM64_REG_PC)
-    h = hashlib.md5(bytes(mu.mem_read(BUF, BUF_SIZE))).hexdigest()
+    h = f'{zlib.crc32(bytes(mu.mem_read(BUF, BUF_SIZE))):08x}'  # (tools/test_harness.c: the same CRC-32)
     return ox, osp, onz, ov, opc, h
 
 
@@ -125,13 +130,22 @@ def main():
     seen, picks = set(), []
     order = list(range(len(words)))
     r.shuffle(order)
-    lifter = Lifter(base)
+    simd = os.environ.get('SIMD') or ('asm' if platform.machine().lower() in ('arm64', 'aarch64') else 'c')
+    lifter = Lifter(base, simd)
+    only = re.compile(os.environ['ONLY']) if os.environ.get('ONLY') else None
+    if only:
+        import capstone
+        md_only = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
     unsupported = {}
     for i in order:
         w = words[i]
         key = w if not is_mem(w) else w  # every distinct word is a distinct case
-        if key in seen or classify(w) == 'skip':
+        if key in seen or (classify(w) == 'skip' and not only):
             continue
+        if only:
+            d = next(md_only.disasm_lite(struct.pack('<I', w), 0), None)
+            if not d or not only.search(d[2] + ' ' + d[3]):
+                continue
         seen.add(key)
         pc = base + lo + i * 4
         try:
@@ -157,10 +171,13 @@ def main():
         f.write(f'int ntests = {len(picks)};\n')
     harness = os.path.join(ROOT, 'tools', 'test_harness.c')
     exe = os.path.join(work, 'harness')
-    subprocess.check_call(['clang', '-O1', '-Wno-deprecated-declarations', '-fno-strict-aliasing', '-I', os.path.join(ROOT, 'runtime'),
+    cc = os.environ.get('CC', 'clang').split()
+    extra = ['-march=' + ('x86_64_v3' if 'zig' in cc[0] else 'x86-64-v3')] if platform.machine().lower() in ('x86_64', 'amd64') else []  # (zig cc spells the CPU its own way)
+    subprocess.check_call(cc + extra + ['-O1', '-Wno-deprecated-declarations', '-fno-strict-aliasing', '-I', os.path.join(ROOT, 'runtime'),
                            '-o', exe, harness, os.path.join(work, 'tests.c')])
 
     mu = uc.Uc(uc.UC_ARCH_ARM64, uc.UC_MODE_ARM)
+    mu.ctl_set_cpu_model(A.UC_CPU_ARM64_MAX)  # (ARMv8.1+: LSE atomics, as the SDK's outline atomics may use)
     mu.mem_map(base, len(n.image))
     mu.mem_write(base, bytes(n.image))
     mu.mem_map(BUF, BUF_SIZE)
@@ -172,6 +189,7 @@ def main():
         f.write(buf0)
 
     cases, expect = [], []
+    uc_errors = {}
     for k, (w, pc, body) in enumerate(picks):
         for rep in range(3):
             if is_mem(w) or (w & 0xFFFFF000) == 0xD508B000 or (w & 0xFFFFFFE0) == 0xD50B7420:
@@ -189,6 +207,7 @@ def main():
             try:
                 res = run_unicorn(mu, n, w, pc, (x, sp, nzcv, v), buf0)
             except uc.UcError as e:
+                uc_errors[str(e)] = uc_errors.get(str(e), 0) + 1
                 continue
             cases.append((k, pc, x, sp, nzcv, v))
             expect.append(res)
@@ -233,6 +252,12 @@ def main():
             fails.setdefault(w, (pc, diffs[:4]))
     print(f'tested {len(picks)} encodings, {len(cases)} cases, {len(lines) - 1} ran, failing encodings: {len(fails)}')
     print('unsupported:', unsupported)
+    if uc_errors:
+        print('cases Unicorn could not run:', uc_errors)
+    if only:
+        import collections
+        ran = collections.Counter(next(md_only.disasm_lite(struct.pack('<I', picks[k][0]), 0))[2] for k, *_ in cases)
+        print('cases per mnemonic:', dict(sorted(ran.items())))
     import capstone
     md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
     for w, (pc, d) in list(fails.items())[:40]:

@@ -1,7 +1,7 @@
 // Runs lifted single-instruction tests; prints final state per case.
-#include <CommonCrypto/CommonDigest.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 
 #include "cpu.h"
@@ -17,6 +17,20 @@ void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) { (void)c; (void)imm; (void)pc; }
 void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) { (void)c; (void)imm; (void)pc; abort(); }
 void rt_udf(Cpu *c, uint64_t pc) { (void)c; (void)pc; abort(); }
 uint64_t rt_ticks(void) { return 0; }
+
+// CRC-32 (zlib's polynomial) of the scratch buffer: the Python side compares it with zlib.crc32 of Unicorn's buffer.
+static uint32_t crc32_buf(const uint8_t *p, size_t n) {
+    static uint32_t t[256];
+    if (!t[1])
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            t[i] = c;
+        }
+    uint32_t c = ~0u;
+    while (n--) c = t[(c ^ *p++) & 0xFF] ^ (c >> 8);
+    return ~c;
+}
 
 static void *map_file(const char *path, uint64_t addr, size_t *size) {
     FILE *f = fopen(path, "rb");
@@ -50,12 +64,10 @@ int main(int argc, char **argv) {
         memcpy(c.v, in.v, sizeof c.v);
         c.excl_addr = ~0ull;
         tests[in.k](&c);
-        unsigned char md[16];
-        CC_MD5((void *)BUF, BUF_SIZE, md);
-        for (int i = 0; i < 31; i++) printf("%llx ", c.x[i]);
-        printf("%llx %llx %llx ", c.sp, c.nzcv & 0xf0000000ull, c.pc);
-        for (int i = 0; i < 16; i++) printf("%02x", md[i]);
-        for (int i = 0; i < 32; i++) printf(" %016llx%016llx", (uint64_t)(c.v[i] >> 64), (uint64_t)c.v[i]);
+        for (int i = 0; i < 31; i++) printf("%llx ", (unsigned long long)c.x[i]);
+        printf("%llx %llx %llx ", (unsigned long long)c.sp, (unsigned long long)(c.nzcv & 0xf0000000ull), (unsigned long long)c.pc);
+        printf("%08x", crc32_buf((const uint8_t *)BUF, BUF_SIZE));
+        for (int i = 0; i < 32; i++) printf(" %016llx%016llx", (unsigned long long)(c.v[i] >> 64), (unsigned long long)c.v[i]);
         printf("\n");
     }
     return 0;

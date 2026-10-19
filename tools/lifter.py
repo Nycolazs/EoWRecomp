@@ -389,7 +389,7 @@ class Lifter:
         nbits = 8 << size
         addr = XS(rn)
         if o1:
-            raise Unsupported('exclusive pair / CAS')
+            return self.excl_pair_cas(w, size, o2, L, rs, rn, rt)
         if o2 == 0:
             if L:
                 return Insn('op', set_reg(1, rt, f'ldx{nbits}(c, {addr})'))
@@ -397,6 +397,50 @@ class Lifter:
         if L:
             return Insn('op', set_reg(1, rt, f'lda{nbits}({addr})'))
         return Insn('op', f'stl{nbits}({addr}, {X(rt)});')
+
+    def excl_pair_cas(self, w, size, o2, L, rs, rn, rt):
+        """LDXP/STXP (+ acquire / release forms), CAS and CASP. Ordering: the helpers are sequentially consistent,
+        at least as strong as every acquire / release variant."""
+        addr = XS(rn)
+        rt2 = bits(w, 10, 5)
+        if o2 == 0 and size >= 2:  # exclusive pair
+            if size == 3:
+                if L:
+                    return Insn('op', f'{{ uint64_t lo, hi; ldxp64(c, {addr}, &lo, &hi); '
+                                      f'{set_reg(1, rt, "lo")} {set_reg(1, rt2, "hi")} }}')
+                return Insn('op', f'{{ uint32_t st = stxp64(c, {addr}, {X(rt)}, {X(rt2)}); {set_reg(0, rs, "st")} }}')
+            if L:  # two words: one 64-bit exclusive access, first register at the lower address
+                return Insn('op', f'{{ uint64_t v = ldx64(c, {addr}); {set_reg(0, rt, "v")} {set_reg(0, rt2, "v >> 32")} }}')
+            return Insn('op', f'{{ uint32_t st = stx64(c, {addr}, (uint64_t){W(rt)} | ((uint64_t){W(rt2)} << 32)); '
+                              f'{set_reg(0, rs, "st")} }}')
+        if rt2 != 31:
+            raise Unsupported('exclusive pair / CAS encoding')
+        if o2 == 1:  # CAS{A,L,AL}{B,H,}: Rs = old value, store Rt if it was Rs
+            nbits = 8 << size
+            return Insn('op', set_reg(1 if size == 3 else 0, rs, f'cas{nbits}({addr}, {X(rs)}, {X(rt)})'))
+        if size == 0:  # CASP (32-bit registers): one 64-bit compare-and-swap
+            return Insn('op', f'{{ uint64_t old = cas64({addr}, (uint64_t){W(rs)} | ((uint64_t){W(rs + 1)} << 32), '
+                              f'(uint64_t){W(rt)} | ((uint64_t){W(rt + 1)} << 32)); '
+                              f'{set_reg(0, rs, "old")} {set_reg(0, rs + 1, "old >> 32")} }}')
+        return Insn('op', f'{{ uint64_t lo, hi; casp64({addr}, {X(rs)}, {X(rs + 1)}, {X(rt)}, {X(rt + 1)}, &lo, &hi); '
+                          f'{set_reg(1, rs, "lo")} {set_reg(1, rs + 1, "hi")} }}')
+
+    LSE_OPS = ['ldadd', 'ldclr', 'ldeor', 'ldset', 'ldsmax', 'ldsmin', 'ldumax', 'ldumin']
+
+    def lse(self, w):
+        """Atomic memory operations (ARMv8.1 LSE): LD<op>, SWP, and LDAPR. Rt = old value (zero-extended)."""
+        size, rs, o3, opc, rn, rt = bits(w, 30, 2), bits(w, 16, 5), bits(w, 15, 1), bits(w, 12, 3), bits(w, 5, 5), bits(w, 0, 5)
+        nbits = 8 << size
+        addr = XS(rn)
+        if o3 == 0:
+            op = self.LSE_OPS[opc]
+        elif opc == 0:
+            op = 'swp'
+        elif opc == 4 and rs == 31:  # LDAPR: load-acquire (RCpc)
+            return Insn('op', set_reg(1, rt, f'lda{nbits}({addr})'))
+        else:
+            raise Unsupported(f'lse o3 opc {opc}')
+        return Insn('op', set_reg(1 if size == 3 else 0, rt, f'{op}{nbits}({addr}, {X(rs)})'))
 
     def ldst_pair(self, w):
         opc, mode, L = bits(w, 30, 2), bits(w, 23, 2), bits(w, 22, 1)
@@ -442,8 +486,10 @@ class Lifter:
         else:
             kind = bits(w, 10, 2)
             if bits(w, 21, 1):
+                if kind == 0 and bits(w, 24, 2) == 0:
+                    return self.lse(w)
                 if kind != 2:
-                    raise Unsupported('ldst reg atomic/pac')
+                    raise Unsupported('ldst reg pac')
                 rm, option, S = bits(w, 16, 5), bits(w, 13, 3), bits(w, 12, 1)
                 if option not in (2, 3, 6, 7):
                     raise Unsupported('ldst reg option')
