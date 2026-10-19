@@ -1,10 +1,13 @@
-# EoWRecomp build (derived from EoWRecomp, MIT)
+# EoWRecomp build (derived from LAS Recomp, MIT)
 # macOS: Homebrew clang/SDL3/FFmpeg, Metal renderer.
 # Windows: MSYS2 UCRT64 shell (see docs/BUILD-windows.md), clang + Vulkan renderer.
 # Linux: clang + Vulkan renderer, x86-64 or aarch64 (see docs/linux.md).
+# Windows from Linux: WINCROSS=1 (tools/windows/build.sh): zig cc for x86_64-windows-gnu, deps from tools/windows/fetch_deps.sh.
 UNAME := $(shell uname -s)
 comma := ,
-ifneq ($(filter MINGW% MSYS% CYGWIN% Windows_NT,$(UNAME) $(OS)),)
+ifeq ($(WINCROSS),1)
+PLATFORM := windows
+else ifneq ($(filter MINGW% MSYS% CYGWIN% Windows_NT,$(UNAME) $(OS)),)
 PLATFORM := windows
 else ifeq ($(UNAME),Linux)
 PLATFORM := linux
@@ -35,6 +38,12 @@ DEPS      ?=
 MINFLAG  := $(if $(MACOS_MIN),-mmacosx-version-min=$(MACOS_MIN))
 CC       := clang $(MINFLAG) $(CROSS)
 CXX      := clang++ $(MINFLAG) $(CROSS)
+ifeq ($(WINCROSS),1)
+ZIG      ?= build/zig-full/zig
+CC       := $(ZIG) cc -target x86_64-windows-gnu
+CXX      := $(ZIG) c++ -target x86_64-windows-gnu
+GENARCH  ?= -mcpu=x86_64_v3  # (zig's spelling of x86-64-v3)
+endif
 IMGUI    := third_party/imgui
 GENFLAGS := -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
 
@@ -97,14 +106,15 @@ LDFLAGS  := -fuse-ld=lld -Wl,--stack,16777216 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3
             $(if $(RELEASE),-Wl$(comma)--subsystem$(comma)windows)  # release: no console window (log -> eowrecomp.log)
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
-BACKEND_OBJ += $(B)/rt/platform/windows_rc.o  # the .exe's icon (Explorer, taskbar)
+BACKEND_OBJ += $(if $(wildcard docs/icon/icon.ico),$(B)/rt/platform/windows_rc.o)  # the .exe's icon (none yet)
 WINDRES  ?= windres
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
 UIFLAGS  := -x c++ $(OSFLAGS)  # the .mm UI sources are plain C++ apart from __APPLE__ blocks
 GAMELIB  := $(B)/eowgame.dll
-# the runtime functions it calls: exported by the .exe, linked through its import library
-LDFLAGS  += -Wl,--export-all-symbols -Wl,--out-implib,$(B)/eowrecomp.dll.a
-GAMELIB_LDFLAGS := -shared -fuse-ld=lld $(B)/eowrecomp.dll.a
+# the runtime functions it calls (RT_API in runtime/cpu.h): exported by the .exe, imported through an import library
+# made from tools/windows/eowrecomp.def
+IMPLIB   := $(B)/eowrecomp.lib
+GAMELIB_LDFLAGS := -shared -fuse-ld=lld $(IMPLIB)
 GAMELIB_SHARED := -shared  # (+ the import library: runtime/gamebuild.c)
 endif
 
@@ -116,8 +126,8 @@ GAMELIB_SRCS := tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools
 GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS)') | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 
 RT_OBJ   := $(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC))
-RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Iruntime/nvn $(DEPINC) $(OSFLAGS)
-CXXFLAGS := -O2 -g -std=c++17 -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime/nvn $(DEPINC)
+RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -DEOW_RUNTIME -Iruntime -Iruntime/nvn $(DEPINC) $(OSFLAGS)
+CXXFLAGS := -O2 -g -std=c++17 -DEOW_RUNTIME -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime/nvn $(DEPINC)
 
 all: $(EXE) $(if $(GEN_SRC),$(GAMELIB))
 
@@ -164,9 +174,16 @@ $(EXE): $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ) $(IMGUI_OBJ)
 	$(CXX) -o $(dir $@)link/$(notdir $@) $^ $(LDFLAGS)
 	mv -f $(dir $@)link/$(notdir $@) $@
 
+ifeq ($(PLATFORM),windows)
+$(IMPLIB): tools/windows/eowrecomp.def
+	@mkdir -p $(dir $@)
+	$(or $(ZIG),zig) dlltool -m i386:x86-64 -D eowrecomp.exe -d $< -l $@
+$(GAMELIB): $(IMPLIB)
+endif
+
 # its id file (<library>.id) says what it was built from without loading it (runtime/gamelib.c)
 $(GAMELIB): $(GEN_OBJ) | $(EXE)
-	$(CC) $(GAMELIB_LDFLAGS) -o $@.tmp $^
+	$(CC) $(GAMELIB_LDFLAGS) -o $@.tmp $(GEN_OBJ)
 	mv -f $@.tmp $@
 	echo $(GAMELIB_ID) > $@.id
 

@@ -1,0 +1,10 @@
+; What the game code library (eowgame.dll) imports from eowrecomp.exe: RT_API in runtime/cpu.h.
+LIBRARY eowrecomp.exe
+EXPORTS
+    rt_dispatch
+    rt_svc
+    rt_brk
+    rt_udf
+    rt_ticks
+    fnprof_hit
+    g_fnprof DATA

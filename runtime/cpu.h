@@ -31,12 +31,22 @@ _Static_assert(offsetof(Cpu, v) == 512, "v");
 
 typedef void (*GuestFn)(Cpu *);
 
+// What the game code library calls in the app. On Windows the .exe exports them (EOW_RUNTIME: compiling the app)
+// and the library imports them through tools/windows/eowrecomp.def; elsewhere the dynamic linker binds them.
+#if defined(_WIN32) && defined(EOW_RUNTIME)
+#define RT_API __declspec(dllexport)
+#elif defined(_WIN32)
+#define RT_API __declspec(dllimport)
+#else
+#define RT_API
+#endif
+
 // ---- runtime services (runtime/*.c)
-void rt_dispatch(Cpu *c);                 // call function at c->pc
-void rt_svc(Cpu *c, uint32_t imm, uint64_t pc);
-void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) __attribute__((noreturn));
-void rt_udf(Cpu *c, uint64_t pc) __attribute__((noreturn));
-uint64_t rt_ticks(void);
+RT_API void rt_dispatch(Cpu *c);                 // call function at c->pc
+RT_API void rt_svc(Cpu *c, uint32_t imm, uint64_t pc);
+RT_API void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) __attribute__((noreturn));
+RT_API void rt_udf(Cpu *c, uint64_t pc) __attribute__((noreturn));
+RT_API uint64_t rt_ticks(void);
 
 #if defined(__aarch64__)
 static inline uint64_t rt_get_fpcr(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
@@ -59,8 +69,8 @@ typedef uint64_t __attribute__((aligned(1), may_alias)) u64u;
 typedef uint8_t __attribute__((may_alias)) u8a;
 
 // Function-entry profiler (runtime/fnprof.c, EOWRECOMP_FNPROF): one predictable branch per call when off.
-extern volatile int g_fnprof;
-void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0);
+RT_API extern volatile int g_fnprof;
+RT_API void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0);
 #define FN_ENTER(a) do { if (__builtin_expect(g_fnprof, 0)) fnprof_hit(a, c->x[30], c->x[0]); } while (0)
 
 #define LD8(a)  (*(const u8a *)(uintptr_t)(a))
