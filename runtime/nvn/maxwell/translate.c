@@ -75,7 +75,8 @@ typedef struct {
     bool tex_weak[64];            // slot type only guessed (from a size query): the next sample decides
     bool fail;
     bool branchy;  // program uses the pc state machine
-    bool fwd;      // ... with forward branches only: blocks in pc order instead of a loop (see FWD below)
+    char fwd_tail[2048];  // loop closings after the last block (structured mode)
+    bool fwd;      // ... structured instead: blocks in pc order, loops as for (;;) (see FWD below)
     int ipa_mode;  // interpolation mode of the IPA being translated (-1 for plain loads)
     int ipa_mul;   // its multiplier register (mode 1: the result is the "pass" value attr/w times this register)
     // GLSL (fields kept last: the MSL path's layout, including its out-of-range reg_used writes, is unchanged)
@@ -1348,8 +1349,17 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         }
     } else if (OPM(0x5c30000000000000ull, 0xfff8000000000000ull) || OPM(0x4c30000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x3830000000000000ull, 0xfef8000000000000ull)) {  // FLO
-        const char *bv = B(false);
-        sprintf(t, bits(w, 48, 1) ? "(int(%s) < 0 ? (31u - clz(~%s)) : (31u - clz(%s)))" : "(31u - clz(%s))", bv, bv, bv);
+        // FLO[.U32/.S32][.SH] Rd, ~?B: the most significant 1 (signed: of a negative value, the most significant 0), or
+        // 0xFFFFFFFF if none; .SH (bit 41) gives the shift instead, 31 - position (Ryujinx EmitFlo). .INV (bit 40)
+        // complements B first. (.SH was missing: Echoes of Wisdom walks its light masks with FLO.SH of a BREV - the
+        // lowest set bit - and the wrong bit was cleared: the loop ran far too long and lit wrongly.)
+        char vb[300];
+        sprintf(vb, bits(w, 40, 1) ? "(~%s)" : "%s", B(false));
+        char msb[1024];
+        if (bits(w, 48, 1)) sprintf(msb, "(int(%s) < 0 ? (31u - clz(~%s)) : (31u - clz(%s)))", vb, vb, vb);
+        else sprintf(msb, "(31u - clz(%s))", vb);
+        if (bits(w, 41, 1)) sprintf(t, "flo_sh(%s)", msb);
+        else strcpy(t, msb);
         set_reg(c, d, t);
     } else if (OPM(0x5c08000000000000ull, 0xfff8000000000000ull) || OPM(0x4c08000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x3808000000000000ull, 0xfef8000000000000ull)) {  // POPC
@@ -1830,6 +1840,7 @@ static const char glsl_prelude[] =
     "uint mulhi(uint a, uint b) { uint hi, lo; umulExtended(a, b, hi, lo); return hi; }\n"
     "int mulhi(int a, int b) { int hi, lo; imulExtended(a, b, hi, lo); return hi; }\n"
     "uint brev32(uint v) { return bitfieldReverse(v); }\n"
+    "uint flo_sh(uint msb) { return msb == 0xFFFFFFFFu ? msb : 31u - msb; }\n"
     "uint bfe_u(uint v, uint ctl) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u) return 0u; if (pos >= 32u) return 0u; return bitfieldExtract(v, int(pos), int(min(len, 32u - pos))); }\n"
     "uint bfe_s(uint v, uint ctl) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u) return 0u; if (pos >= 32u) return (int(v) < 0) ? 0xFFFFFFFFu : 0u; return uint(bitfieldExtract(int(v), int(pos), int(min(len, 32u - pos)))); }\n"
     "uint bfi(uint ins, uint ctl, uint base) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u || pos >= 32u) return base; return bitfieldInsert(base, ins, int(pos), int(min(len, 32u - pos))); }\n"
@@ -1957,7 +1968,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         sp(&s, "  bool exit_now = false;\n");
         if (c->fwd) {
             sp(&s, "%s", body.buf ? body.buf : "");
-            sp(&s, "    exit_now = true;\n  } while (false);\n");
+            sp(&s, "    exit_now = true;\n  } while (false);\n%s", c->fwd_tail);
         } else {
             sp(&s, "  for (uint guard = 0u; guard < %uu; guard++) {\n  switch (pc) {\n", maxwell_loop_guard);
             sp(&s, "%s", body.buf ? body.buf : "");
@@ -2042,11 +2053,17 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     uint8_t *label = calloc(end + 4, 1);
     label[1] = 1;
     bool any_branch = false;
-    // FWD: when every BRA / SSY / PBK goes forward and there are no PCNT / CONT / BRX, every block is entered at most
-    // once, in pc order: the blocks become `if (pc == N) do { ... } while (false);` in sequence, with no dispatch loop.
-    // A loop around a switch keeps every register live across its back edge, which GPU compilers turn into spills:
-    // Echoes of Wisdom's main ground material (32 textures, 10 blocks) took ~4.5 ms per draw on an Iris Xe.
+    // FWD (structured control flow): the blocks become `if (pc == N) do { ... } while (false);` in pc order, a jump
+    // sets pc and leaves its block, and later blocks whose pc doesn't match are skipped. A backward BRA from b to h
+    // makes [h, b] a loop: `for (;;) { its blocks; if (pc == h) continue; break; }`. Loops must nest (or be disjoint);
+    // with PCNT / CONT, BRX, a backward SSY / PBK or overlapping loops the shader keeps the dispatch loop
+    // (for { switch (pc) }). That loop around the whole shader keeps every register live across its back edge, which
+    // GPU compilers turn into spills: Echoes of Wisdom's main ground material (a loop, 32 textures) took ~4.5 ms per
+    // draw on an Iris Xe.
     bool forward = true;
+    enum { MAX_LOOPS = 64 };
+    uint32_t loop_h[MAX_LOOPS], loop_b[MAX_LOOPS];  // head pc, pc of the backward branch
+    int nloops = 0;
     for (size_t i = 0; i < end; i++) {
         if (i % 4 == 0) continue;
         uint64_t w = ((const uint64_t *)code)[i];
@@ -2059,7 +2076,18 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             int64_t t = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
             if (t >= 0 && (size_t)(t / 8) < end) label[t / 8] = 1;
             any_branch = true;
-            if (t <= (int64_t)pc || (w & 0xfff0000000000020ull) == 0xe2b0000000000000ull) forward = false;  // back / PCNT
+            bool bra = (w & 0xfff0000000000020ull) == 0xe240000000000000ull;
+            if ((w & 0xfff0000000000020ull) == 0xe2b0000000000000ull) forward = false;  // PCNT
+            else if (t <= (int64_t)pc && !bra) forward = false;                         // backward SSY / PBK
+            else if (t <= (int64_t)pc) {                                                // a loop
+                int k = 0;
+                while (k < nloops && loop_h[k] != (uint32_t)t) k++;
+                if (k == MAX_LOOPS) forward = false;
+                else {
+                    if (k == nloops) { loop_h[k] = (uint32_t)t; loop_b[k] = pc; nloops++; }
+                    if (pc > loop_b[k]) loop_b[k] = pc;
+                }
+            }
         }
         if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) {  // BRX: any instruction may be a target
             any_branch = true;
@@ -2076,15 +2104,54 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     bool dbg = maxwell_dbg_code && blob == maxwell_dbg_code && stage == STAGE_FRAGMENT;
     static int annotate = -1;
     if (annotate < 0) annotate = getenv("EOWRECOMP_SAVE_MSL") != NULL;
+    // a loop ends after its backward branch: its end is a block boundary (index of the first instruction after it)
+    uint32_t loop_e[MAX_LOOPS];
+    for (int k = 0; k < nloops && forward; k++) {
+        size_t e = loop_b[k] / 8 + 1;
+        if (e % 4 == 0) e++;
+        if (e < end) label[e] = 1;
+        loop_e[k] = (uint32_t)(e * 8);
+        if (loop_h[k] / 8 >= end || !label[loop_h[k] / 8]) forward = false;
+    }
+    for (int k = 0; k < nloops && forward; k++)  // nested or disjoint
+        for (int m = 0; m < nloops; m++) {
+            if (m == k) continue;
+            bool disjoint = loop_e[k] <= loop_h[m] || loop_e[m] <= loop_h[k];
+            bool k_in_m = loop_h[m] <= loop_h[k] && loop_e[k] <= loop_e[m];
+            bool m_in_k = loop_h[k] <= loop_h[m] && loop_e[m] <= loop_e[k];
+            if (!disjoint && !k_in_m && !m_in_k) forward = false;
+            if (loop_h[k] == loop_h[m] && k != m) forward = false;
+        }
     c->branchy = any_branch;
     c->fwd = any_branch && forward && !getenv("EOWRECOMP_NO_FWD_SHADERS");
+    bool fwd_first = true;
     for (size_t i = 0; i < end && !c->fail; i++) {
         if (i % 4 == 0) continue;
         uint32_t pc = (uint32_t)(i * 8);
         if (any_branch && label[i]) {
             if (!c->fwd) sp(&c->body, "  case %uu:\n", pc);
-            else if (pc == 8) sp(&c->body, "  if (pc == 8u) do {\n");
-            else sp(&c->body, "    pc = %uu;\n  } while (false);\n  if (!exit_now && pc == %uu) do {\n", pc, pc);  // (fall through)
+            else {
+                if (!fwd_first) sp(&c->body, "    pc = %uu;\n  } while (false);\n", pc);  // (fall through)
+                fwd_first = false;
+                // loops ending here, innermost (latest head) first; then loops starting here, outermost first
+                for (int pass = 0; pass < 2; pass++) {
+                    uint32_t done = 0;
+                    for (int n = 0; n < nloops; n++) {
+                        int pick = -1;
+                        for (int k = 0; k < nloops; k++) {
+                            if (done & (1u << k)) continue;
+                            if (pass == 0 ? loop_e[k] != pc : loop_h[k] != pc) continue;
+                            if (pick < 0 || (pass == 0 ? loop_h[k] > loop_h[pick] : loop_e[k] > loop_e[pick])) pick = k;
+                        }
+                        if (pick < 0) break;
+                        done |= 1u << pick;
+                        if (pass == 0) sp(&c->body, "  if (!exit_now && pc == %uu) continue;\n  break;\n  }\n", loop_h[pick]);
+                        else sp(&c->body, "  if (!exit_now && pc >= %uu && pc < %uu) for (uint g_%u = 0u; g_%u < %uu; g_%u++) {\n",
+                                loop_h[pick], loop_e[pick], pick, pick, maxwell_loop_guard, pick);
+                    }
+                }
+                sp(&c->body, pc == 8 ? "  if (pc == 8u) do {\n" : "  if (!exit_now && pc == %uu) do {\n", pc);
+            }
         }
         if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)((const uint64_t *)code)[i]);
         emit_insn(c, ((const uint64_t *)code)[i], pc);
@@ -2097,6 +2164,14 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         info->num_insts++;
     }
     free(label);
+    if (c->fwd && !c->fail) {  // (loops whose end is the program's end: closed after the last block, in the wrappers)
+        c->fwd_tail[0] = 0;
+        for (int k = nloops - 1; k >= 0; k--)  // (sorted by head: later heads are inner)
+            if (loop_e[k] >= (uint32_t)(end * 8)) {
+                size_t l = strlen(c->fwd_tail);
+                snprintf(c->fwd_tail + l, sizeof c->fwd_tail - l, "  if (!exit_now && pc == %uu) continue;\n  break;\n  }\n", loop_h[k]);
+            }
+    }
     if (c->fail) { free(c->body.buf); free(c); return info; }
     if (c->glsl) return glsl_finish(c, any_branch, dbg);
 
@@ -2105,6 +2180,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     sp(&s, "#include <metal_stdlib>\nusing namespace metal;\n");
     sp(&s, "static inline uint cbr(constant uint4 *cb, uint off) { return cb[off >> 4][(off >> 2) & 3]; }\n");
     sp(&s, "static inline uint brev32(uint v) { return reverse_bits(v); }\n");
+    sp(&s, "static inline uint flo_sh(uint msb) { return msb == 0xFFFFFFFFu ? msb : 31u - msb; }\n");
     sp(&s, "static inline uint bfe_u(uint v, uint ctl) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u) return 0u; if (pos >= 32u) return 0u; return extract_bits(v, pos, min(len, 32u - pos)); }\n");
     sp(&s, "static inline uint bfe_s(uint v, uint ctl) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u) return 0u; if (pos >= 32u) return (int(v) < 0) ? 0xFFFFFFFFu : 0u; return uint(extract_bits(int(v), pos, min(len, 32u - pos))); }\n");
     sp(&s, "static inline uint bfi(uint ins, uint ctl, uint base) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u || pos >= 32u) return base; return insert_bits(base, ins, pos, min(len, 32u - pos)); }\n");
@@ -2205,7 +2281,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         sp(&s, "  bool exit_now = false;\n");
         if (c->fwd) {
             sp(&s, "%s", c->body.buf ? c->body.buf : "");
-            sp(&s, "    exit_now = true;\n  } while (false);\n");
+            sp(&s, "    exit_now = true;\n  } while (false);\n%s", c->fwd_tail);
         } else {
             sp(&s, "  for (uint guard = 0; guard < %uu; guard++) {\n  switch (pc) {\n", maxwell_loop_guard);
             sp(&s, "%s", c->body.buf ? c->body.buf : "");
