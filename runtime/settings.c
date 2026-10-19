@@ -22,21 +22,20 @@ Settings g_settings = {
     .reverb = true,
     .movie_audio = true,
     .show_fps = false,
-    .inv_keys = true,
-    .tracker = true,
-    .chaos_letters = CHAOS_LETTERS_MAP,
-    .diff_damage = 1.0f,
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
 };
 
-// The game's own text languages: its RomFS carries these per region (regionUS/USen|USes|USfr, regionEU/EUen|EUes|...,
-// regionJP/JPja, regionKR/KRkr, regionTW/TWch, regionCN/CNch), and the game picks one from the system language it
-// reads back (runtime/services/am.c), exactly as it does on the console. Codes as the Switch reports them.
-const char *const g_language_codes[N_LANGUAGES] = {"auto", "ja", "en-US", "es", "fr", "de", "it", "nl", "ru", "ko",
-                                                   "zh-CN", "zh-TW"};
-const char *const g_language_names[N_LANGUAGES] = {"Auto", "Japanese", "English", "Spanish", "French", "German",
-                                                   "Italian", "Dutch", "Russian", "Korean", "Chinese (Simplified)",
-                                                   "Chinese (Traditional)"};
+// The game's own text languages: its RomFS carries these per region (regionUS/USen|USes|USfr|USpt,
+// regionEU/EUen|EUde|EUes|EUfr|EUit|EUnl|EUru, regionJP/JPja, regionKR/KRko, regionTW/TWzh, regionCN/CNzh), and the
+// game picks one from the system language it reads back (runtime/services/am.c), as on the console. Codes as the
+// Switch reports them (nn::settings::LanguageCode).
+const char *const g_language_codes[N_LANGUAGES] = {"auto", "ja", "en-US", "en-GB", "fr", "fr-CA", "de", "it", "es",
+                                                   "es-419", "nl", "ru", "ko", "zh-CN", "zh-TW", "pt-BR"};
+const char *const g_language_names[N_LANGUAGES] = {"Auto", "Japanese", "English (US)", "English (UK)", "French",
+                                                   "French (Canada)", "German", "Italian", "Spanish",
+                                                   "Spanish (Latin America)", "Dutch", "Russian", "Korean",
+                                                   "Chinese (Simplified)", "Chinese (Traditional)",
+                                                   "Portuguese (Brazil)"};
 
 // LANG_AUTO: the host's own language (LANG=es_ES.UTF-8 -> es), en-US when it is none of the game's. Linux only:
 // macOS / Windows apps get no locale variables from the system, so Auto is English there (pick one in settings).
@@ -52,7 +51,8 @@ static const char *host_language(void) {
     size_t n = 0;
     for (const char *p = e; *p && *p != '.' && *p != '@' && *p != '_' && n < sizeof l - 1; p++) l[n++] = *p;
     static const struct { const char *loc, *code; } map[] = {{"ja", "ja"}, {"ko", "ko"}, {"ru", "ru"}, {"nl", "nl"},
-                                                             {"de", "de"}, {"it", "it"}, {"fr", "fr"}, {"es", "es"}};
+                                                             {"de", "de"}, {"it", "it"}, {"fr", "fr"}, {"es", "es"},
+                                                             {"pt", "pt-BR"}};
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (!strcmp(l, map[i].loc)) return map[i].code;
     if (!strcmp(l, "zh")) return e[n] == '_' && e[n + 1] == 'T' ? "zh-TW" : "zh-CN";  // (TW / HK: traditional)
@@ -83,11 +83,6 @@ void settings_load(void) {
         char key[64];
         char val[128];
         if (sscanf(line, " %63[^= ] = %127[^\n]", key, val) < 1) continue;
-        if (!strcmp(key, "rando_seed")) {
-            if (sscanf(line, " %63[^= ] = %127[^\n]", key, val) != 2) val[0] = 0;
-            strlcpy(g_settings.rando_seed, val, sizeof g_settings.rando_seed);
-            continue;
-        }
         if (!strcmp(key, "aspect")) g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : ASPECT_UNLOCKED;
         else if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
@@ -102,12 +97,7 @@ void settings_load(void) {
         }
         else if (!strcmp(key, "upscaler")) g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR : UPSCALE_SHARP;  // (metalfx / fsr1: this OS's)
         else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : AA_SMAA;  // ("fxaa": SMAA now)
-        else if (!strcmp(key, "inv_keys")) g_settings.inv_keys = atoi(val) != 0;
         else if (!strcmp(key, "dpad_move")) g_settings.dpad_move = atoi(val) != 0;
-        else if (!strcmp(key, "move_360")) g_settings.move_360 = atoi(val) != 0;
-        else if (!strcmp(key, "blur_removal")) g_settings.blur_removal = atoi(val) != 0;
-        else if (!strcmp(key, "hide_hero_icon")) g_settings.hide_hero_icon = atoi(val) != 0;
-        else if (!strcmp(key, "mirror_mode")) g_settings.mirror_mode = atoi(val) != 0;
         else if (!strcmp(key, "prompts")) g_settings.prompts = !strcmp(val, "nintendo") ? PROMPTS_NINTENDO : !strcmp(val, "xbox") ?
                                                               PROMPTS_XBOX : !strcmp(val, "playstation") ? PROMPTS_PLAYSTATION : PROMPTS_AUTO;
         else if (!strcmp(key, "language")) {  // ("auto" or one of the game's codes; anything else: auto)
@@ -115,21 +105,8 @@ void settings_load(void) {
             for (int i = 1; i < N_LANGUAGES; i++)
                 if (!strcmp(val, g_language_codes[i])) g_settings.language = i;
         }
-        else if (!strcmp(key, "tracker")) g_settings.tracker = atoi(val) != 0;
         else if (!strcmp(key, "menu_tip_seen")) g_settings.menu_tip_seen = atoi(val) != 0, tip_key = true;
         else if (!strcmp(key, "aspect_asked")) g_settings.aspect_asked = atoi(val) != 0, aspect_key = true;
-        else if (!strcmp(key, "chaos_letters"))
-            g_settings.chaos_letters = !strcmp(val, "off") ? CHAOS_LETTERS_OFF : !strcmp(val, "explored") ? CHAOS_LETTERS_EXPLORED : CHAOS_LETTERS_MAP;
-        else if (!strcmp(key, "cheat_hearts")) g_settings.cheat_hearts = atoi(val) != 0;
-        else if (!strcmp(key, "cheat_ammo")) g_settings.cheat_ammo = atoi(val) != 0;
-        else if (!strcmp(key, "cheat_rupees")) g_settings.cheat_rupees = atoi(val) != 0;
-        else if (!strcmp(key, "cheat_hookshot")) g_settings.cheat_hookshot = atoi(val) != 0;
-        else if (!strcmp(key, "no_buff_drops")) g_settings.no_buff_drops = atoi(val) != 0;
-        else if (!strcmp(key, "diff_damage")) g_settings.diff_damage = (float)atof(val);
-        else if (!strcmp(key, "diff_ohko")) g_settings.diff_ohko = atoi(val) != 0;
-        else if (!strcmp(key, "diff_hero")) g_settings.diff_hero = atoi(val) != 0;
-        else if (!strcmp(key, "tunic")) { for (int i = 0; i < N_TUNIC_COLOURS; i++) if (!strcmp(val, g_tunic_colours[i])) g_settings.tunic = i; }
-        else if (!strcmp(key, "hearts")) { for (int i = 0; i < N_HEART_COLOURS; i++) if (!strcmp(val, g_heart_colours[i])) g_settings.hearts = i; }
         else bind_settings_load(key, val);  // bind_pad_* / bind_key_*: runtime/hle/bindings.c
     }
     fclose(f);
@@ -158,28 +135,13 @@ void settings_save(void) {
     else if (g_settings.res_mode == RES_Q50) fprintf(f, "resolution = 50%%\n");
     else if (g_settings.res_mode >= 1 && g_settings.res_mode <= 8) fprintf(f, "resolution = %dx\n", g_settings.res_mode);
     else fprintf(f, "resolution = match\n");
-    fprintf(f, "inv_keys = %d\n", g_settings.inv_keys);
     fprintf(f, "dpad_move = %d\n", g_settings.dpad_move);
-    fprintf(f, "move_360 = %d\nblur_removal = %d\nhide_hero_icon = %d\n", g_settings.move_360, g_settings.blur_removal,
-            g_settings.hide_hero_icon);
     static const char *const prompts[] = {"auto", "nintendo", "xbox", "playstation"};
     fprintf(f, "prompts = %s\n", prompts[g_settings.prompts & 3]);
-    fprintf(f, "mirror_mode = %d\n", g_settings.mirror_mode);
     fprintf(f, "language = %s\n", g_language_codes[g_settings.language > LANG_AUTO && g_settings.language < N_LANGUAGES
                                                      ? g_settings.language : LANG_AUTO]);
-    fprintf(f, "tracker = %d\n", g_settings.tracker);
     fprintf(f, "aspect_asked = %d\n", g_settings.aspect_asked);
     fprintf(f, "menu_tip_seen = %d\n", g_settings.menu_tip_seen);
-    static const char *const letters[] = {"off", "explored", "map"};
-    fprintf(f, "chaos_letters = %s\n", letters[g_settings.chaos_letters]);
-    fprintf(f, "cheat_hearts = %d\ncheat_ammo = %d\ncheat_rupees = %d\n", g_settings.cheat_hearts, g_settings.cheat_ammo,
-            g_settings.cheat_rupees);
-    fprintf(f, "cheat_hookshot = %d\n", g_settings.cheat_hookshot);
-    fprintf(f, "no_buff_drops = %d\n", g_settings.no_buff_drops);
-    fprintf(f, "diff_damage = %.2f\ndiff_ohko = %d\ndiff_hero = %d\n", g_settings.diff_damage, g_settings.diff_ohko,
-            g_settings.diff_hero);
-    fprintf(f, "tunic = %s\nhearts = %s\n", g_tunic_colours[g_settings.tunic], g_heart_colours[g_settings.hearts]);
     bind_settings_save(f);
-    fprintf(f, "rando_seed = %s\n", g_settings.rando_seed);
     fclose(f);
 }

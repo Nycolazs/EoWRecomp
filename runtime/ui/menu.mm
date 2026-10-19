@@ -27,13 +27,6 @@ extern "C" {
 #include "../settings.h"
 #include "menu.h"
 void input_reset(void);
-void save_editor_draw(float scale);  // save_editor.mm
-extern "C" int game_in_play(void);  // hle/warp.c
-void save_editor_on_open(void);
-void rando_tab_draw(float scale);
-bool warp_tab_draw(float scale);  // warp_tab.mm: true when a warp started
-extern "C" void cheats_draw(float scale);  // cheats.mm
-extern "C" void difficulty_draw(float scale);  // difficulty.mm
 void controls_bindings_draw(float scale);  // controls_ui.mm
 #include "../input_bind.h"
 #include "../paths.h"
@@ -76,7 +69,6 @@ static void set_open(bool open) {
     input_reset();  // nothing held while the menu had focus leaks into the game
     bind_capture_cancel();
     if (open) {
-        save_editor_on_open();
         static bool opened;  // the controller's cursor: the first tab (Controls) the first time this session, later the
         menu_tabs_focus(!opened);  // selected one
         opened = true;
@@ -439,8 +431,8 @@ static void tab_display(void) {
     opt_section("Display");
     const char *aspects[] = {"Unlocked", "Original 16:9"};
     opt_choice("Aspect ratio", &g_settings.aspect, aspects, 2, ASPECT_UNLOCKED,
-               "Unlocked: the view fills the window, so wider (or taller) windows show more of the island - up to "
-               "ultrawide; houses and dungeons keep their framing. Original 16:9: the game's own framing, with bars.");
+               "Unlocked: the view fills the window, so wider (or taller) windows show more of the world. Original "
+               "16:9: the game's own framing, with bars.");
     bool fs = g_settings.fullscreen;
     if (opt_toggle("Fullscreen", &fs, false, "Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.")) {
         g_settings.fullscreen = fs;
@@ -494,26 +486,6 @@ static void tab_display(void) {
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
 
-    opt_section("Game");
-    opt_toggle("Remove blur", &g_settings.blur_removal, false,
-               "Turns off the tilt-shift blur at the top and bottom of the screen.");
-    opt_toggle("Hide Hero Mode icon", &g_settings.hide_hero_icon, false,
-               "Hides the Hero Mode emblem in the corner of the screen while playing a Hero Mode file.");
-    opt_end();
-}
-
-// Cosmetics: tunic / heart colours, live (runtime/nvn/texpatch.c); never part of a seed
-static void tab_cosmetics(void) {
-    opt_begin("##cosmetics", ImGui::GetFontSize() / 34);
-    opt_section("Colors");
-    opt_choice("Tunic color", &g_settings.tunic, g_tunic_colours, N_TUNIC_COLOURS, 0,
-               "Link's tunic color. Default: the game's own (or the randomizer seed's).");
-    opt_choice("Heart color", &g_settings.hearts, g_heart_colours, N_HEART_COLOURS, 0,
-               "The color of the hearts on the HUD.");
-    if (opt_action("Random colors", "", "Picks a random tunic and heart color (any other color, Default included).")) {
-        g_settings.tunic = (g_settings.tunic + 1 + rand() % (N_TUNIC_COLOURS - 1)) % N_TUNIC_COLOURS;
-        g_settings.hearts = (g_settings.hearts + 1 + rand() % (N_HEART_COLOURS - 1)) % N_HEART_COLOURS;
-    }
     opt_end();
 }
 
@@ -527,7 +499,7 @@ static void tab_audio(void) {
     opt_toggle("Room reverb", &g_settings.reverb, true,
                "The game's echo in caves, dungeons and big rooms.");
     opt_toggle("Movie audio", &g_settings.movie_audio, true,
-               "Sound in the game's movies (the opening and the ending). Applies the next time a movie starts.");
+               "Sound in the game's movies. Applies the next time a movie starts.");
     opt_end();
 }
 
@@ -568,9 +540,7 @@ static void tab_quit(float scale, bool in_game) {
 
 static void tab_about(void) {
     header("Movement");
-    toggle("D-pad moves Link", &g_settings.dpad_move);
-    toggle("360-degree movement", &g_settings.move_360);
-    hint("Link walks in the exact direction of the stick instead of snapping to 8 directions.");
+    toggle("D-pad moves like the left stick", &g_settings.dpad_move);
     ImGui::Spacing();
     header("Button prompts");
     {
@@ -603,12 +573,6 @@ static void tab_about(void) {
     ImGui::TextUnformatted("Fullscreen:  F11 / Alt+Enter");
 }
 
-extern "C" bool inventory_overlay_wanted(void);
-extern "C" bool tracker_overlay_wanted(void);
-extern "C" void tracker_overlay_draw(ImVec2 display, ImFont *font);
-extern "C" bool chaos_overlay_wanted(void);
-extern "C" void chaos_overlay_draw(ImVec2 display, ImFont *font);
-extern "C" void inventory_overlay_draw(ImVec2 display, ImFont *font);
 
 // Reboot (runtime/main.c): the game is gone - menu and name dialog close; the ImGui context stays.
 RT_ON_RESET(menu_reset) {
@@ -683,12 +647,10 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     Tab tabs[11];
     int ntabs = 0;
     if (prelaunch) tabs[ntabs++] = {"Prelaunch", -1, true};
-    static const char *names[] = {"Video", "Audio", "Save Editor", "Randomizer", "Warp", "Cheats", "Gameplay",
-                                  "Cosmetics", "Controls", "Quit"};
-    static const int order[] = {8, 0, 1, 6, 7, 3, 5, 4, 2, 9};  // Controls, Video, Audio, Gameplay, Cosmetics, Randomizer,
-                                                                // Cheats, Warp, Save Editor, Quit (ids stay: test hooks)
-    for (int i : order)  // (Quit: in game only - the start screen has its own QUIT, and an eleventh tab cut names short)
-        if (i != 9 || !prelaunch) tabs[ntabs++] = {names[i], i, in_game || (i != 2 && i != 4 && i != 5)};
+    static const char *names[] = {"Video", "Audio", "", "", "", "", "", "", "Controls", "Quit"};
+    static const int order[] = {8, 0, 1, 9};  // Controls, Video, Audio, Quit (ids as in LAS Recomp: test hooks)
+    for (int i : order)  // (Quit: in game only - the start screen has its own QUIT)
+        if (i != 9 || !prelaunch) tabs[ntabs++] = {names[i], i, true};
     int cur = 0;  // g_tab / g_tab_request hold ids
     for (int i = 0; i < ntabs; i++) if (tabs[i].id == g_tab) cur = i;
     if (!tabs[cur].on) cur = 0;
@@ -754,16 +716,9 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 ImGui::Spacing();
                 ImGui::BeginChild("##page", ImVec2(0, 0), ImGuiChildFlags_None,  // (the rest of the window: no hint line)
                                   ImGuiWindowFlags_NavFlattened);
-                // Down from the tab bar, pages that aren't option rows (Prelaunch, Controls, Warp): their first control
+                // Down from the tab bar, pages that aren't option rows (Prelaunch, Controls): their first control
                 // (option-row pages: opt_focus_first)
-                if (down_from_tab && (t.id == -1 || t.id == 8 || t.id == 4)) {
-                    opt_focus_first(false);
-                    ImGui::SetKeyboardFocusHere();
-                    ImGui::SetNavCursorVisible(true);
-                }
-                // Down from the tab bar, pages that aren't option rows (Prelaunch, Controls, Warp): their first control
-                // (option-row pages: opt_focus_first)
-                if (down_from_tab && (t.id == -1 || t.id == 8 || t.id == 4)) {
+                if (down_from_tab && (t.id == -1 || t.id == 8)) {
                     opt_focus_first(false);
                     ImGui::SetKeyboardFocusHere();
                     ImGui::SetNavCursorVisible(true);
@@ -772,15 +727,6 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case -1: prelaunch(scale); break;
                 case 0: tab_display(); break;
                 case 1: tab_audio(); break;
-                case 2:
-                    if (game_in_play()) save_editor_draw(scale);
-                    else ImGui::TextDisabled("Load a save file and get into the game to edit it.");
-                    break;
-                case 3: rando_tab_draw(scale); break;
-                case 4: if (warp_tab_draw(scale)) set_open(false); break;
-                case 5: cheats_draw(scale); break;
-                case 6: difficulty_draw(scale); break;
-                case 7: tab_cosmetics(); break;
                 case 8: tab_about(); break;
                 case 9: tab_quit(scale, in_game); break;
                 }
@@ -815,11 +761,8 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     const double tw = target_w, th = target_h;
 #endif
     bool open = g_open.load();
-    bool inv = !open && inventory_overlay_wanted();
-    bool trk = !open && tracker_overlay_wanted();
-    bool chaos = !open && chaos_overlay_wanted();
     bool kbd = g_kbd.load() == 1;
-    if (!open && !kbd && !g_settings.show_fps && !inv && !trk && !chaos) {
+    if (!open && !kbd && !g_settings.show_fps) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         return;
     }
@@ -873,11 +816,6 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         ImGui::End();
     }
 
-    if (trk) tracker_overlay_draw(io.DisplaySize, g_font_big ? g_font_big : ImGui::GetFont());
-    if (chaos) chaos_overlay_draw(io.DisplaySize, g_font_big ? g_font_big : ImGui::GetFont());
-    if (inv) {
-        inventory_overlay_draw(io.DisplaySize, g_font_big ? g_font_big : ImGui::GetFont());
-    }
 
     if (open) {
         // dim the game behind the menu

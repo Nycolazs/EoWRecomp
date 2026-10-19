@@ -479,20 +479,9 @@ static void load_background(GpuDevice dev) {
     avformat_close_input(&fmt);
 }
 
-// ------------------------------------------------------------------ seeds
-static std::vector<std::string> list_seeds() {
-    std::vector<std::string> out;
-    if (DIR *d = opendir("rando")) {
-        while (struct dirent *e = readdir(d)) {
-            if (e->d_name[0] == '.') continue;
-            std::string dir = std::string("rando/") + e->d_name;
-            if (file_exists(dir + "/settings.json") && file_exists(dir + "/romfs")) out.push_back(e->d_name);
-        }
-        closedir(d);
-    }
-    std::sort(out.begin(), out.end());
-    return out;
-}
+// ------------------------------------------------------------------ play choices
+// The PLAY line's ‹ › picker: LAS Recomp listed randomizer seeds here. EoWRecomp has only the game itself for now.
+static std::vector<std::string> list_seeds() { return {}; }
 
 // ------------------------------------------------------------------ screen
 static ImFont *g_font_title, *g_font_menu, *g_font_small;
@@ -505,7 +494,7 @@ void menu_tabs_draw(float scale, ImFont *font, ImFont *font_big, bool in_game, v
 void menu_tabs_focus(bool first_tab);
 extern int g_tab_request_ext;
 extern "C" void menu_apply_window_requests(void *sdl_window);
-extern "C" int g_start_screen;  // runtime/hle/warp.c: the start screen is up (no game loaded: don't read its memory)
+int g_start_screen;  // the start screen is up (no game loaded: host code must not read its memory)
 // The Randomizer tab's Play / Play Now on the start screen (rando_tab.mm): start the game with that seed
 static std::string g_play_seed;
 static bool g_play_seed_req, g_play_pending;
@@ -902,11 +891,9 @@ extern "C" void launcher_run(const char *root) {
     std::string status = check_game_files(g_root);
     if (status.empty()) load_background(dev);
     std::vector<std::string> seeds = list_seeds();
-    std::vector<std::string> choices = {"Vanilla"};
+    std::vector<std::string> choices = {"Echoes of Wisdom"};
     choices.insert(choices.end(), seeds.begin(), seeds.end());
     int choice = 0;
-    for (size_t i = 0; i < seeds.size(); i++)
-        if (seeds[i] == g_settings.rando_seed) choice = (int)i + 1;
     Page page = status.empty() ? MAIN : SETUP;
     bool play = false;
     // EOWRECOMP_LAUNCHER_SHOT=<frame>[:<page>] (test): save build/launcher.png at that frame and exit; page: settings[:<tab>] / askdelete / setup
@@ -953,8 +940,6 @@ extern "C" void launcher_run(const char *root) {
     }
     while (!play) {
         menu_apply_window_requests(win);  // (the Video tab's Fullscreen)
-        // the seed PLAY would start, kept current (Settings > Gameplay greys out what that seed forces)
-        snprintf(g_settings.rando_seed, sizeof g_settings.rando_seed, "%s", choice ? choices[choice].c_str() : "");
         if (g_files_deleted) {  // (Settings > Prelaunch deleted them)
             g_files_deleted = false;
             status = check_game_files(g_root);
@@ -963,7 +948,7 @@ extern "C" void launcher_run(const char *root) {
         if (g_play_seed_req) {  // the Randomizer tab's Play: that seed, then PLAY as if pressed (first-launch questions)
             g_play_seed_req = false;
             seeds = list_seeds();
-            choices = {"Vanilla"};
+            choices = {"Echoes of Wisdom"};
             choices.insert(choices.end(), seeds.begin(), seeds.end());
             choice = 0;
             for (size_t i = 0; i < seeds.size(); i++)
@@ -1224,7 +1209,7 @@ extern "C" void launcher_run(const char *root) {
                     page = MAIN, g_refocus = SETTINGS;
                     std::string cur = choices[choice];  // seeds made / renamed / deleted in the Randomizer tab
                     seeds = list_seeds();
-                    choices = {"Vanilla"};
+                    choices = {"Echoes of Wisdom"};
                     choices.insert(choices.end(), seeds.begin(), seeds.end());
                     choice = 0;
                     for (size_t i = 0; i < choices.size(); i++)
@@ -1509,8 +1494,7 @@ extern "C" void launcher_run(const char *root) {
 #endif
         }
     }
-    // play: remember the choice, hand the window to the game
-    snprintf(g_settings.rando_seed, sizeof g_settings.rando_seed, "%s", choice ? choices[choice].c_str() : "");
+    // play: hand the window to the game
     settings_save();
 #ifdef __APPLE__
     ImGui_ImplMetal_Shutdown();

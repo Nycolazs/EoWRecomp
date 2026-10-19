@@ -9,7 +9,6 @@
 #include "settings.h"
 #include "hle.h"
 #include "kernel.h"
-#include "rando.h"
 
 const char *g_romfs_dir;
 
@@ -31,8 +30,12 @@ static void module_init(Cpu *c, Module *m) {
     else run_array(c, m->init_array, m->init_array_sz);
 }
 
-static void rtld_init_sdk(Cpu *c) { module_init(c, &g_modules[1]); }
-static void rtld_init_main(Cpu *c) { module_init(c, &g_modules[0]); }
+// Early: the SDK's own constructors. Late (its heap is up): the other modules', main last (it uses the others).
+static void rtld_init_sdk(Cpu *c) { module_init(c, loader_module("sdk")); }
+static void rtld_init_main(Cpu *c) {
+    for (int i = g_nmodules - 1; i >= 0; i--)
+        if (strcmp(g_modules[i].name, "sdk")) module_init(c, &g_modules[i]);
+}
 
 // Claim the guest address range before anything else can map there. The host allocator places
 // regions at random addresses in the same window; on a collision, re-exec for a fresh layout.
@@ -53,11 +56,11 @@ __attribute__((constructor(101))) static void reserve_guest_space(void) {
 }
 
 // ------------------------------------------------------------------ boot / in-place reboot
-// Switching seeds (or vanilla) and going back to the start screen reboot the game inside this process: the window,
+// Going back to the start screen (or booting again) reboots the game inside this process: the window,
 // GPU device, settings and shader caches stay. rt_request_reboot (menu, any thread) makes ui_run return on the
 // main thread, which then: stops every guest thread (kernel_stop_threads: each unwinds at its next svc / HLE call /
 // wait), resets the renderer (textures, address-keyed caches) and all per-boot host state (RT_ON_RESET hooks:
-// services, HLE features, seed data, audio), empties the kernel, wipes guest memory, and boots again.
+// services, HLE features, audio), empties the kernel, wipes guest memory, and boots again.
 static _Atomic int g_reboot;
 void rt_request_reboot(int kind) {
     LOG("[reboot] requested (%s)\n", kind == RT_REBOOT_TITLE ? "start screen" : "boot");
@@ -65,9 +68,8 @@ void rt_request_reboot(int kind) {
 }
 int rt_reboot_requested(void) { return g_reboot; }
 
-// EOWRECOMP_REBOOT_AT=<frame>:<seed | vanilla | title>[,...] (test): at that presented frame, switch to the seed /
-// vanilla in place, or go back to the start screen (with EOWRECOMP_LAUNCHER_AUTOPLAY it plays the saved choice).
-// Frames count on across reboots. Called by the presenter every frame.
+// EOWRECOMP_REBOOT_AT=<frame>:<game | title>[,...] (test): at that presented frame, boot the game again in place, or
+// go back to the start screen. Frames count on across reboots. Called by the presenter every frame.
 void reboot_test_frame(uint64_t frame) {
     static const char *next;
     static int init;
@@ -77,11 +79,7 @@ void reboot_test_frame(uint64_t frame) {
     if (!next || !*next || sscanf(next, "%ld:%127[^,]", &at, what) != 2 || (long)frame < at) return;
     next = strchr(next, ',');
     if (next) next++;
-    if (!strcmp(what, "title")) { rt_request_reboot(RT_REBOOT_TITLE); return; }
-    // (a test run: the next boot's seed without saving it - eowrecomp.ini is the player's choice)
-    strlcpy(g_settings.rando_seed, strcmp(what, "vanilla") ? what : "", sizeof g_settings.rando_seed);
-    unsetenv("EOWRECOMP_RANDO_SEED");
-    rt_request_reboot(RT_REBOOT_GAME);
+    rt_request_reboot(strcmp(what, "title") ? RT_REBOOT_GAME : RT_REBOOT_TITLE);
 }
 
 #ifdef __APPLE__
@@ -133,7 +131,6 @@ static void boot(const char *root) {
     char why[512];
     if (!gamelib_load(root, why, sizeof why)) FATAL("%s\n", why);
     loader_load(exefs);
-    rando_boot();  // the chosen seed's data patches go into the freshly loaded module
     { extern void settings_load(void); settings_load(); }
     kernel_init();
     dispatch_init();
@@ -176,7 +173,7 @@ int main(int argc, char **argv) {
     }
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
     for (bool title = !skip_launcher;;) {
-        if (title) {  // start screen (runtime/ui/launcher.mm): game files setup, seed choice, settings
+        if (title) {  // start screen (runtime/ui/launcher.mm): game files setup, settings
             extern void launcher_run(const char *root);
             launcher_run(root);
         }

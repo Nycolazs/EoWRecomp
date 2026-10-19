@@ -1,6 +1,7 @@
 // Linux host layer (runtime/platform.h). x86-64 and aarch64.
 #define _GNU_SOURCE
 #include <SDL3/SDL.h>
+#include "cpu_check.h"
 #include <dlfcn.h>
 #include <errno.h>
 #include <execinfo.h>
@@ -103,8 +104,7 @@ static void log_to_file_without_terminal(void) {
 // The recompiled game code is built for x86-64-v3 (Makefile GENARCH: AVX2, FMA, BMI2): say so instead of crashing
 // with an illegal instruction on an older CPU.
 static void require_cpu(void) {
-    __builtin_cpu_init();
-    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2")) return;
+    if (cpu_has_x86_64_v3()) return;
     fprintf(stderr, "FATAL: EoWRecomp needs a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / Zen or "
                     "newer).\n");
     exit(1);

@@ -4,7 +4,7 @@
 
 #include "rt.h"
 
-Module g_modules[4];
+Module g_modules[GAME_NMODULES];
 int g_nmodules;
 
 enum { DT_NULL = 0, DT_PLTRELSZ = 2, DT_HASH = 4, DT_STRTAB = 5, DT_SYMTAB = 6, DT_RELA = 7, DT_RELASZ = 8,
@@ -98,6 +98,12 @@ static void load_nso(Module *m, const char *path, uint64_t base) {
 static Elf64Sym *sym(Module *m, uint64_t i) { return (Elf64Sym *)m->symtab + i; }
 static const char *symname(Module *m, Elf64Sym *s) { return (const char *)(m->strtab + s->name); }
 
+Module *loader_module(const char *name) {
+    for (int i = 0; i < g_nmodules; i++)
+        if (!strcmp(g_modules[i].name, name)) return &g_modules[i];
+    return NULL;
+}
+
 uint64_t loader_find_symbol(const char *name) {
     for (int mi = 0; mi < g_nmodules; mi++) {
         Module *m = &g_modules[mi];
@@ -174,12 +180,16 @@ static void relocate(Module *m) {
 
 void loader_load(const char *exefs) {
     char path[1024];
-    static const struct { const char *name; uint64_t base; } mods[] = {{"main", MAIN_BASE}, {"sdk", SDK_BASE}};
-    for (unsigned i = 0; i < 2; i++) {
+#define MOD(name, base) {#name, base},
+    static const struct { const char *name; uint64_t base; } mods[] = {GAME_MODULES(MOD)};
+    for (unsigned i = 0; i < GAME_NMODULES; i++) {
         Module *m = &g_modules[g_nmodules++];
         m->name = mods[i].name;
         snprintf(path, sizeof path, "%s/%s", exefs, m->name);
         load_nso(m, path, mods[i].base);
+        uint64_t room = i + 1 < GAME_NMODULES ? mods[i + 1].base - mods[i].base : GAME_MODULE_SPAN;
+        if (m->size > room) FATAL("module %s (0x%llx bytes) overlaps the next one: fix runtime/modules.h\n", m->name,
+                                  (unsigned long long)m->size);
     }
     for (int i = 0; i < g_nmodules; i++) relocate(&g_modules[i]);
 }

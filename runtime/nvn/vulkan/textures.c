@@ -186,15 +186,9 @@ bool renderer_texture_first_write(NvnTexture *t) {
 }
 
 static uint32_t g_level_gen = 1;
-void vk_level_change_check(void) {
-    extern const char *game_level_name(void);
-    static char last[64];
-    const char *lv = game_level_name();
-    if (strncmp(lv, last, sizeof last - 1) != 0) {
-        strlcpy(last, lv, sizeof last);
-        if (!strncmp(lv, "TelephoneBox", 12) || getenv("EOWRECOMP_CLEAR_ALL_LEVELS")) g_level_gen++;
-    }
-}
+// Render targets are cleared once after a level change (renderer_texture_level_fresh). LAS Recomp bumped the
+// generation on Link's Awakening level names; Echoes of Wisdom has no level hook yet, so it never changes.
+void vk_level_change_check(void) {}
 
 bool renderer_texture_frame_fresh(NvnTexture *t) {
     static int on = -1;

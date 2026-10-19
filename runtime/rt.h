@@ -5,6 +5,7 @@
 #include <stdio.h>
 
 #include "cpu.h"
+#include "modules.h"
 #include "platform.h"
 
 #define LOG(...) fprintf(stderr, __VA_ARGS__)
@@ -15,8 +16,7 @@
 // guest lives in a 12.5 GB window at 0x70_0000_0000 claimed at startup (see main.c).
 #define GUEST_LO     0x7000000000ull
 #define GUEST_HI     0x7320000000ull
-#define MAIN_BASE    0x7000000000ull
-#define SDK_BASE     0x7004000000ull
+// game modules: runtime/modules.h (0x7000000000 - 0x7010000000)
 #define HLE_BASE     0x7080000000ull   // fake addresses for host-implemented functions
 #define HLE_SIZE     0x0000100000ull
 #define TLS_BASE     0x7090000000ull
@@ -37,7 +37,8 @@ typedef struct Module {
     uint64_t symtab, strtab, nsyms;
 } Module;
 
-extern Module g_modules[4];
+extern Module g_modules[GAME_NMODULES];
+Module *loader_module(const char *name);  // NULL if not loaded
 extern int g_nmodules;
 void loader_load(const char *exefs_dir);  // (again after a reboot: modules are reloaded into wiped memory)
 uint64_t loader_find_symbol(const char *name);

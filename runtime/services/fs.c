@@ -8,8 +8,15 @@
 #include <unistd.h>
 
 #include "../hle.h"
-#include "../rando.h"
 #include "../ipc.h"
+
+// Replacement / extra RomFS files and separate save slots from a folder (in LAS Recomp: randomizer seeds). The
+// overlay machinery below stays for mod support; no folder is used yet.
+static const char *mod_dir(void) { return NULL; }
+static bool mod_romfs_override(const char *path, char *host, size_t n) {
+    (void)path, (void)host, (void)n;
+    return false;
+}
 
 #define FS_PATH_NOT_FOUND MAKE_RESULT(2, 1)
 #define FS_PATH_EXISTS MAKE_RESULT(2, 2)
@@ -135,7 +142,7 @@ static int64_t dir_lookup(const uint8_t *dm, uint64_t dsz, const char *path) {
 }
 
 static void add_new_files(int fd, const uint64_t *h, const uint8_t *dmeta, uint64_t dsz, uint64_t fsz) {
-    const char *seed = rando_seed_dir();
+    const char *seed = mod_dir();  // (the mod folder)
     if (!seed) return;
     char root[1100];
     snprintf(root, sizeof root, "%s/romfs", seed);
@@ -217,7 +224,7 @@ static void add_new_files(int fd, const uint64_t *h, const uint8_t *dmeta, uint6
     patches[npatches++] = (Patch){0, 0x50, head};
     patches[npatches++] = (Patch){h[3], dsz, dcopy};
     patches[npatches++] = (Patch){hoff, hsz, hcopy};
-    LOG("[fs] randomizer: %d new romfs files\n", added);
+    LOG("[fs] mods: %d new romfs files\n", added);
 }
 
 static void rom_index(int fd) {
@@ -249,11 +256,11 @@ static void rom_index(int fd) {
         rom_files[rom_nfiles++] = (RomFile){rom_data_off + data, size, path, (uint32_t)o};
         o += 0x20 + ((namelen + 3) & ~3u);
     }
-    // Randomizer seed: replacement files are served from the seed folder. The file-meta table is patched
+    // Mods: replacement files are served from the mod folder. The file-meta table is patched
     // (in a copy) to point them at data appended past the end of the image; reads there go to host files.
     for (int i = 0; i < rom_nfiles; i++) {
         char host[1200];
-        if (!rando_romfs_override(rom_files[i].path, host, sizeof host)) continue;
+        if (!mod_romfs_override(rom_files[i].path, host, sizeof host)) continue;
         struct stat sb;
         if (stat(host, &sb)) continue;
         if (!ov_meta) {
@@ -277,7 +284,7 @@ static void rom_index(int fd) {
         ov_n++;
         ov_end = (ov_end + size + 0xF) & ~0xFull;
     }
-    if (ov_n) LOG("[fs] randomizer: %d romfs files replaced\n", ov_n);
+    if (ov_n) LOG("[fs] mods: %d romfs files replaced\n", ov_n);
     if (ov_meta) { patches[npatches++] = (Patch){ov_meta_off, ov_meta_size, ov_meta}; }
     add_new_files(fd, h, dmeta, dsz, fsz);
     qsort(rom_files, rom_nfiles, sizeof *rom_files, rom_cmp);
@@ -337,8 +344,6 @@ const char *romfs_file_at(uint64_t off) {
     return NULL;
 }
 
-void romfs_file_read_hook(const char *path);
-
 // ------------------------------------------------------------------ IStorage (raw RomFS image)
 typedef struct { int fd; uint64_t size; } Storage;
 
@@ -358,7 +363,6 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
             if (path && path != last) {
                 last = path;
                 if (getenv("EOWRECOMP_LOG_FILES")) LOG("[fs] read %s\n", path);
-                romfs_file_read_hook(path);
             }
         }
         static uint64_t reads, bytes;
@@ -420,10 +424,6 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
         ssize_t n = pread(f->fd, (void *)(uintptr_t)b->addr, (size_t)size, off);
         if (strstr(f->path, "savedata")) {
             LOG("[save] read %s off %lld size %lld -> guest %llx\n", f->path, (long long)off, (long long)size, (unsigned long long)b->addr);
-            extern void save_editor_file_read(const char *path, uint64_t addr, int64_t off, int64_t size);
-            save_editor_file_read(f->path, b->addr, off, n);
-            extern void flags_ext_save_read(const char *path, uint64_t addr, int64_t off, int64_t size);
-            flags_ext_save_read(f->path, b->addr, off, n);
         }
         OUT(int64_t, 0) = n < 0 ? 0 : n;
         resp_size(resp, 8);
@@ -435,10 +435,6 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
         if (strstr(f->path, "savedata"))
             LOG("[save] write %s off %lld size %lld <- guest %llx\n", f->path, (long long)off, (long long)size, (unsigned long long)a->addr);
         if (pwrite(f->fd, (void *)(uintptr_t)a->addr, (size_t)size, off) < 0) resp->result = errno_result();
-        else if (strstr(f->path, "savedata")) {
-            extern void flags_ext_save_written(const char *path, uint64_t addr, int64_t off, int64_t size);
-            flags_ext_save_written(f->path, a->addr, off, size);
-        }
         break;
     }
     case 2: fsync(f->fd); break;
@@ -576,9 +572,9 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
 static Service *open_host_fs(const char *sub) {
     HostFs *fs = calloc(1, sizeof *fs);
     if (getenv("EOWRECOMP_SAVE_DIR")) g_save_dir = getenv("EOWRECOMP_SAVE_DIR");  // test runs use a scratch copy
-    else if (rando_seed_dir()) {  // each randomizer seed has its own save slots
+    else if (mod_dir()) {  // a mod folder has its own save slots
         static char seed_save[600];
-        snprintf(seed_save, sizeof seed_save, "%s/save", rando_seed_dir());
+        snprintf(seed_save, sizeof seed_save, "%s/save", mod_dir());
         g_save_dir = seed_save;
     }
     snprintf(fs->root, sizeof fs->root, "%s/%s", g_save_dir, sub);
