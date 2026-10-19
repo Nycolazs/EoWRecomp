@@ -164,7 +164,7 @@ static GuestFn dispatch_slow(Cpu *c) {
 // Always tail-calls, so chains of indirect jumps don't grow the host stack.
 void rt_dispatch(Cpu *c) {
     unsigned h = (unsigned)(c->pc >> 2) & (DCACHE - 1);
-    GuestFn f = dcache[h].addr == c->pc ? dcache[h].fn : dispatch_slow(c);
+    GuestFn f = dcache[h].addr == c->pc && dcache[h].fn ? dcache[h].fn : dispatch_slow(c);  // (empty slots: addr 0)
     __attribute__((musttail)) return f(c);
 }
 

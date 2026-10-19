@@ -24,6 +24,9 @@ from nso import Nso, R_AARCH64_RELATIVE
 SCRATCH_MEM = 0x7300000000
 
 
+OPTNONE_INSNS = 3000  # functions with jump tables above this many instructions are compiled unoptimized
+
+
 def sext26(w):
     v = w & 0x03FFFFFF
     return v - 0x04000000 if v & 0x02000000 else v
@@ -95,8 +98,21 @@ class Module:
             self.mu = mu
         return self.mu
 
+    def true_function(self, a):
+        """[start, end) of the .eh_frame function containing a (the compiler's function, before splitting)."""
+        if not hasattr(self, '_eh'):
+            self._eh = sorted(self.base + x for x in eh_frame_functions(self.nso) if self.in_text(self.base + x))
+        i = bisect.bisect_right(self._eh, a) - 1
+        if i < 0:
+            return self.lo, self.hi
+        return self._eh[i], self._eh[i + 1] if i + 1 < len(self._eh) else self.hi
+
     def jump_table(self, br_pc, entry, end):
-        """Resolve `br xN` targets from a bounds-checked jump table, or None."""
+        """Resolve `br xN` targets from a bounds-checked jump table, or None. Targets may lie outside the piece
+        entry..end when the function was split (another function branches into its middle): anywhere in the
+        compiler's function (.eh_frame) holding the br is accepted; scan() makes those targets boundaries."""
+        tlo, thi = self.true_function(br_pc)
+        self._vlo, self._vhi = min(entry, tlo), max(end, thi)
         r = self._jump_table_fallthrough(br_pc, entry, end)
         if r is None:
             r = self._jump_table_taken(br_pc, entry, end)
@@ -153,7 +169,7 @@ class Module:
                 for r in range(29):
                     mu.reg_write(A.UC_ARM64_REG_X0 + r, SCRATCH_MEM + 0x80000)
                 mu.reg_write(A.UC_ARM64_REG_SP, SCRATCH_MEM + 0x80000)
-                a2 = entry
+                a2 = self._vlo
                 while a2 < start:
                     w2 = self.word(a2)
                     if (w2 & 0x1F000000) == 0x10000000 or (w2 & 0xFF800000) == 0x91000000:
@@ -166,7 +182,7 @@ class Module:
                     return None
                 t = mu.reg_read(A.UC_ARM64_REG_X0 + rn if rn < 29 else
                                 (A.UC_ARM64_REG_X29 if rn == 29 else A.UC_ARM64_REG_X30))
-                if not (entry <= t < end) or t % 4:
+                if not (self._vlo <= t < self._vhi) or t % 4:
                     return None
                 targets.append(t)
         except uc.UcError:
@@ -256,7 +272,7 @@ class Module:
                 mu.reg_write(A.UC_ARM64_REG_SP, SCRATCH_MEM + 0x80000)
                 # replay address materialization (ADRP/ADR/ADD-imm) from the function entry, so table
                 # bases computed before loops or branches are known
-                a2 = entry
+                a2 = self._vlo
                 while a2 < start:
                     w2 = self.word(a2)
                     if (w2 & 0x1F000000) == 0x10000000 or (w2 & 0xFF800000) == 0x91000000:
@@ -269,7 +285,7 @@ class Module:
                     return None
                 t = mu.reg_read(A.UC_ARM64_REG_X0 + rn if rn < 29 else
                                 (A.UC_ARM64_REG_X29 if rn == 29 else A.UC_ARM64_REG_X30))
-                if not (entry <= t < end) or t % 4:
+                if not (self._vlo <= t < self._vhi) or t % 4:
                     return None
                 targets.append(t)
         except uc.UcError:
@@ -314,7 +330,8 @@ class Module:
                 jt = self.jump_table(a, entry, end)
                 if jt:
                     tables[a] = jt
-                    labels.update(jt)
+                    labels.update(t for t in jt if entry <= t < end)
+                    ext.update(t for t in jt if not entry <= t < end)
                     self.stats['jumptables'] += 1
                 elif self.computed_target(a, entry):
                     # unresolved table jump: allow jumping to any instruction of the function
@@ -353,7 +370,14 @@ class Module:
         raise Unsupported(k)
 
     def emit_function(self, entry, end, labels, tables, hle):
-        out = [f'void {fname(entry)}(Cpu *c) {{']
+        # A huge function with the all-instruction fallback (thousands of labels, one big switch) sends clang's
+        # optimizer into the hours (main 1.0.0: f_7000a7c130, f_7001389610 - over an hour each at -O1): unoptimized
+        # those compile in seconds.
+        huge = bool(tables) and (end - entry) // 4 > OPTNONE_INSNS and entry not in hle
+        attr = '__attribute__((optnone, noinline)) ' if huge else ''
+        if huge:
+            self.stats['optnone'] += 1
+        out = [f'{attr}void {fname(entry)}(Cpu *c) {{']
         if entry in hle:
             out.append(f'    {sanitize(hle[entry])}(c);')
             out.append('}')
@@ -426,7 +450,7 @@ class Module:
                     out.append(f'    c->pc = {ins.target}; goto L_dispatch;')
                     continue
                 if jt:
-                    cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in jt)
+                    cases = ' '.join(f'case {hx(t)}: {jump(t)}' for t in jt)
                     out.append(f'    switch ({ins.target}) {{ {cases} default: break; }}')
                     out.append(f'    c->pc = {ins.target}; goto L_dispatch;')
                     continue

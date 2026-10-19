@@ -864,8 +864,11 @@ static void request_update(Renderer *r, IpcReq *req, IpcResp *resp) {
     }
     // effects (not processed): report them as enabled/disabled per request
     const uint8_t *ein = vin + voices_sz;
-    oh[5] = neffects * 0x10;
-    for (uint32_t i = 0; i < neffects && o + 0x10 <= out->size; i++, o += 0x10) {
+    // effect output: EffectOutStatus 0x10 bytes; from REV9 on (EffectInfo version 2) 0x90 - the state plus 0x80 bytes of
+    // result state. A wrong size here makes the SDK's RequestUpdateAudioRenderer fail (Echoes of Wisdom: REV11, abort).
+    uint32_t eout = (r->revision >> 24) - '0' >= 9 ? 0x90 : 0x10;
+    oh[5] = neffects * eout;
+    for (uint32_t i = 0; i < neffects && o + eout <= out->size; i++, o += eout) {
         const uint8_t *e = ein + i * 0xC0;
         op[o] = e[2] ? 3 : 4;  // EffectState Enabled / Disabled
         if (i < r->effects) effect_update(&r->fx[i], e);
@@ -1014,8 +1017,9 @@ SERVICE("audren:u", audren_u) {
         r->event = kernel_create_event_pair(&r->event_w, &r->event_r);
         pthread_create(&r->thread, NULL, renderer_tick, r);
         audio_track(r, NULL);
-        LOG("[audren] renderer %u Hz, %u samples/frame, %u voices, %u mixes, %u mix buffers, %u splitters, %u effects\n",
-            r->sample_rate, r->sample_count, r->voices, r->nmix, r->mix_buffers, r->splitters, r->effects);
+        LOG("[audren] renderer %u Hz, %u samples/frame, %u voices, %u mixes, %u mix buffers, %u splitters, %u effects, "
+            "revision %.4s (REV%d)\n", r->sample_rate, r->sample_count, r->voices, r->nmix, r->mix_buffers, r->splitters,
+            r->effects, (const char *)&r->revision, (int)((r->revision >> 24) - '0'));
         ipc_return_object(resp, service_new("IAudioRenderer", audio_renderer, r));
         break;
     }

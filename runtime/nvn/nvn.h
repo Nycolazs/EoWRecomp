@@ -88,8 +88,10 @@ typedef struct NvnSync {
 // ---- command recording (stored in guest command memory)
 typedef struct {
     uint64_t mem;    // current command memory chunk (guest address)
-    uint64_t size;   // chunk size
-    uint64_t used;   // bytes used in chunk
+    uint64_t size;   // chunk size (guest bytes)
+    uint64_t host;   // the chunk's shadow, where the records go (cmdbuf.c: CMD_SHADOW times the guest size)
+    uint64_t hcap;   // shadow size
+    uint64_t used;   // bytes used in the shadow
     uint64_t start;  // first record of the list being recorded
     uint64_t callback, callback_data;
     bool recording;

@@ -8,6 +8,8 @@ SECS=${SECS:-30}
 export EOWRECOMP_NO_AUDIO=${EOWRECOMP_NO_AUDIO:-1} EOWRECOMP_NO_MOVIE_AUDIO=${EOWRECOMP_NO_MOVIE_AUDIO:-1}
 export EOWRECOMP_NO_LAUNCHER=1
 [ -z "$SHOW" ] && export EOWRECOMP_HIDDEN=1
+# (Wayland: SDL's libdecor-gtk plugin aborts on this desktop's GTK settings schema; XWayland works)
+export SDL_VIDEO_DRIVER=${SDL_VIDEO_DRIVER:-x11}
 [ -d build/deps-linux/lib ] && export LD_LIBRARY_PATH="$PWD/build/deps-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 [ -z "$KEEPSAVE" ] && rm -rf build/testsave
 mkdir -p build/testsave
@@ -19,6 +21,5 @@ for i in $(seq 1 "$SECS"); do sleep 1; kill -0 $PID 2>/dev/null || break; done
 kill -9 $PID 2>/dev/null && echo "(still running after ${SECS}s, killed)"
 wait $PID 2>/dev/null
 grep -v "^\[svc\]" "$LOG" | grep -v "host backtrace" | tail -"${TAIL:-40}"
-ADDRS=$(grep -oE "f_[0-9a-f]{10}" "$LOG" | head -"${DEPTH:-14}" | sed 's/f_//' | tr '\n' ' ')
-[ -n "$ADDRS" ] && (cd tools && ./venv/bin/python sym.py $ADDRS)
+grep -q "eowgame.so+" "$LOG" && { echo "guest call stack:"; (cd tools && ./venv/bin/python symgame.py "../$LOG"); }
 exit 0

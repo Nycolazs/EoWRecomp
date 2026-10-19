@@ -1,6 +1,7 @@
 // NVN command buffers: commands are recorded into the guest-provided command memory as CmdRec
 // records, so the game's own memory management and out-of-memory callbacks work as designed.
 // A command handle is the guest address of a list's first record.
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -27,24 +28,68 @@ static CmdRec *raw_rec(uint64_t at, uint32_t op, uint32_t size) {
     return r;
 }
 
+// Shadow command memory. Our records (CmdRec, 80+ bytes) are several times the size of NVN's own command encoding, and
+// games size their command memory for the latter: Echoes of Wisdom hands some command buffers 2 KB chunks and has no
+// out-of-memory handler behind their callback (a null function pointer: it never runs out on the console). So the
+// records go to a host shadow of each guest chunk, CMD_SHADOW times its size, and the game sees the shadow's use
+// divided by CMD_SHADOW. A chunk's shadow is kept with the chunk's guest address: the game reuses a chunk only once
+// the GPU is done with it, and its shadow is reused with it.
+#define CMD_SHADOW 8
+typedef struct { uint64_t guest, size, host; } Shadow;
+static Shadow *g_shadow;
+static uint64_t g_nshadow, g_shadow_cap;
+static pthread_mutex_t g_shadow_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t shadow_of(uint64_t guest, uint64_t size) {
+    pthread_mutex_lock(&g_shadow_lock);
+    if (g_nshadow * 2 >= g_shadow_cap) {  // (open addressing, grown at half full)
+        uint64_t ncap = g_shadow_cap ? g_shadow_cap * 2 : 4096;
+        Shadow *n = calloc(ncap, sizeof *n);
+        for (uint64_t i = 0; i < g_shadow_cap; i++)
+            if (g_shadow[i].guest) {
+                uint64_t k = (g_shadow[i].guest >> 8) & (ncap - 1);
+                while (n[k].guest) k = (k + 1) & (ncap - 1);
+                n[k] = g_shadow[i];
+            }
+        free(g_shadow);
+        g_shadow = n;
+        g_shadow_cap = ncap;
+    }
+    uint64_t k = (guest >> 8) & (g_shadow_cap - 1);
+    while (g_shadow[k].guest && g_shadow[k].guest != guest) k = (k + 1) & (g_shadow_cap - 1);
+    Shadow *e = &g_shadow[k];
+    if (!e->guest) { e->guest = guest; g_nshadow++; }
+    if (e->size < size) {  // (a bigger chunk at the same address: the old shadow is left alone - a list may use it)
+        e->host = (uint64_t)(uintptr_t)malloc(size * CMD_SHADOW);
+        if (!e->host) FATAL("nvn: no memory for a %llu KB command shadow\n", (unsigned long long)(size * CMD_SHADOW >> 10));
+        e->size = size;
+    }
+    uint64_t h = e->host;
+    pthread_mutex_unlock(&g_shadow_lock);
+    return h;
+}
+
 NVN(nvnCommandBufferAddCommandMemory) {
     NvnCmdBuf *cb = cb_of(A(0));
     uint64_t mem = HOST(NvnPool, A(1))->storage + A(2), size = A(3);
-    if (cb->recording && cb->mem) {
+    uint64_t host = shadow_of(mem, size);
+    if (cb->recording && cb->host) {
         // chain the list being recorded into the new chunk
-        CmdRec *j = raw_rec(cb->mem + cb->used, CMD_JUMP, sizeof(CmdRec));
-        j->x[0] = mem;
+        CmdRec *j = raw_rec(cb->host + cb->used, CMD_JUMP, sizeof(CmdRec));
+        j->x[0] = host;
     }
     cb->mem = mem;
     cb->size = size;
+    cb->host = host;
+    cb->hcap = size * CMD_SHADOW;
     cb->used = 0;
 }
 NVN(nvnCommandBufferAddControlMemory) { (void)c; }
 NVN(nvnCommandBufferGetCommandMemorySize) { RET(cb_of(A(0))->size); }
-NVN(nvnCommandBufferGetCommandMemoryUsed) { RET(cb_of(A(0))->used); }
+NVN(nvnCommandBufferGetCommandMemoryUsed) { RET((cb_of(A(0))->used + CMD_SHADOW - 1) / CMD_SHADOW); }
 NVN(nvnCommandBufferGetCommandMemoryFree) {
     NvnCmdBuf *cb = cb_of(A(0));
-    RET(cb->size > cb->used + JUMP_RESERVE ? cb->size - cb->used - JUMP_RESERVE : 0);
+    RET(cb->hcap > cb->used + JUMP_RESERVE ? (cb->hcap - cb->used - JUMP_RESERVE) / CMD_SHADOW : 0);
 }
 NVN(nvnCommandBufferGetControlMemorySize) { RET(0x10000); }
 NVN(nvnCommandBufferGetControlMemoryUsed) { RET(0); }
@@ -59,18 +104,21 @@ NVN(nvnCommandBufferSetCommandMemoryCallbackEnabled) { (void)c; }
 // arguments first.
 static CmdRec *rec(Cpu *c, NvnCmdBuf *cb, uint32_t op, uint32_t extra) {
     uint32_t size = (uint32_t)((sizeof(CmdRec) + extra + 7) & ~7u);
-    for (int tries = 0; !cb->mem || cb->used + size + JUMP_RESERVE > cb->size; tries++) {
+    for (int tries = 0; !cb->host || cb->used + size + JUMP_RESERVE > cb->hcap; tries++) {
         if (!cb->callback || tries == 2) FATAL("nvn: out of command memory (need %u)\n", size);
+        LOG("[nvn] cmdbuf %llx out of command memory: chunk %llx size %#llx used %#llx, op %u needs %u (callback %llx)\n",
+            (unsigned long long)cb->guest, (unsigned long long)cb->mem, (unsigned long long)cb->size,
+            (unsigned long long)cb->used, op, size, (unsigned long long)cb->callback);
         uint64_t saved[8];
         memcpy(saved, c->x, sizeof saved);
         c->x[0] = cb->guest;
         c->x[1] = 0;  // NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY
-        c->x[2] = size + JUMP_RESERVE;
+        c->x[2] = (size + JUMP_RESERVE + CMD_SHADOW - 1) / CMD_SHADOW;  // (in the game's units)
         c->x[3] = cb->callback_data;
         guest_call(c, cb->callback);
         memcpy(c->x, saved, sizeof saved);
     }
-    CmdRec *r = raw_rec(cb->mem + cb->used, op, size);
+    CmdRec *r = raw_rec(cb->host + cb->used, op, size);
     cb->used += size;
     return r;
 }
@@ -79,7 +127,7 @@ NVN(nvnCommandBufferBeginRecording) {
     NvnCmdBuf *cb = cb_of(A(0));
     cb->recording = true;
     rec(c, cb, CMD_BARRIER, 0);  // makes sure memory exists; the list starts here
-    cb->start = cb->mem + cb->used - sizeof(CmdRec);
+    cb->start = cb->host + cb->used - sizeof(CmdRec);
 }
 NVN(nvnCommandBufferEndRecording) {
     NvnCmdBuf *cb = cb_of(A(0));

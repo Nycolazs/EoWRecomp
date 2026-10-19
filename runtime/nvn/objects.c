@@ -42,7 +42,15 @@ NVN(nvnDeviceInitialize) {
 }
 NVN(nvnDeviceFinalize) { (void)c; }
 NVN(nvnDeviceSetDebugLabel) { (void)c; }
-NVN(nvnDeviceGetInteger) { *(int32_t *)AP(2) = (int32_t)device_integer((uint32_t)A(1)); }
+NVN(nvnDeviceGetInteger) {
+    uint32_t which = (uint32_t)A(1), v = device_integer(which);
+    static uint64_t seen[4];  // (each item logged once: which items a game asks for, and what it got)
+    if (which < 256 && !(seen[which / 64] >> (which % 64) & 1)) {
+        seen[which / 64] |= 1ull << (which % 64);
+        LOG("[nvn] DeviceGetInteger %u -> %u (lr %llx)\n", which, v, (unsigned long long)c->x[30]);
+    }
+    *(int32_t *)AP(2) = (int32_t)v;
+}
 NVN(nvnDeviceGetCurrentTimestampInNanoseconds) {
     RET(plat_now_ns());
 }
@@ -290,7 +298,15 @@ NVN(nvnTextureBuilderGetPackagedTextureData) { RET(TB(uint64_t, 0x48)); }
 NVN(nvnTextureBuilderGetPackagedTextureLayout) { RET(0); }
 NVN(nvnTextureBuilderGetGLTextureName) { RET(TB(uint32_t, 0x58)); }
 NVN(nvnTextureBuilderGetSparseTileLayout) { RET(0); }
-NVN(nvnTextureBuilderGetZCullStorageSize) { RET(0); }
+// Z-cull storage: games allocate it (Echoes of Wisdom: its depth buffer's, in a 256-byte-granule allocator that
+// breaks on 0) and pass it to Save/RestoreZCullData, which are no-ops here - the host GPU culls by itself. Its size
+// only has to be a sane non-zero amount for the dimensions: 8 bytes per 16x16 pixel tile, 4 KB aligned.
+static uint64_t zcull_size(uint64_t w, uint64_t h) {
+    if (!w) w = 1;
+    if (!h) h = 1;
+    return (((w + 15) / 16) * ((h + 15) / 16) * 8 + 0xFFF) & ~0xFFFull;
+}
+NVN(nvnTextureBuilderGetZCullStorageSize) { RET(zcull_size(TB(uint32_t, 0x10), TB(uint32_t, 0x14))); }
 NVN(nvnTextureBuilderGetStorageClass) { RET(0); }
 NVN(nvnTextureBuilderGetRawStorageClass) { RET(0); }
 
@@ -394,7 +410,7 @@ NVN(nvnTextureGetViewOffset) { RET(0); }
 NVN(nvnTextureGetStorageClass) { RET(0); }
 NVN(nvnTextureGetRawStorageClass) { RET(0); }
 NVN(nvnTextureGetSparseTileLayout) { RET(0); }
-NVN(nvnTextureGetZCullStorageSize) { RET(0); }
+NVN(nvnTextureGetZCullStorageSize) { RET(zcull_size(TEX->width, TEX->height)); }
 NVN(nvnTextureCompare) { RET(A(0) == A(1)); }
 NVN(nvnTextureFlushTexels) { (void)c; }
 NVN(nvnTextureInvalidateTexels) { (void)c; }
@@ -438,44 +454,63 @@ NVN(nvnTextureReadTexels) { LOG("[nvn] ReadTexels not implemented\n"); (void)c; 
 NVN(nvnTextureReadTexelsStrided) { (void)c; }
 
 // ================================================================== samplers
-// SamplerBuilder: device@0 then an NvnSamplerDesc at 8
-#define SD ((NvnSamplerDesc *)(AP(0) + 8))
-NVN(nvnSamplerBuilderSetDevice) { G(uint64_t, A(0), 0) = A(1); }
-NVN(nvnSamplerBuilderSetDefaults) {
-    NvnSamplerDesc *d = SD;
-    memset(d, 0, sizeof *d);
-    d->min_filter = 0; d->mag_filter = 0;
-    d->wrap[0] = d->wrap[1] = d->wrap[2] = 1;  // REPEAT
-    d->lod_min = 0; d->lod_max = 1000.0f; d->max_aniso = 1.0f;
-    d->compare_func = 4;
+// SamplerBuilder (guest memory): only 0x40 bytes are guaranteed - Echoes of Wisdom keeps them on its stack, right
+// under the saved frame pointer and return address (an NvnSamplerDesc stored here overwrote them). So the builder
+// holds a packed copy (48 bytes), turned into an NvnSamplerDesc by sampler_desc().
+typedef struct {
+    uint64_t device;
+    uint8_t min_filter, mag_filter, wrap[3], compare_mode, compare_func, reduction;
+    float lod_min, lod_max, lod_bias, max_aniso;
+    float border[4];
+} SamplerBuilder;
+_Static_assert(sizeof(SamplerBuilder) <= 0x40, "NVNsamplerBuilder: 0x40 bytes in guest memory");
+#define SB ((SamplerBuilder *)AP(0))
+static NvnSamplerDesc sampler_desc(const SamplerBuilder *b) {
+    NvnSamplerDesc d = {0};
+    d.min_filter = b->min_filter, d.mag_filter = b->mag_filter;
+    for (int i = 0; i < 3; i++) d.wrap[i] = b->wrap[i];
+    d.compare_mode = b->compare_mode, d.compare_func = b->compare_func, d.reduction = b->reduction;
+    d.lod_min = b->lod_min, d.lod_max = b->lod_max, d.lod_bias = b->lod_bias, d.max_aniso = b->max_aniso;
+    memcpy(d.border, b->border, sizeof d.border);
+    return d;
 }
-NVN(nvnSamplerBuilderSetMinMagFilter) { SD->min_filter = (uint32_t)A(1); SD->mag_filter = (uint32_t)A(2); }
-NVN(nvnSamplerBuilderSetWrapMode) { SD->wrap[0] = (uint32_t)A(1); SD->wrap[1] = (uint32_t)A(2); SD->wrap[2] = (uint32_t)A(3); }
-NVN(nvnSamplerBuilderSetLodClamp) { SD->lod_min = AF(0); SD->lod_max = AF(1); }
-NVN(nvnSamplerBuilderSetLodBias) { SD->lod_bias = AF(0); }
-NVN(nvnSamplerBuilderSetCompare) { SD->compare_mode = (uint32_t)A(1); SD->compare_func = (uint32_t)A(2); }
-NVN(nvnSamplerBuilderSetBorderColor) { memcpy(SD->border, AP(1), 16); }
-NVN(nvnSamplerBuilderSetBorderColori) { memcpy(SD->border, AP(1), 16); }
-NVN(nvnSamplerBuilderSetBorderColorui) { memcpy(SD->border, AP(1), 16); }
-NVN(nvnSamplerBuilderSetMaxAnisotropy) { SD->max_aniso = AF(0); }
-NVN(nvnSamplerBuilderSetReductionFilter) { SD->reduction = (uint32_t)A(1); }
+NVN(nvnSamplerBuilderSetDevice) { SB->device = A(1); }
+NVN(nvnSamplerBuilderSetDefaults) {
+    SamplerBuilder *b = SB;
+    uint64_t dev = b->device;
+    memset(b, 0, sizeof *b);
+    b->device = dev;
+    b->wrap[0] = b->wrap[1] = b->wrap[2] = 1;  // REPEAT
+    b->lod_max = 1000.0f, b->max_aniso = 1.0f;
+    b->compare_func = 4;
+}
+NVN(nvnSamplerBuilderSetMinMagFilter) { SB->min_filter = (uint8_t)A(1); SB->mag_filter = (uint8_t)A(2); }
+NVN(nvnSamplerBuilderSetWrapMode) { SB->wrap[0] = (uint8_t)A(1); SB->wrap[1] = (uint8_t)A(2); SB->wrap[2] = (uint8_t)A(3); }
+NVN(nvnSamplerBuilderSetLodClamp) { SB->lod_min = AF(0); SB->lod_max = AF(1); }
+NVN(nvnSamplerBuilderSetLodBias) { SB->lod_bias = AF(0); }
+NVN(nvnSamplerBuilderSetCompare) { SB->compare_mode = (uint8_t)A(1); SB->compare_func = (uint8_t)A(2); }
+NVN(nvnSamplerBuilderSetBorderColor) { memcpy(SB->border, AP(1), 16); }
+NVN(nvnSamplerBuilderSetBorderColori) { memcpy(SB->border, AP(1), 16); }
+NVN(nvnSamplerBuilderSetBorderColorui) { memcpy(SB->border, AP(1), 16); }
+NVN(nvnSamplerBuilderSetMaxAnisotropy) { SB->max_aniso = AF(0); }
+NVN(nvnSamplerBuilderSetReductionFilter) { SB->reduction = (uint8_t)A(1); }
 NVN(nvnSamplerBuilderSetLodSnap) { (void)c; }
-NVN(nvnSamplerBuilderGetDevice) { RET(G(uint64_t, A(0), 0)); }
-NVN(nvnSamplerBuilderGetMinMagFilter) { *(uint32_t *)AP(1) = SD->min_filter; *(uint32_t *)AP(2) = SD->mag_filter; }
-NVN(nvnSamplerBuilderGetWrapMode) { for (int i = 0; i < 3; i++) *(uint32_t *)AP(1 + i) = SD->wrap[i]; }
-NVN(nvnSamplerBuilderGetLodClamp) { *(float *)AP(1) = SD->lod_min; *(float *)AP(2) = SD->lod_max; }
-NVN(nvnSamplerBuilderGetLodBias) { RETF(SD->lod_bias); }
-NVN(nvnSamplerBuilderGetCompare) { *(uint32_t *)AP(1) = SD->compare_mode; *(uint32_t *)AP(2) = SD->compare_func; }
-NVN(nvnSamplerBuilderGetBorderColor) { memcpy(AP(1), SD->border, 16); }
-NVN(nvnSamplerBuilderGetBorderColori) { memcpy(AP(1), SD->border, 16); }
-NVN(nvnSamplerBuilderGetBorderColorui) { memcpy(AP(1), SD->border, 16); }
-NVN(nvnSamplerBuilderGetMaxAnisotropy) { RETF(SD->max_aniso); }
-NVN(nvnSamplerBuilderGetReductionFilter) { RET(SD->reduction); }
+NVN(nvnSamplerBuilderGetDevice) { RET(SB->device); }
+NVN(nvnSamplerBuilderGetMinMagFilter) { *(uint32_t *)AP(1) = SB->min_filter; *(uint32_t *)AP(2) = SB->mag_filter; }
+NVN(nvnSamplerBuilderGetWrapMode) { for (int i = 0; i < 3; i++) *(uint32_t *)AP(1 + i) = SB->wrap[i]; }
+NVN(nvnSamplerBuilderGetLodClamp) { *(float *)AP(1) = SB->lod_min; *(float *)AP(2) = SB->lod_max; }
+NVN(nvnSamplerBuilderGetLodBias) { RETF(SB->lod_bias); }
+NVN(nvnSamplerBuilderGetCompare) { *(uint32_t *)AP(1) = SB->compare_mode; *(uint32_t *)AP(2) = SB->compare_func; }
+NVN(nvnSamplerBuilderGetBorderColor) { memcpy(AP(1), SB->border, 16); }
+NVN(nvnSamplerBuilderGetBorderColori) { memcpy(AP(1), SB->border, 16); }
+NVN(nvnSamplerBuilderGetBorderColorui) { memcpy(AP(1), SB->border, 16); }
+NVN(nvnSamplerBuilderGetMaxAnisotropy) { RETF(SB->max_aniso); }
+NVN(nvnSamplerBuilderGetReductionFilter) { RET(SB->reduction); }
 NVN(nvnSamplerBuilderGetLodSnap) { RETF(0); }
 
 NVN(nvnSamplerInitialize) {
     NvnSamplerDesc *d = malloc(sizeof *d);
-    *d = *(NvnSamplerDesc *)(AP(1) + 8);
+    *d = sampler_desc((const SamplerBuilder *)AP(1));
     SET_HOST(A(0), d);
     RET(1);
 }
@@ -550,7 +585,7 @@ NVN(nvnSamplerPoolRegisterSampler) {
 NVN(nvnSamplerPoolRegisterSamplerBuilder) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
     int id = (int)A(1);
-    if (id >= 0 && id < d->count) ((NvnSamplerDesc *)d->entries)[id] = *(NvnSamplerDesc *)(AP(2) + 8);
+    if (id >= 0 && id < d->count) ((NvnSamplerDesc *)d->entries)[id] = sampler_desc((const SamplerBuilder *)AP(2));
 }
 
 NvnDescPool *nvn_find_pool(NvnDescPool **reg, uint64_t guest_pool) {
