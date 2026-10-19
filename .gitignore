@@ -1,0 +1,44 @@
+# ---- Nintendo files: never committed (CLAUDE.md). The app extracts what it needs from the user's own dump.
+# game dumps, containers, executables and keys
+*.xci
+*.nsp
+*.nsz
+*.xcz
+*.nca
+*.ncz
+*.nso
+*.nro
+*.npdm
+*.keys
+prod.keys
+title.keys
+dev.keys
+# extracted game files (exefs, romfs, nca, control, meta) and the code generated from them
+extracted/
+input/
+generated/
+generated-*/
+# Nintendo fonts (users import their own; only the README ships)
+/fonts/*
+!/fonts/README.md
+# game asset formats, in case one is ever copied out of extracted/ for a test
+*.bfres
+*.bntx
+*.bfsha
+*.bfstm
+*.bfwav
+*.bffnt
+*.bfttf
+*.msbt
+*.sarc
+*.zs
+# ---- build output, caches, saves and settings
+build/
+/cache/
+save/
+/eowrecomp.ini
+# ---- tools and Python environments (machine-specific)
+tools/venv/
+venv/
+__pycache__/
+.DS_Store

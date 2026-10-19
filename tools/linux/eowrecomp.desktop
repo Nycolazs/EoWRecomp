@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=EoWRecomp
+Comment=The Legend of Zelda: Link's Awakening, recompiled (bring your own game files)
+Exec=eowrecomp
+Icon=eowrecomp
+Categories=Game;
+Terminal=false
