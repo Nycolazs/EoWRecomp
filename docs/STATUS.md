@@ -26,33 +26,44 @@ Build IDs dos módulos (endereços de patches/HLE valem só para estes):
 
 RomFS: 10 963 arquivos, 8 032 371 686 bytes (todos com magic válido: FRES, BNTX, MsgS, FSTM, SARC, FSHA, webm…).
 
-## Marco atual: M1 concluído, M2 em andamento
+## Marco atual: M4 alcançado (Linux / Vulkan); M5 em andamento
 
-### M1 — comprovado
-- `make gen` gera C para os 4 módulos (`main`, `subsdk0` glslc, `subsdk1` multimedia, `sdk`) **sem nenhum
-  `Unsupported`**: 296 mil funções, 84 s. Medido com `tools/inventory.py --lift` e o log do gerador.
-- Lifter: pares exclusivos (LDXP/STXP), CAS/CASP e atômicos LSE implementados; `tools/test_lift.py` contra o
-  Unicorn: 127 codificações novas + 3000 aleatórias por módulo, 0 falhas.
-- Jump tables: corrigida a divisão de funções nas bases de tabela (main: 963 resolvidas, eram 71).
+Comprovado por screenshot (`EOWRECOMP_SHOT_AT`, `build/frames/`): o jogo inicializa, carrega, toca a abertura
+(masmorra do prólogo: Link, moblins, tochas, piso texturizado) e renderiza corretamente no Vulkan (Intel Iris Xe,
+Mesa ANV). Backend testado: **Vulkan no Linux**. Metal não foi tocado nem testado.
 
-### M2 — estado
-- O runtime compila e linka no Linux (`build/eowrecomp`) e no Windows por cross-compilação
-  (`tools/windows/build.sh` → `build/win/dist/EoWRecomp/eowrecomp.exe`). Nenhum dos dois foi executado ainda.
-- Boot adaptado ao SDK 16.2: `nn::init::Start` com 3 callbacks; `sm:` via TIPC; `GetInfo` com os tipos novos.
-- Em andamento: compilação da biblioteca do jogo (`build/eowgame.so`, ~900 MB de C, ~1 h em 12 núcleos).
-- Próximo: rodar `tools/run.sh` (janela oculta) e seguir os logs de SVC/serviços até o primeiro
-  `nvnQueuePresentTexture` (marcado no log como `[nvn] first nvnQueuePresentTexture`).
+### Funciona
+- M1: geração dos 4 módulos sem `Unsupported`; lifter com LDXP/STXP, CAS/CASP, LSE (testado contra Unicorn).
+- M2/M3: boot pelo `nn::init::Start` do SDK 16.2, serviços (sm via TIPC, fs, acc, hid, am, time, audren REV11),
+  primeiro `nvnQueuePresentTexture`, threads, áudio (renderer abre; mixes/efeitos aceitos pelo SDK).
+- M4: imagem correta da cena de abertura.
+
+### Problemas abertos (por prioridade)
+1. **Desempenho de GPU**: ~7–12 fps na abertura numa Iris Xe; um único material (fs `72ee66f300`, com laço)
+   custa ~87 ms de 126 ms por frame. Causa: a máquina de estados `for { switch (pc) }` dos shaders com laço
+   (registradores vivos na aresta de volta → spill). Próximo passo: estruturar laços (PBK/BRK/BRA para trás →
+   `do { } while (true)`) no `maxwell/translate.c`. Shaders só com desvios para frente já saem sem o laço.
+2. **Estabilidade**: houve travamentos (~frame 1600–1900) e um `vkWaitSemaphores: device lost` numa execução
+   com um shader pulado. A investigar depois do item 1 (frames muito longos podem disparar o watchdog da GPU).
+3. Dois compute shaders ainda não traduzem (RED com min/max assinado; `SUST` `eb20…`): 128 dispatches pulados.
+4. Input e áudio ainda não verificados a ouvido/jogando; save ainda não testado (diretório monta).
+
+### Como testar (Linux)
+- `tools/run.sh` (SECS=60; janela oculta; `SHOW=1` mostra) — log em `build/run.log`, pilha do jogo resolvida.
+- Screenshots: `EOWRECOMP_SHOT_AT=300,600,900` (imagem do jogo) → `build/frames/`.
+- Desempenho: `EOWRECOMP_VK_PROF=1` (tempo de CPU/GPU na linha de fps), `EOWRECOMP_GPUPROF_AT=<frame>` (GPU por passe).
+
+### Windows
+- `tools/windows/build.sh all` gera `build/win/dist/EoWRecomp/` (exe + `eowgame.dll` + DLLs). Ainda não executado
+  no Windows: é o próximo teste do usuário (ver instruções no relatório da sessão).
 
 ### Como compilar (Linux, sem sudo)
-1. `tools/venv` (Python: capstone, unicorn, lz4, cryptography).
+1. `tools/venv` (Python: capstone, unicorn, lz4, cryptography, pillow).
 2. `tools/linux/dev_deps.sh`: zig 0.17.0 (clang 22 + lld, hash conferido) e os pacotes -dev (SDL3, Vulkan, shaderc,
    FFmpeg, VMA) via `apt-get download`, sem instalar nada no sistema.
-3. `PATH=$PWD/build/bin:$PATH make -j12 DEPS=$PWD/build/deps-linux GENARCH=-mcpu=x86_64_v3`
-   (`build/bin/clang` e `clang++` são wrappers de `zig cc` / `zig c++`).
-4. `tools/run.sh` (SECS=30, SHOW=1 para ver a janela).
+3. `make gen` (84 s) e `PATH=$PWD/build/bin:$PATH make -j12 DEPS=$PWD/build/deps-linux GENARCH=-mcpu=x86_64_v3`
+   (código do jogo: ~1 h na primeira vez; depois só o que muda).
 
 ### Pendências conhecidas
 - `docs/linux.md` / `docs/BUILD-windows.md` ainda são do LAS.
-- Jump tables: funções com tabela ainda levam o fallback "todas as instruções" (correto, porém pesado);
-  otimizar depois de haver profiling.
 - Widescreen, ícones de botão, menu sem abas específicas do EoW: M7.
