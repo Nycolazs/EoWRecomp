@@ -101,3 +101,5 @@ ShaderInfo *maxwell_translate(const uint8_t *code, size_t max_size, int stage, c
 void maxwell_free(ShaderInfo *s);
 // Disassemble for debugging (writes text to f).
 void maxwell_disassemble(const uint8_t *code, size_t max_size, int stage, void *file);
+
+extern uint32_t maxwell_loop_guard;  // translate.c

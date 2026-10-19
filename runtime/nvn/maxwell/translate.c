@@ -23,6 +23,9 @@
 #include "shader.h"
 
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
+// Iteration limit of a branching shader's dispatch loop (a mistranslated branch can't hang the GPU forever).
+// EOWRECOMP_SHADER_GUARD overrides it (backends read it): a small one shows which shaders loop.
+uint32_t maxwell_loop_guard = 100000;
 const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
 int maxwell_dbg_reg;
@@ -72,6 +75,7 @@ typedef struct {
     bool tex_weak[64];            // slot type only guessed (from a size query): the next sample decides
     bool fail;
     bool branchy;  // program uses the pc state machine
+    bool fwd;      // ... with forward branches only: blocks in pc order instead of a loop (see FWD below)
     int ipa_mode;  // interpolation mode of the IPA being translated (-1 for plain loads)
     int ipa_mul;   // its multiplier register (mode 1: the result is the "pass" value attr/w times this register)
     // GLSL (fields kept last: the MSL path's layout, including its out-of-range reg_used writes, is unchanged)
@@ -864,7 +868,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0xe240000000000000ull, 0xfff0000000000020ull)) {  // BRA
         uint32_t target = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
         c->uses_branches = true;
-        sp(&c->body, "    pc = %uu; continue;\n", target);
+        sp(&c->body, c->fwd ? "    pc = %uu; break;\n" : "    pc = %uu; continue;\n", target);
     } else if (OPM(0xe290000000000000ull, 0xfff0000000000020ull)) {  // SSY
         c->uses_branches = true;
         sp(&c->body, "    ssy[ssy_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
@@ -875,9 +879,9 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         c->uses_branches = true;
         sp(&c->body, "    pcnt[pcnt_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xf0f8000000000000ull, 0xfff8000000000000ull)) {  // SYNC
-        sp(&c->body, "    pc = ssy[--ssy_n]; continue;\n");
+        sp(&c->body, c->fwd ? "    pc = ssy[--ssy_n]; break;\n" : "    pc = ssy[--ssy_n]; continue;\n");
     } else if (OPM(0xe340000000000000ull, 0xfff0000000000000ull)) {  // BRK
-        sp(&c->body, "    pc = pbk[--pbk_n]; continue;\n");
+        sp(&c->body, c->fwd ? "    pc = pbk[--pbk_n]; break;\n" : "    pc = pbk[--pbk_n]; continue;\n");
     } else if (OPM(0xe350000000000000ull, 0xfff0000000000000ull)) {  // CONT
         sp(&c->body, "    pc = pcnt[pcnt_n - 1]; continue;\n");
     } else if (OPM(0xf0f0000000000000ull, 0xfff8000000000000ull) || OPM(0x50b0000000000000ull, 0xfff8000000000000ull) ||
@@ -1951,9 +1955,14 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0u; uint pbk[16]; uint pbk_n = 0u; uint pcnt[16]; uint pcnt_n = 0u;\n");
         sp(&s, "  bool exit_now = false;\n");
-        sp(&s, "  for (uint guard = 0u; guard < 100000u; guard++) {\n  switch (pc) {\n");
-        sp(&s, "%s", body.buf ? body.buf : "");
-        sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
+        if (c->fwd) {
+            sp(&s, "%s", body.buf ? body.buf : "");
+            sp(&s, "    exit_now = true;\n  } while (false);\n");
+        } else {
+            sp(&s, "  for (uint guard = 0u; guard < %uu; guard++) {\n  switch (pc) {\n", maxwell_loop_guard);
+            sp(&s, "%s", body.buf ? body.buf : "");
+            sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
+        }
     } else {
         sp(&s, "  do {\n%s  } while (false);\n", body.buf ? body.buf : "");
     }
@@ -2033,6 +2042,11 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     uint8_t *label = calloc(end + 4, 1);
     label[1] = 1;
     bool any_branch = false;
+    // FWD: when every BRA / SSY / PBK goes forward and there are no PCNT / CONT / BRX, every block is entered at most
+    // once, in pc order: the blocks become `if (pc == N) do { ... } while (false);` in sequence, with no dispatch loop.
+    // A loop around a switch keeps every register live across its back edge, which GPU compilers turn into spills:
+    // Echoes of Wisdom's main ground material (32 textures, 10 blocks) took ~4.5 ms per draw on an Iris Xe.
+    bool forward = true;
     for (size_t i = 0; i < end; i++) {
         if (i % 4 == 0) continue;
         uint64_t w = ((const uint64_t *)code)[i];
@@ -2045,14 +2059,17 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             int64_t t = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
             if (t >= 0 && (size_t)(t / 8) < end) label[t / 8] = 1;
             any_branch = true;
+            if (t <= (int64_t)pc || (w & 0xfff0000000000020ull) == 0xe2b0000000000000ull) forward = false;  // back / PCNT
         }
         if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) {  // BRX: any instruction may be a target
             any_branch = true;
+            forward = false;
             memset(label, 1, end);
         }
         if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull || (w & 0xfff0000000000000ull) == 0xe340000000000000ull ||
             (w & 0xfff0000000000000ull) == 0xe350000000000000ull)
             any_branch = true;
+        if ((w & 0xfff0000000000000ull) == 0xe350000000000000ull) forward = false;  // CONT
         (void)is_branch_target_op;
     }
     // translate
@@ -2060,10 +2077,15 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     static int annotate = -1;
     if (annotate < 0) annotate = getenv("EOWRECOMP_SAVE_MSL") != NULL;
     c->branchy = any_branch;
+    c->fwd = any_branch && forward && !getenv("EOWRECOMP_NO_FWD_SHADERS");
     for (size_t i = 0; i < end && !c->fail; i++) {
         if (i % 4 == 0) continue;
         uint32_t pc = (uint32_t)(i * 8);
-        if (any_branch && label[i]) sp(&c->body, "  case %uu:\n", pc);
+        if (any_branch && label[i]) {
+            if (!c->fwd) sp(&c->body, "  case %uu:\n", pc);
+            else if (pc == 8) sp(&c->body, "  if (pc == 8u) do {\n");
+            else sp(&c->body, "    pc = %uu;\n  } while (false);\n  if (!exit_now && pc == %uu) do {\n", pc, pc);  // (fall through)
+        }
         if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)((const uint64_t *)code)[i]);
         emit_insn(c, ((const uint64_t *)code)[i], pc);
         if (dbg && pc == maxwell_dbg_pc) {
@@ -2181,9 +2203,14 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0; uint pbk[16]; uint pbk_n = 0; uint pcnt[16]; uint pcnt_n = 0;\n");
         sp(&s, "  bool exit_now = false;\n");
-        sp(&s, "  for (uint guard = 0; guard < 100000u; guard++) {\n  switch (pc) {\n");
-        sp(&s, "%s", c->body.buf ? c->body.buf : "");
-        sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
+        if (c->fwd) {
+            sp(&s, "%s", c->body.buf ? c->body.buf : "");
+            sp(&s, "    exit_now = true;\n  } while (false);\n");
+        } else {
+            sp(&s, "  for (uint guard = 0; guard < %uu; guard++) {\n  switch (pc) {\n", maxwell_loop_guard);
+            sp(&s, "%s", c->body.buf ? c->body.buf : "");
+            sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
+        }
     } else {
         sp(&s, "  do {\n%s  } while (false);\n", c->body.buf ? c->body.buf : "");
     }
