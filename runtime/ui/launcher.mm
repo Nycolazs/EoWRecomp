@@ -89,31 +89,33 @@ static void save_png(id<MTLTexture> tex, const char *path) {
 
 static const uint8_t BUILD_ID[8] = {0xa5, 0x81, 0x40, 0x6b, 0xc9, 0x85, 0x86, 0x51};  // Echoes of Wisdom v1.0.0 main (docs/STATUS.md)
 // The release tag this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read
-// it): beta_<n> until 1.0, then v<major>.<minor>.<patch>.
-#define EOWRECOMP_VERSION "0.0.1-dev"
+// it): alpha_<n> while the game isn't playable, beta_<n> until 1.0, then v<major>.<minor>.<patch>.
+#define EOWRECOMP_VERSION "alpha_1"
 
 // ------------------------------------------------------------------ update check
 // The start screen asks GitHub for the project's releases once per launch (a background curl, which macOS and
-// Windows 10+ ship) and offers the best one if it outranks this build: any v1.0.0+ above every beta, betas by
-// number; other tags (the alpha_* ones) are ignored. Offline / no curl / anything unexpected: nothing is shown.
-// The release feed checked for updates: none until EoWRecomp has a public repository ("" = no update check).
-#define RELEASES_URL ""
-#define RELEASE_PAGE ""
+// Windows 10+ ship) and offers the best one if it outranks this build: any v1.0.0+ above every beta, every beta
+// above every alpha, alphas and betas by number; other tags are ignored. Offline / no curl / anything unexpected: nothing is shown.
+// The release feed checked for updates ("" = no update check).
+#define RELEASES_URL "https://api.github.com/repos/Nycolazs/EoWRecomp/releases"
+#define RELEASE_PAGE "https://github.com/Nycolazs/EoWRecomp/releases/tag/"
 
 static long long tag_rank(const std::string &t) {
     int n, a, b, c;
     char end;
-    if (sscanf(t.c_str(), "beta_%d%c", &n, &end) == 1 && n > 0) return n;
+    if (sscanf(t.c_str(), "alpha_%d%c", &n, &end) == 1 && n > 0 && n < (1 << 24)) return n;
+    if (sscanf(t.c_str(), "beta_%d%c", &n, &end) == 1 && n > 0 && n < (1 << 24)) return (1LL << 24) + n;
     if (sscanf(t.c_str(), "v%d.%d.%d%c", &a, &b, &c, &end) == 3 && a >= 1 && b >= 0 && c >= 0 && b < 4096 && c < 4096)
         return (1LL << 48) + ((long long)a << 24) + ((long long)b << 12) + c;
     return -1;
 }
 
-// "Beta 2" / "1.0.0" (with_word: "Version 1.0.0")
+// "Alpha 1" / "Beta 2" / "1.0.0" (with_word: "Version 1.0.0")
 static std::string tag_label(const std::string &t, bool with_word) {
     int n;
     char end;
     if (sscanf(t.c_str(), "beta_%d%c", &n, &end) == 1) return "Beta " + std::to_string(n);
+    if (sscanf(t.c_str(), "alpha_%d%c", &n, &end) == 1) return "Alpha " + std::to_string(n);
     std::string v = t.size() > 1 && t[0] == 'v' ? t.substr(1) : t;
     return with_word ? "Version " + v : v;
 }

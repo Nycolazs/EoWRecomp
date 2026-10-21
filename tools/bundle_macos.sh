@@ -15,8 +15,9 @@ APP="build/EoWRecomp.app"
 DEPS=$PWD/build/deps
 BUNDLE_ID=$(sed -n 's/^#define RT_BUNDLE_ID "\(.*\)"/\1/p' runtime/paths.h)
 VERSION=$(sed -n 's/^#define EOWRECOMP_VERSION "\(.*\)"/\1/p' runtime/ui/launcher.mm)
-# CFBundleShortVersionString must be digits: beta_<n> -> 0.9.<n>, v1.2.3 -> 1.2.3
+# CFBundleShortVersionString must be digits: alpha_<n> -> 0.1.<n>, beta_<n> -> 0.9.<n>, v1.2.3 -> 1.2.3
 case "$VERSION" in
+    alpha_*) VERSION="0.1.${VERSION#alpha_}" ;;
     beta_*) VERSION="0.9.${VERSION#beta_}" ;;
     v*) VERSION="${VERSION#v}" ;;
 esac
