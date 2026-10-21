@@ -1749,6 +1749,10 @@ static void glsl_rewrite(Ctx *c, Str *o, const char *src) {
         {"ulong", "uint64_t"}, {"rsqrt", "inversesqrt"}, {"rint", "roundEven"}, {"front_facing", "gl_FrontFacing"},
         {"point_coord", "gl_PointCoord"}, {"lane", "gl_SubgroupInvocationID"}, {"vid", "uint(gl_VertexIndex)"},
         {"iid", "uint(gl_InstanceIndex)"},
+        // the MSL-named helpers of the GLSL preamble: Metal built-ins of the same names made MoltenVK's MSL
+        // (SPIRV-Cross keeps function names) fail with "call to 'popcount' is ambiguous" (tools/test_moltenvk.sh)
+        {"fmin", "mw_fmin"}, {"fmax", "mw_fmax"}, {"clz", "mw_clz"}, {"popcount", "mw_popcount"},
+        {"saturate", "mw_saturate"}, {"mulhi", "mw_mulhi"},
     };
     const char *p = src;
     while (*p) {
@@ -1849,14 +1853,14 @@ static const char glsl_prelude[] =
     "int sx16(uint v) { return bitfieldExtract(int(v), 0, 16); }\n"
     "int sx16(int v) { return bitfieldExtract(v, 0, 16); }\n"
     // MSL semantics: saturate(NaN) = 0, fmin/fmax return the non-NaN operand
-    "float saturate(float x) { return isnan(x) ? 0.0f : clamp(x, 0.0f, 1.0f); }\n"
-    "vec2 saturate(vec2 x) { return vec2(saturate(x.x), saturate(x.y)); }\n"
-    "float fmin(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : min(a, b)); }\n"
-    "float fmax(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : max(a, b)); }\n"
-    "uint clz(uint v) { return v == 0u ? 32u : uint(31 - findMSB(v)); }\n"
-    "uint popcount(uint v) { return uint(bitCount(v)); }\n"
-    "uint mulhi(uint a, uint b) { uint hi, lo; umulExtended(a, b, hi, lo); return hi; }\n"
-    "int mulhi(int a, int b) { int hi, lo; imulExtended(a, b, hi, lo); return hi; }\n"
+    "float mw_saturate(float x) { return isnan(x) ? 0.0f : clamp(x, 0.0f, 1.0f); }\n"
+    "vec2 mw_saturate(vec2 x) { return vec2(mw_saturate(x.x), mw_saturate(x.y)); }\n"
+    "float mw_fmin(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : min(a, b)); }\n"
+    "float mw_fmax(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : max(a, b)); }\n"
+    "uint mw_clz(uint v) { return v == 0u ? 32u : uint(31 - findMSB(v)); }\n"
+    "uint mw_popcount(uint v) { return uint(bitCount(v)); }\n"
+    "uint mw_mulhi(uint a, uint b) { uint hi, lo; umulExtended(a, b, hi, lo); return hi; }\n"
+    "int mw_mulhi(int a, int b) { int hi, lo; imulExtended(a, b, hi, lo); return hi; }\n"
     "uint brev32(uint v) { return bitfieldReverse(v); }\n"
     "uint flo_sh(uint msb) { return msb == 0xFFFFFFFFu ? msb : 31u - msb; }\n"
     "uint bfe_u(uint v, uint ctl) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u) return 0u; if (pos >= 32u) return 0u; return bitfieldExtract(v, int(pos), int(min(len, 32u - pos))); }\n"
