@@ -70,7 +70,8 @@ FFMPEG   := $(or $(DEPS),/opt/homebrew/opt/ffmpeg)
 # MACOS_BACKEND: vulkan (default: the backend every other platform runs, through MoltenVK; Homebrew's molten-vk,
 # vulkan-loader, vulkan-headers, shaderc) or metal (LAS's renderer, not yet carried over to EoW)
 MACOS_BACKEND ?= vulkan
-VKSDK    := $(or $(DEPS),/opt/homebrew)
+# (MoltenVK, the Vulkan loader and headers, shaderc: from Homebrew, also for a release build with DEPS)
+VKSDK    ?= /opt/homebrew
 EXE      := $(B)/eowrecomp
 DEPINC   := -I$(SDL)/include -I$(FFMPEG)/include
 LDFLAGS  := -L$(SDL)/lib -lSDL3 -Wl,-rpath,$(SDL)/lib -L$(FFMPEG)/lib -lavformat -lavcodec -lavutil -lswscale -Wl,-rpath,$(FFMPEG)/lib \
@@ -256,7 +257,16 @@ build/gen-venv/.ok:
 	$(GEN_VPY) -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5 pyinstaller==6.22.3
 	touch $@
 
-.PHONY: all gen gen-helper gen-objs runtime-objs
+# make app (macOS): build/EoWRecomp.app to ship - the runtime built against build/deps (tools/build_deps_macos.sh:
+# LGPL-only FFmpeg, SDL3), MoltenVK, and what the start screen builds the game code with (the generator helper, zig).
+# No game code or files inside (tools/bundle_macos.sh checks).
+app:
+	$(MAKE) B=build/rel DEPS=$(CURDIR)/build/deps build/rel/eowrecomp
+	$(MAKE) gen-helper
+	[ -x build/zig/zig ] || tools/fetch_zig.sh
+	tools/bundle_macos.sh build/rel/eowrecomp
+
+.PHONY: all gen gen-helper gen-objs runtime-objs app
 
 build/test_shaders: tools/test_shaders.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
 	clang -O1 -fobjc-arc -framework Metal -framework Foundation -o $@ tools/test_shaders.m runtime/nvn/maxwell/translate.c

@@ -443,6 +443,22 @@ static void CreateOrResizeBuffer(VkBuffer& buffer, VkDeviceMemory& buffer_memory
     buffer_size = buffer_size_aligned;
 }
 
+// LAS Recomp / EoWRecomp (from LASRecomp-Android-Plus): a pre-rotated swapchain (Android, the panel's own orientation) - everything drawn turned by quarter turns
+// (1: clip space (-y, x), 3: (y, -x)) through a vertex shader with the turn in its push constants (set before Init).
+static int g_LasQuarter = 0;
+static const uint32_t* g_LasVertSpv = nullptr;
+static size_t g_LasVertSpvSize = 0;
+void ImGui_ImplVulkan_SetPreRotation(int quarter) { g_LasQuarter = quarter; }
+void ImGui_ImplVulkan_SetVertexShader(const uint32_t* spv, size_t size) { g_LasVertSpv = spv; g_LasVertSpvSize = size; }
+static VkRect2D LasTurnRect(int x, int y, int w, int h, int W, int H)
+{
+    VkRect2D r;
+    if (g_LasQuarter == 1) { r.offset.x = H - y - h; r.offset.y = x; r.extent.width = (uint32_t)h; r.extent.height = (uint32_t)w; }
+    else if (g_LasQuarter == 3) { r.offset.x = y; r.offset.y = W - x - w; r.extent.width = (uint32_t)h; r.extent.height = (uint32_t)w; }
+    else { r.offset.x = x; r.offset.y = y; r.extent.width = (uint32_t)w; r.extent.height = (uint32_t)h; }
+    return r;
+}
+
 static void ImGui_ImplVulkan_SetupRenderState(ImDrawData* draw_data, VkPipeline pipeline, VkCommandBuffer command_buffer, ImGui_ImplVulkan_FrameRenderBuffers* rb, int fb_width, int fb_height)
 {
     ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
@@ -466,8 +482,8 @@ static void ImGui_ImplVulkan_SetupRenderState(ImDrawData* draw_data, VkPipeline 
         VkViewport viewport;
         viewport.x = 0;
         viewport.y = 0;
-        viewport.width = (float)fb_width;
-        viewport.height = (float)fb_height;
+        viewport.width = (float)(g_LasQuarter ? fb_height : fb_width);
+        viewport.height = (float)(g_LasQuarter ? fb_width : fb_height);
         viewport.minDepth = 0.0f;
         viewport.maxDepth = 1.0f;
         vkCmdSetViewport(command_buffer, 0, 1, &viewport);
@@ -484,6 +500,8 @@ static void ImGui_ImplVulkan_SetupRenderState(ImDrawData* draw_data, VkPipeline 
         translate[1] = -1.0f - draw_data->DisplayPos.y * scale[1];
         vkCmdPushConstants(command_buffer, bd->PipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 0, sizeof(float) * 2, scale);
         vkCmdPushConstants(command_buffer, bd->PipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 2, sizeof(float) * 2, translate);
+        float rot[2] = { g_LasQuarter ? 0.0f : 1.0f, g_LasQuarter == 1 ? 1.0f : g_LasQuarter == 3 ? -1.0f : 0.0f };  // (cos, sin)
+        vkCmdPushConstants(command_buffer, bd->PipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, sizeof(float) * 4, sizeof(float) * 2, rot);
     }
 }
 
@@ -601,11 +619,8 @@ void ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer comm
                     continue;
 
                 // Apply scissor/clipping rectangle
-                VkRect2D scissor;
-                scissor.offset.x = (int32_t)(clip_min.x);
-                scissor.offset.y = (int32_t)(clip_min.y);
-                scissor.extent.width = (uint32_t)(clip_max.x - clip_min.x);
-                scissor.extent.height = (uint32_t)(clip_max.y - clip_min.y);
+                VkRect2D scissor = LasTurnRect((int)clip_min.x, (int)clip_min.y, (int)(clip_max.x - clip_min.x), (int)(clip_max.y - clip_min.y),
+                                               fb_width, fb_height);
                 vkCmdSetScissor(command_buffer, 0, 1, &scissor);
 
                 // Bind DescriptorSet with font or user texture
@@ -628,7 +643,7 @@ void ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer comm
     // If you use VK_DYNAMIC_STATE_VIEWPORT or VK_DYNAMIC_STATE_SCISSOR you are responsible for setting the values before rendering.
     // In theory we should aim to backup/restore those values but I am not sure this is possible.
     // We perform a call to vkCmdSetScissor() to set back a full viewport which is likely to fix things for 99% users but technically this is not perfect. (See github #4644)
-    VkRect2D scissor = { { 0, 0 }, { (uint32_t)fb_width, (uint32_t)fb_height } };
+    VkRect2D scissor = LasTurnRect(0, 0, fb_width, fb_height, fb_width, fb_height);
     vkCmdSetScissor(command_buffer, 0, 1, &scissor);
 }
 
@@ -856,8 +871,8 @@ static void ImGui_ImplVulkan_CreateShaderModules(VkDevice device, const VkAlloca
     {
         VkShaderModuleCreateInfo vert_info = {};
         vert_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        vert_info.codeSize = sizeof(__glsl_shader_vert_spv);
-        vert_info.pCode = (uint32_t*)__glsl_shader_vert_spv;
+        vert_info.codeSize = g_LasVertSpv ? g_LasVertSpvSize : sizeof(__glsl_shader_vert_spv);
+        vert_info.pCode = g_LasVertSpv ? g_LasVertSpv : (uint32_t*)__glsl_shader_vert_spv;
         VkResult err = vkCreateShaderModule(device, &vert_info, allocator, &bd->ShaderModuleVert);
         check_vk_result(err);
     }
@@ -1046,7 +1061,7 @@ bool ImGui_ImplVulkan_CreateDeviceObjects()
         VkPushConstantRange push_constants[1] = {};
         push_constants[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
         push_constants[0].offset = sizeof(float) * 0;
-        push_constants[0].size = sizeof(float) * 4;
+        push_constants[0].size = sizeof(float) * 6;  // (LAS Recomp: + the pre-rotation's cos / sin)
         VkDescriptorSetLayout set_layout[1] = { bd->DescriptorSetLayout };
         VkPipelineLayoutCreateInfo layout_info = {};
         layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;

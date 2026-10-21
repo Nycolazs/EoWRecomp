@@ -43,12 +43,16 @@ typedef struct {
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
     VkFormat sc_format;
-    VkExtent2D sc_extent;
+    VkExtent2D sc_extent;      // the window's size (what everything is laid out in)
+    VkExtent2D sc_phys;        // the images' own size: sc_extent turned when pre-rotated
+    int sc_quarter;            // pre-rotation in quarter turns (Android: 1 = 90, 3 = 270 degrees; 0 elsewhere)
     uint32_t sc_count;
     VkImage sc_images[8];
     VkImageView sc_views[8];
 } VkG;
 extern VkG g_vk;
+// A rectangle of the window (x, y, w, h) in the swapchain image's own coordinates (pre-rotation: device.c)
+VkRect2D vk_sc_rect(int x, int y, int w, int h);
 
 // ---- submissions (exec.c)
 // Work is recorded into the current command buffer; uploads go into a separate one that runs first.

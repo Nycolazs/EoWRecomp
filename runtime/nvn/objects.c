@@ -121,6 +121,8 @@ NVN(nvnQueueGetTotalControlMemoryUsed) { RET(0); }
 NVN(nvnQueueGetTotalComputeMemoryUsed) { RET(0); }
 NVN(nvnQueueResetMemoryUsageCounts) { (void)c; }
 NVN(nvnQueueSubmitCommands) {
+    static _Thread_local bool placed;  // (phones: the submitting thread is the render thread: platform.h)
+    if (!placed) placed = true, plat_thread_core(PLAT_CORE_RENDER);
     int n = (int)A(1);
     const uint64_t *handles = AP(2);
     for (int i = 0; i < n; i++) backend_execute(handles[i]);

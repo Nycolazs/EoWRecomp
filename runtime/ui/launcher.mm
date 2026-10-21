@@ -1364,7 +1364,7 @@ extern "C" void launcher_run(const char *root) {
                 std::string src_d = "The folder with your own copy of The Legend of Zelda: Echoes of Wisdom for Nintendo "
                                     "Switch, version 1.0.0: the .nsp or .xci with the prod.keys of your Switch beside it, "
                                     "or the extracted exefs / romfs folders. The game isn't included with EoWRecomp.";
-                if (!src.empty()) src_d += "\n\nChosen: " + src;
+                if (!src.empty()) src_d += "\n\nChosen: " + (src.compare(0, 8, "android:") ? src : src.substr(8));
                 // the step that's running / its result, under the rows and in the Set up row's explanation
                 const std::string &job_line = job;
                 std::string ex_d = "Copies the game files EoWRecomp needs and recompiles the game from them. This only "

@@ -10,7 +10,7 @@
 # lists them); without it the newest minimum found inside is used.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-EXE=${1:-build/mac15/eowrecomp}
+EXE=${1:-build/eowrecomp}
 APP="build/EoWRecomp.app"
 DEPS=$PWD/build/deps
 BUNDLE_ID=$(sed -n 's/^#define RT_BUNDLE_ID "\(.*\)"/\1/p' runtime/paths.h)
@@ -41,10 +41,38 @@ cp -R "$ZIG" "$C/Resources/zig"
 mkdir "$C/Resources/gamelib-src"
 cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h runtime/modules.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
    "$C/Resources/gamelib-src/"
+if [ ! -f docs/icon/icon.icns ]; then  # (from the 1024 px PNG: iconutil, part of macOS)
+    IS=build/icon.iconset; rm -rf "$IS"; mkdir -p "$IS"
+    for s in 16 32 128 256 512; do
+        sips -z $s $s docs/icon/icon_1024.png --out "$IS/icon_${s}x${s}.png" >/dev/null
+        sips -z $((s * 2)) $((s * 2)) docs/icon/icon_1024.png --out "$IS/icon_${s}x${s}@2x.png" >/dev/null
+    done
+    iconutil -c icns "$IS" -o docs/icon/icon.icns
+fi
 cp docs/icon/icon.icns "$C/Resources/icon.icns"
 cp docs/icon/icon_1024.png "$C/Resources/icon.png"  # (window / Dock icon at run time)
 cp third_party/fonts/Baloo2/Baloo2-SemiBold.ttf "$C/Resources/Baloo2-SemiBold.ttf"  # (start screen; OFL, README "License")
 cp third_party/fonts/Baloo2/OFL.txt "$C/Resources/Baloo2-OFL.txt"
+
+# ---- Vulkan: the loader (libvulkan, linked: copied below with the other dylibs) finds its driver, MoltenVK, through the
+# ICD file the bundle carries (the loader looks in Contents/Resources/vulkan/icd.d)
+MVK=$( (find "$DEPS/lib" /opt/homebrew/opt/molten-vk/lib -name libMoltenVK.dylib 2>/dev/null || true) | head -1)
+[ -n "$MVK" ] || { echo "no libMoltenVK.dylib (brew install molten-vk)"; exit 1; }
+cp -L "$MVK" "$C/Frameworks/libMoltenVK.dylib"
+chmod u+w "$C/Frameworks/libMoltenVK.dylib"
+install_name_tool -id "@rpath/libMoltenVK.dylib" "$C/Frameworks/libMoltenVK.dylib" 2>/dev/null
+mkdir -p "$C/Resources/vulkan/icd.d"
+cat > "$C/Resources/vulkan/icd.d/MoltenVK_icd.json" <<EOF
+{
+    "file_format_version": "1.0.0",
+    "ICD": {
+        "library_path": "../../../Frameworks/libMoltenVK.dylib",
+        "api_version": "1.4.0",
+        "is_portability_driver": true
+    }
+}
+EOF
+cp /opt/homebrew/opt/molten-vk/LICENSE "$C/Resources/MoltenVK-LICENSE.txt" 2>/dev/null || true
 
 # ---- dylibs: copy every non-system dependency, recursively; point all references at @rpath/<name>
 is_system() { case "$1" in /usr/lib/*|/System/*) return 0;; esac; return 1; }
@@ -59,7 +87,7 @@ find_dep() {  # dep as referenced by (the original of) $2 -> a real file
 }
 deps_of() { otool -L "$1" | tail -n +2 | awk '{print $1}' | grep -v "^$(otool -D "$1" | tail -n +2 | head -1)\$" || true; }
 origin() { local s; s="$(dirname "$1")/.$(basename "$1").src"; if [ -f "$s" ]; then cat "$s"; else echo "$1"; fi; }
-queue="$C/MacOS/eowrecomp"
+queue="$C/MacOS/eowrecomp|$C/Frameworks/libMoltenVK.dylib"
 copied=" "
 while [ -n "$queue" ]; do
     f=${queue%%|*}; [ "$queue" = "$f" ] && queue= || queue=${queue#*|}

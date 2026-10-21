@@ -3429,11 +3429,16 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
     vkUpdateDescriptorSets(g_vk.dev, 1, &w, 0, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, present_layout, 0, 1, &ds, 0, NULL);
-    VkViewport vp = {vx, vy, vw, vh, 0, 1};
+    // (pre-rotated swapchain: the rectangle in the image's own coordinates, the triangle turned in the shader)
+    VkRect2D r = vk_sc_rect((int)lroundf(vx), (int)lroundf(vy), (int)lroundf(vw), (int)lroundf(vh));
+    VkViewport vp = {(float)r.offset.x, (float)r.offset.y, (float)r.extent.width, (float)r.extent.height, 0, 1};
     vkCmdSetViewport(cb, 0, 1, &vp);
-    vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 32, pv);
+    float pq[8];
+    memcpy(pq, pv, sizeof pq);
+    pq[1] = (float)g_vk.sc_quarter;
+    vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 32, pq);
     vkCmdDraw(cb, 3, 1, 0, 0);
-    VkViewport full = {0, 0, (float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, 0, 1};
+    VkViewport full = {0, 0, (float)g_vk.sc_phys.width, (float)g_vk.sc_phys.height, 0, 1};
     vkCmdSetViewport(cb, 0, 1, &full);
 }
 

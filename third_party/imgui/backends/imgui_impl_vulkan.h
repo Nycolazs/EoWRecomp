@@ -111,6 +111,9 @@ struct ImGui_ImplVulkan_InitInfo
 IMGUI_IMPL_API bool             ImGui_ImplVulkan_Init(ImGui_ImplVulkan_InitInfo* info);
 IMGUI_IMPL_API void             ImGui_ImplVulkan_Shutdown();
 IMGUI_IMPL_API void             ImGui_ImplVulkan_NewFrame();
+// LAS Recomp / EoWRecomp: pre-rotated swapchains (quarter turns: 1 = 90, 3 = 270) and the vertex shader that turns (before Init)
+IMGUI_IMPL_API void             ImGui_ImplVulkan_SetPreRotation(int quarter);
+IMGUI_IMPL_API void             ImGui_ImplVulkan_SetVertexShader(const uint32_t* spv, size_t size);
 IMGUI_IMPL_API void             ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer command_buffer, VkPipeline pipeline = VK_NULL_HANDLE);
 IMGUI_IMPL_API bool             ImGui_ImplVulkan_CreateFontsTexture();
 IMGUI_IMPL_API void             ImGui_ImplVulkan_DestroyFontsTexture();

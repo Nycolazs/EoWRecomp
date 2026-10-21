@@ -187,6 +187,9 @@ void rt_unwind_point(void) {
 static void *thread_main(void *arg) {
     KThread *t = arg;
     t_cur = t;
+    // (phones: the game's main thread on the big cores, the others off the fastest; the thread that submits the GPU
+    // work moves itself: nvnQueueSubmitCommands)
+    plat_thread_core(t->handle && t->id == 0x50 ? PLAT_CORE_MAIN : PLAT_CORE_OTHER);
     crash_handler_install();
     rt_set_fpcr(0);
     if (!setjmp(t->unwind)) guest_call(&t->cpu, t->entry);
