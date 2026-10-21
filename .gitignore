@@ -47,3 +47,14 @@ tools/venv/
 venv/
 __pycache__/
 .DS_Store
+# ---- Android build output and local settings
+android/local.properties
+android/keystore.properties
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+*.jks
+*.keystore
+*.apk
+*.aab

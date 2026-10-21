@@ -1,0 +1,95 @@
+// EoW Recomp for Android: libmain.so (the runtime) + libSDL3.so, built by app/CMakeLists.txt (needs
+// tools/android/build_deps.sh first). No game code in here: libeowgame.so is built from the player's own game files
+// by tools/android/build_game.sh and packed into a personal APK (-PeowGameLib=<dir with arm64-v8a/libeowgame.so>).
+// (After LASRecomp-Android-Plus, MIT.)
+plugins {
+    id 'com.android.application'
+}
+
+def sdl = file('../../build/android/SDL3/android-project/app/src/main/java')
+
+android {
+    namespace 'com.eowrecomp.android'
+    compileSdk 36
+    ndkVersion '27.2.12479018'
+
+    defaultConfig {
+        applicationId 'com.eowrecomp.android'
+        minSdk 30          // Android 11: Vulkan 1.1+, AAudio, MAP_FIXED_NOREPLACE kernels
+        targetSdk 36
+        versionCode((project.findProperty('eowVersionCode') ?: '1') as int)
+        versionName project.findProperty('eowVersionName') ?: '0.1.0'
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+        externalNativeBuild {
+            cmake {
+                targets 'main', 'SDL3-shared'
+                arguments '-DANDROID_STL=c++_static'
+            }
+        }
+    }
+
+    // A release key for APKs you share: android/keystore.properties with storeFile, storePassword, keyAlias,
+    // keyPassword (never commit it or the key). Without it, release builds use the local debug key (personal builds).
+    def keystoreProps = rootProject.file('keystore.properties')
+    signingConfigs {
+        if (keystoreProps.exists()) {
+            release {
+                def p = new Properties()
+                keystoreProps.withInputStream { p.load(it) }
+                storeFile file(p.getProperty('storeFile'))
+                storePassword p.getProperty('storePassword')
+                keyAlias p.getProperty('keyAlias')
+                keyPassword p.getProperty('keyPassword')
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig keystoreProps.exists() ? signingConfigs.release : signingConfigs.debug
+            externalNativeBuild { cmake { arguments '-DCMAKE_BUILD_TYPE=Release' } }
+        }
+        debug {
+            // the runtime is unusably slow at -O0: keep debug info but optimize
+            externalNativeBuild { cmake { arguments '-DCMAKE_BUILD_TYPE=RelWithDebInfo' } }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('CMakeLists.txt')
+            buildStagingDirectory file('../../build/android/cxx')
+        }
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs += [sdl]
+            assets.srcDirs += ["$buildDir/generated/eow-assets"]
+            // a personal build with the game code inside (tools/android/build_game.sh --apk)
+            if (project.hasProperty('eowGameLib')) jniLibs.srcDirs += [project.property('eowGameLib')]
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging false  // (stored uncompressed and mapped directly from the APK)
+        }
+    }
+}
+
+// What the app ships besides code (runtime/paths.c android_resources): the start screen fonts and the icon
+tasks.register('eowAssets', Sync) {  // (Sync: a file gone from the sources goes from the APK too)
+    from('../../third_party/fonts') { include '**/*.ttf'; eachFile { path = name }; includeEmptyDirs = false }
+    from('../../docs/icon/icon_1024.png') { rename { 'icon.png' } }
+    into "$buildDir/generated/eow-assets"
+}
+preBuild.dependsOn eowAssets

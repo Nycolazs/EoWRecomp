@@ -24,7 +24,19 @@
 #endif
 #endif
 
+#ifdef __ANDROID__
+#include "platform/android.h"
+#endif
+
 #define WHY(...) (snprintf(why, why_size, __VA_ARGS__), false)
+
+// The package by path, or (Android) by the document URI the folder picker gave access to
+static int open_package(const char *path) {
+#ifdef __ANDROID__
+    if (!strncmp(path, "content://", 10)) return android_open_document(path);
+#endif
+    return open(path, O_RDONLY);
+}
 
 // ------------------------------------------------------------------ AES-128 (software; ARMv8 AES for CTR)
 static const uint8_t SBOX[256] = {
@@ -533,7 +545,7 @@ NxRomfs *nx_romfs_open(const char *src_path, char *why, size_t why_size) {
     }
     fclose(f);
     struct stat sb;
-    r->fd = package[0] ? open(package, O_RDONLY) : -1;
+    r->fd = package[0] ? open_package(package) : -1;
     if (r->fd < 0 || fstat(r->fd, &sb) || (unsigned long long)sb.st_size != pkg_size) {
         snprintf(why, why_size, "the game package moved or changed (%s)", package);
         nx_romfs_close(r);
@@ -601,7 +613,7 @@ bool nx_setup(const char *package, const char *keys_path, const char *out_dir, u
     if (!keys_load(keys_path, &ks)) return WHY("can't read the keys file");
     bool ok = false;
     Entries files = {0};
-    int fd = open(package, O_RDONLY);
+    int fd = open_package(package);
     struct stat sb;
     if (fd < 0 || fstat(fd, &sb)) { WHY("can't open the game package"); goto out; }
     uint8_t head[0x200];

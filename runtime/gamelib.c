@@ -9,6 +9,9 @@
 #else
 #include <dlfcn.h>
 #endif
+#ifdef __ANDROID__
+#include <SDL3/SDL.h>  // (SDL_GetAndroidInternalStoragePath)
+#endif
 
 #include "paths.h"
 #include "rt.h"
@@ -35,10 +38,19 @@ static bool exists(const char *p) {
 }
 
 // The places to look, in order (gamelib.h). Returns how many were filled.
+// Android: the app's internal storage (the data folder is on external storage, mounted without exec), then one packed
+// into the APK itself, opened by its bare name (it lives inside the APK: no file to look at, its own id decides).
 static int candidates(const char *game_dir, char out[3][1100]) {
     int n = 0;
     const char *env = getenv("EOWRECOMP_GAME_LIB");
     if (env && *env) snprintf(out[n++], 1100, "%s", env);
+#ifdef __ANDROID__
+    (void)game_dir;
+    const char *internal = SDL_GetAndroidInternalStoragePath();
+    if (internal) snprintf(out[n++], 1100, "%s/%s", internal, GAMELIB_NAME);
+    snprintf(out[n++], 1100, "%s", GAMELIB_NAME);
+    return n;
+#endif
     char exe_side[1024];
     if (rt_resource(GAMELIB_NAME, NULL, exe_side, sizeof exe_side) && exists(exe_side))
         snprintf(out[n++], 1100, "%s", exe_side);
@@ -46,12 +58,20 @@ static int candidates(const char *game_dir, char out[3][1100]) {
     return n;
 }
 
+static bool in_apk(const char *c) { return !strchr(c, '/'); }  // (Android: a bare name)
+
 bool gamelib_present(const char *game_dir) {
     if (g_tables) return true;
     char c[3][1100];
     int n = candidates(game_dir, c);
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n; i++) {
+        if (in_apk(c[i])) {  // (loading it is the only way to look: the library stays loaded for the game)
+            char why[8];
+            if (gamelib_load(NULL, why, sizeof why)) return true;
+            continue;
+        }
         if (exists(c[i]) && id_matches(c[i])) return true;
+    }
     return false;
 }
 
@@ -83,8 +103,9 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
         int n = candidates(game_dir, c);
         const char *env = getenv("EOWRECOMP_GAME_LIB");
         for (int i = 0; i < n && !g_tables; i++) {
-            if (!exists(c[i])) continue;
-            bool given = i == 0 && env && *env;  // EOWRECOMP_GAME_LIB: loaded as given, the library's own id decides
+            if (!in_apk(c[i]) && !exists(c[i])) continue;
+            // EOWRECOMP_GAME_LIB / the APK's own: loaded as given, the library's own id decides
+            bool given = (i == 0 && env && *env) || in_apk(c[i]);
             if (!given && !id_matches(c[i])) {
                 snprintf(g_error, sizeof g_error, "%s was built for another version", c[i]);
                 continue;

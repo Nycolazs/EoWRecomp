@@ -12,6 +12,9 @@
 #if defined(_WIN32)
 #define GAMELIB_NAME "eowgame.dll"
 #define GAMELIB_EXPORT __declspec(dllexport)
+#elif defined(__ANDROID__)
+#define GAMELIB_NAME "libeowgame.so"  // (the lib*.so name an APK's libraries need)
+#define GAMELIB_EXPORT __attribute__((visibility("default")))
 #elif defined(__APPLE__)
 #define GAMELIB_NAME "eowgame.dylib"
 #define GAMELIB_EXPORT __attribute__((visibility("default")))

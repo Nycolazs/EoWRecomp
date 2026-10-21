@@ -1,5 +1,8 @@
 // EoWRecomp entry: load modules, set up the kernel, run nn::init::Start on the main thread.
 #include <SDL3/SDL.h>
+#ifdef __ANDROID__
+#include <SDL3/SDL_main.h>  // (main() becomes the SDL_main the Java activity calls)
+#endif
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,8 +45,13 @@ static void rtld_fini(Cpu *c) { (void)c; LOG("nnMain returned\n"); }
 
 // Claim the guest address range before anything else can map there. The host allocator places
 // regions at random addresses in the same window; on a collision, re-exec for a fresh layout.
+// Android: no re-exec (the app is forked from the zygote, whose layout it keeps): main() reports it.
+static bool g_guest_reserved;
 __attribute__((constructor(101))) static void reserve_guest_space(void) {
-    if (plat_reserve_guest(GUEST_LO, GUEST_HI)) return;
+    if ((g_guest_reserved = plat_reserve_guest(GUEST_LO, GUEST_HI))) return;
+#ifdef __ANDROID__
+    return;
+#endif
     const char *tries = getenv("EOWRECOMP_REEXEC");
     int n = tries ? atoi(tries) : 0;
     if (n >= 20) {
@@ -160,8 +168,28 @@ static void boot(const char *root) {
     kernel_run_main(t, t->handle, 0, init_fn, main_fn, fini_fn);  // nn::init::Start(thread, args, init_sdk, init, fini)
 }
 
+#ifdef __ANDROID__
+// Test and debug hooks (getenv("EOWRECOMP_...")): KEY=VALUE lines of env.txt in the data folder, there being no
+// shell to start the app from.
+static void android_env_file(void) {
+    FILE *f = fopen("env.txt", "r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *eq = strchr(line, '=');
+        if (line[0] == '#' || !eq) continue;
+        *eq = 0;
+        setenv(line, eq + 1, 1);
+        LOG("[env] %s=%s\n", line, eq + 1);
+    }
+    fclose(f);
+}
+#endif
+
 int main(int argc, char **argv) {
     plat_init();
+    plat_thread_name("eow-main");
 #ifdef _WIN32
     setvbuf(stderr, NULL, _IONBF, 0);  // the Windows CRT treats _IOLBF as full buffering
 #else
@@ -169,13 +197,23 @@ int main(int argc, char **argv) {
 #endif
     const char *root = "extracted";  // (in the data root)
     bool skip_launcher = getenv("EOWRECOMP_NO_LAUNCHER") || getenv("EOWRECOMP_INPUT");  // tests boot straight in
-    static char arg_root[1024];
+    static char arg_root[4096];  // (realpath: PATH_MAX)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--play")) skip_launcher = true;
         else if (argv[i][0] != '-' && !realpath(argv[i], arg_root)) root = argv[i];  // (relative to where we started)
         else if (argv[i][0] != '-') root = arg_root;
     }
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+#ifdef __ANDROID__
+    android_env_file();
+    if (!g_guest_reserved && !plat_reserve_guest(GUEST_LO, GUEST_HI)) {
+        LOG("FATAL: guest address range %llx-%llx is not free\n", GUEST_LO, GUEST_HI);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "EoWRecomp", "The game's memory range is taken on this device. "
+                                 "Restart the phone and try again.", NULL);
+        return 1;
+    }
+    if (getenv("EOWRECOMP_NO_LAUNCHER") || getenv("EOWRECOMP_INPUT")) skip_launcher = true;
+#endif
     for (bool title = !skip_launcher;;) {
         if (title) {  // start screen (runtime/ui/launcher.mm): game files setup, settings
             extern void launcher_run(const char *root);

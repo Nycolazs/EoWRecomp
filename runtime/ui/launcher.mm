@@ -40,6 +40,9 @@ extern "C" {
 #include "gamebuild.h"
 #include "gamelib.h"
 #include "nxpkg.h"
+#ifdef __ANDROID__
+#include "platform/android.h"
+#endif
 #include "romfs_build.h"
 #include "settings.h"
 #include "input_bind.h"
@@ -298,6 +301,13 @@ static float extract_progress(void) {
 
 // Builds the game code from the copied files (a few minutes); false = failed (the job line says so)
 static bool build_game_code(void) {
+#ifdef __ANDROID__
+    // (no generator on the phone yet: the game code comes in a personal APK built on a computer)
+    if (gamelib_present(g_root.c_str())) return true;
+    set_job("The game code isn't in this app", true, "Build your personal APK on a computer from your own game files: "
+            "tools/android/build_game.sh <game folder> --apk (see README).");
+    return false;
+#endif
     int cores = SDL_GetNumLogicalCPUCores(), ram_gb = SDL_GetSystemRAM() / 1024;
     GameBuildOpts o = {build_progress, cores < ram_gb - 2 ? cores : ram_gb - 2 > 1 ? ram_gb - 2 : 1};
     char why[256] = "";
@@ -324,6 +334,24 @@ static void *extract_thread(void *) {
         goto check;
     }
     set_job("Looking for the game files...");
+#ifdef __ANDROID__
+    if (!src.compare(0, 8, "android:")) {  // the picked document tree: the package read in place, the keys copied
+        char uri[2048];
+        rt_remove_game_files(g_root.c_str());
+        mkdir(g_root.c_str(), 0755);
+        std::string kdir = g_root + "/keys";
+        const char *err = android_find_game_package(kdir.c_str(), uri, sizeof uri);
+        if (err) {
+            fprintf(stderr, "[launcher] %s\n", err);
+            if (!strcmp(err, "nokeys"))
+                set_job("No prod.keys beside the game package", true, "Put the keys file from your own Switch (prod.keys) "
+                        "in the same folder as the game and choose it again.");
+            else set_failure(FAIL_NOT_FOUND);
+            goto done;
+        }
+        package = uri, keys = kdir + "/prod.keys";
+    } else
+#endif
     find_game(src, 0, exefs, romfs, package, keys, unusable);
     if ((exefs.empty() || romfs.empty()) && !package.empty()) {  // the game package: ExeFS out, RomFS read in place
         if (keys.empty()) {
@@ -400,6 +428,17 @@ static void SDLCALL picked(void *, const char *const *files, int) {
     g_src = files[0];
     pthread_mutex_unlock(&g_lock);
 }
+
+#ifdef __ANDROID__
+// (the system's folder picker: a tree of documents, read through EowActivity; ANDROID_SRC marks it in g_src)
+#define ANDROID_SRC "android:"
+static void picked_android(const char *name) {
+    if (!name) return;
+    pthread_mutex_lock(&g_lock);
+    g_src = std::string(ANDROID_SRC) + name;
+    pthread_mutex_unlock(&g_lock);
+}
+#endif
 
 // ------------------------------------------------------------------ the user's own Nintendo fonts (not shipped)
 // runtime/hle/pl.c loads fonts/ first, else a close substitute (Hiragino Sans). Import copies recognized files only.
@@ -1331,7 +1370,11 @@ extern "C" void launcher_run(const char *root) {
                     opt_section("Your copy of the game");
                     if (busy) opt_disable_next();
                     if (opt_action("Game files folder", src_v.c_str(), src_d.c_str(), true))
+#ifdef __ANDROID__
+                        android_pick_game_folder(picked_android);
+#else
                         SDL_ShowOpenFolderDialog(picked, NULL, win, NULL, false);
+#endif
                     check_left_of_value(src_v);
                     first_row();
                     opt_section("Set up");

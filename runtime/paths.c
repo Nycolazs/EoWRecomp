@@ -78,13 +78,44 @@ static void fail(const char *msg) {
 static bool g_dev;  // the data root is the starting folder because it has extracted/ (a source checkout)
 bool rt_dev_mode(void) { return g_dev; }
 
+#ifdef __ANDROID__
+// The files the app ships are APK assets (android/app/build.gradle eowAssets), which only SDL's file streams can read:
+// copied once into <internal storage>/res, which then stands in for the executable's folder (rt_resource).
+static void android_resources(void) {
+    static const char *const names[] = {"Baloo2-SemiBold.ttf", "DejaVuSans.ttf", "icon.png"};
+    const char *internal = SDL_GetAndroidInternalStoragePath();
+    if (!internal) return;
+    snprintf(g_exe_dir, sizeof g_exe_dir, "%s/res", internal);
+    mkdirs(g_exe_dir);
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+        SDL_IOStream *in = SDL_IOFromFile(names[i], "rb");
+        if (!in) continue;
+        Sint64 size = SDL_GetIOSize(in);
+        char out[1200];
+        snprintf(out, sizeof out, "%s/%s", g_exe_dir, names[i]);
+        struct stat st;
+        if (size > 0 && !(stat(out, &st) == 0 && st.st_size == size)) {
+            void *data = SDL_LoadFile_IO(in, NULL, false);
+            FILE *f = data ? fopen(out, "wb") : NULL;
+            if (f) { fwrite(data, 1, (size_t)size, f); fclose(f); }
+            SDL_free(data);
+        }
+        SDL_CloseIO(in);
+    }
+}
+#endif
+
 void rt_paths_init(void) {
     if (!getcwd(g_start, sizeof g_start)) g_start[0] = 0;
+#ifdef __ANDROID__
+    android_resources();
+#else
     if (plat_exe_path(g_exe_dir, sizeof g_exe_dir)) {
         char *s = strrchr(g_exe_dir, '/'), *b = strrchr(g_exe_dir, '\\');
         if (b > s) s = b;
         if (s) *s = 0;
     }
+#endif
     char root[1024];
     const char *env = getenv("EOWRECOMP_DATA_ROOT");
     if (env && *env) snprintf(root, sizeof root, "%s", env);
@@ -92,6 +123,11 @@ void rt_paths_init(void) {
     else {
 #ifdef _WIN32
         snprintf(root, sizeof root, "%s", g_exe_dir);
+#elif defined(__ANDROID__)
+        // Android/data/<package>/files: the app's own without any permission, and reachable from a computer over USB
+        // (game files, saves, the log)
+        const char *ext = SDL_GetAndroidExternalStoragePath();
+        snprintf(root, sizeof root, "%s", ext ? ext : SDL_GetAndroidInternalStoragePath());
 #elif defined(__linux__)
         // (the AppImage is read-only): $XDG_DATA_HOME/eowrecomp, ~/.local/share/eowrecomp by default
         const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
@@ -138,7 +174,7 @@ bool rt_resource(const char *name, const char *dev_rel, char *out, size_t n) {
 // ---- game files
 // What the setup (runtime/ui/launcher.mm) creates in extracted/, plus what older versions' extraction and manual
 // extractions left there (never read at run time).
-static const char *const GAME_FILES[] = {"exefs", "romfs", "romfs.bin", "romfs.src", GAMELIB_NAME, GAMELIB_NAME ".id", ".gamebuild",
+static const char *const GAME_FILES[] = {"exefs", "romfs", "romfs.bin", "romfs.src", "keys", GAMELIB_NAME, GAMELIB_NAME ".id", ".gamebuild",
                                          ".extract", "extract.log", "xci_secure", "nso_raw", "update_pfs", ".DS_Store"};
 
 // game_dir must be <data root>/extracted, a real folder (a dev worktree's symlinked extracted/ is refused)

@@ -12,6 +12,7 @@
 #include <strings.h>
 
 #include "../hle.h"
+#include "../paths.h"
 
 typedef struct { uint64_t addr, size; } Font;
 static Font fonts[2];  // [0] Standard (every type), [1] NintendoExt when a dump provides it
@@ -110,6 +111,9 @@ static void load_fonts(void) {
     if (g_fonts_loaded) return;
     g_fonts_loaded = 1;
     const char *env = getenv("EOWRECOMP_FONT");
+    // (the copy the app ships: third_party/fonts/DejaVu - Android has no TrueType system font to rely on)
+    static char shipped[1100];
+    if (!rt_resource("DejaVuSans.ttf", "third_party/fonts/DejaVu/DejaVuSans.ttf", shipped, sizeof shipped)) shipped[0] = 0;
     const char *std[] = {env, "fonts/nintendo_udsg-r_std_003.bfttf", "fonts/nintendo_udsg-r_std_003.ttf",
                          "fonts/nintendo_udsgr_std_003.ttf", "fonts/nintendo_udsgr_std_003.bfttf",
                          "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc", "C:/Windows/Fonts/YuGothR.ttc",
@@ -118,7 +122,7 @@ static void load_fonts(void) {
                          // Linux: DejaVu Sans (Debian / Ubuntu, Arch, Fedora). Not Noto Sans CJK: CFF outlines,
                          // which the game's font engine crashes on (it wants TrueType)
                          "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf",
-                         "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"};
+                         "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf", shipped[0] ? shipped : NULL};
     for (size_t i = 0; i < sizeof std / sizeof *std && !fonts[0].addr; i++)
         if (std[i]) load_one(std[i], &fonts[0]);
     if (!fonts[0].addr) FATAL("no usable system font substitute\n");
