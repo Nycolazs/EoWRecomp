@@ -1623,11 +1623,15 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         bool wide = bits(w, 48, 1);
         int64_t off = sbits(w, 28, 20);
         if (size > 1) fail(c, "red size %d", size);
-        if ((op == 1 || op == 2) && size == 1) fail(c, "red signed min/max");
-        if (op == 3 || op == 4) fail(c, "red inc/dec");
+        bool cas = (op == 1 || op == 2) && size == 1;  // S32 min/max: the uint words' atomicMin/Max would compare unsigned
+        if (op == 3 || op == 4) cas = true;                // INC / DEC (wrapping at the value, as CUDA's atomicInc/Dec)
+        if (cas && !c->glsl && op > 2) fail(c, "red inc/dec");
         static const char *const gl_op[] = {"atomicAdd", "atomicMin", "atomicMax", "", "", "atomicAnd", "atomicOr", "atomicXor"};
         static const char *const ms_op[] = {"atomic_fetch_add_explicit", "atomic_fetch_min_explicit", "atomic_fetch_max_explicit", "", "",
                                             "atomic_fetch_and_explicit", "atomic_fetch_or_explicit", "atomic_fetch_xor_explicit"};
+        // GLSL compare-and-swap loop for the ops the uint atomics lack: the new word from the old one (o_) and the value (v_)
+        static const char *const gl_cas[] = {"", "uint(min(int(o_), int(v_)))", "uint(max(int(o_), int(v_)))",
+                                             "(o_ >= v_ ? 0u : o_ + 1u)", "((o_ == 0u || o_ > v_) ? v_ : o_ - 1u)"};
         c->info->uses_gmem = true;
         c->uses_gmem_store = true;
         c->info->uses_gmem_store = true;
@@ -1637,13 +1641,27 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         else sprintf(addr, "(ulong(%s) + ulong(%lld))", R(a), (long long)off);
         sp(&c->body, "    { ulong ga = %s - 0x%llxul; bool ok = ga < 0x%llxul;\n", addr,
            (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size);
-        if (c->glsl && c->stage == STAGE_COMPUTE) {  // (the dispatch's storage buffers have a device-local copy: see LDG / STG)
+        if (c->glsl && cas) {
+            const char *word = "gmem_.w[uint(ga >> 2)]";
+            if (c->stage == STAGE_COMPUTE) {
+                c->info->uses_gmem_map = true;
+                sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
+                sp(&c->body, "      if (fw != 0xFFFFFFFFu) { uint v_ = %s, o_ = gfast_.w[fw]; for (;;) { uint p_ = atomicCompSwap(gfast_.w[fw], o_, %s); "
+                   "if (p_ == o_) break; o_ = p_; } }\n      else ", R(vr), gl_cas[op]);
+            } else {
+                sp(&c->body, "      ");
+            }
+            sp(&c->body, "if (ok) { uint v_ = %s, o_ = %s; for (;;) { uint p_ = atomicCompSwap(%s, o_, %s); if (p_ == o_) break; o_ = p_; } }\n",
+               R(vr), word, word, gl_cas[op]);
+        } else if (c->glsl && c->stage == STAGE_COMPUTE) {  // (the dispatch's storage buffers have a device-local copy: see LDG / STG)
             c->info->uses_gmem_map = true;
             sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
             sp(&c->body, "      if (fw != 0xFFFFFFFFu) %s(gfast_.w[fw], %s); else if (ok) %s(gmem_.w[uint(ga >> 2)], %s);\n", gl_op[op],
                R(vr), gl_op[op], R(vr));
         } else if (c->glsl) {
             sp(&c->body, "      if (ok) %s(gmem_.w[uint(ga >> 2)], %s);\n", gl_op[op], R(vr));
+        } else if (cas) {  // MSL: signed min/max on the word as an atomic_int
+            sp(&c->body, "      if (ok) %s((device atomic_int *)(gmem + ga), int(%s), memory_order_relaxed);\n", ms_op[op], R(vr));
         } else {
             sp(&c->body, "      if (ok) %s((device atomic_uint *)(gmem + ga), %s, memory_order_relaxed);\n", ms_op[op], R(vr));
         }
