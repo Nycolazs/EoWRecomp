@@ -53,3 +53,14 @@ Useful environment variables (all `EOWRECOMP_*`): `EOWRECOMP_SHOT_AT=300,600` (s
     tools/test_nxpkg.sh                  # the package reader: AES / XTS / LZ4 against reference vectors
     tools/test_translate.sh 8000 8 glsl  # the shader translator: random programs -> GLSL -> SPIR-V, validated
     tools/test_moltenvk.sh 8000 8        # ... and on through SPIRV-Cross to MSL, compiled by Metal (MoltenVK's path)
+
+## The app to share
+
+    tools/build_deps_macos.sh   # once (~10 min): SDL3, LGPL-only FFmpeg, the Vulkan loader, shaderc, VMA, Python
+    make app                    # build/EoWRecomp.app
+
+Homebrew's libraries are built for the macOS they were bottled on, so `build_deps_macos.sh` builds what the app carries
+from pinned, checksum-checked sources for macOS 15 (`MACOS_MIN`), and fetches a standalone Python
+([python-build-standalone](https://github.com/astral-sh/python-build-standalone)) for the generator helper.
+`tools/bundle_macos.sh` refuses to make the app if any Mach-O inside needs a newer macOS, or if game code was linked in.
+The app is ad-hoc signed, not notarized: the first time, open it with right-click -> Open.

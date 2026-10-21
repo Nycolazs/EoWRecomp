@@ -70,7 +70,7 @@ FFMPEG   := $(or $(DEPS),/opt/homebrew/opt/ffmpeg)
 # MACOS_BACKEND: vulkan (default: the backend every other platform runs, through MoltenVK; Homebrew's molten-vk,
 # vulkan-loader, vulkan-headers, shaderc) or metal (LAS's renderer, not yet carried over to EoW)
 MACOS_BACKEND ?= vulkan
-# (MoltenVK, the Vulkan loader and headers, shaderc: from Homebrew, also for a release build with DEPS)
+# (MoltenVK and the Vulkan headers: from Homebrew; the loader and shaderc too, or from DEPS when set: make app)
 VKSDK    ?= /opt/homebrew
 EXE      := $(B)/eowrecomp
 DEPINC   := -I$(SDL)/include -I$(FFMPEG)/include
@@ -240,31 +240,33 @@ $(B)/rt/platform/windows_rc.o: runtime/platform/windows.rc docs/icon/icon.ico
 	$(WINDRES) -I docs/icon -O coff $< -o $@
 
 # The game code generator as a standalone helper (PyInstaller, tools/eowgen.spec): build/helper/eowgen/, for the start
-# screen's setup on the player's machine (runtime/gamebuild.c). Release packaging (app bundle, zip, AppImage) is not
-# set up for EoWRecomp yet.
+# screen's setup on the player's machine (runtime/gamebuild.c). GEN_VENV: its venv (make app: one on build/deps'
+# Python, which runs on older macOS than Homebrew's).
 GEN_PY  ?= $(if $(filter windows,$(PLATFORM)),py -3.12,python3)
-GEN_VPY := $(if $(filter windows,$(PLATFORM)),build/gen-venv/Scripts/python.exe,build/gen-venv/bin/python)
+GEN_VENV ?= build/gen-venv
+GEN_VPY := $(if $(filter windows,$(PLATFORM)),$(GEN_VENV)/Scripts/python.exe,$(GEN_VENV)/bin/python)
 
-gen-helper: build/gen-venv/.ok
+gen-helper: $(GEN_VENV)/.ok
 	$(if $(filter windows,$(PLATFORM)),USERPROFILE="$$(cygpath -w ~ 2>/dev/null || echo $$HOME)") \
 	$(GEN_VPY) -m PyInstaller --noconfirm --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller \
 	    tools/eowgen.spec
 	$(if $(filter windows,$(PLATFORM)),$(GEN_VPY) tools/pe_no_cfg.py build/helper/eowgen/eowgen.exe)
 	@du -sh build/helper/eowgen
 
-build/gen-venv/.ok:
-	$(GEN_PY) -m venv build/gen-venv
+$(GEN_VENV)/.ok:
+	$(GEN_PY) -m venv $(GEN_VENV)
 	$(GEN_VPY) -m pip install -q capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5 pyinstaller==6.22.3
 	touch $@
 
 # make app (macOS): build/EoWRecomp.app to ship - the runtime built against build/deps (tools/build_deps_macos.sh:
 # LGPL-only FFmpeg, SDL3), MoltenVK, and what the start screen builds the game code with (the generator helper, zig).
-# No game code or files inside (tools/bundle_macos.sh checks).
+# No game code or files inside (tools/bundle_macos.sh checks). For macOS 15+ (build/deps' minimum) unless MACOS_MIN.
+APP_MIN := $(or $(MACOS_MIN),15.0)
 app:
-	$(MAKE) B=build/rel DEPS=$(CURDIR)/build/deps build/rel/eowrecomp
-	$(MAKE) gen-helper
+	$(MAKE) B=build/rel DEPS=$(CURDIR)/build/deps MACOS_MIN=$(APP_MIN) build/rel/eowrecomp
+	$(MAKE) gen-helper GEN_PY=build/deps/python/bin/python3 GEN_VENV=build/gen-venv-rel
 	[ -x build/zig/zig ] || tools/fetch_zig.sh
-	tools/bundle_macos.sh build/rel/eowrecomp
+	MACOS_MIN=$(APP_MIN) tools/bundle_macos.sh build/rel/eowrecomp
 
 .PHONY: all gen gen-helper gen-objs runtime-objs app
 
