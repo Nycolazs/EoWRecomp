@@ -22,6 +22,15 @@ const char *android_find_game_package(const char *keys_dir, char *uri, size_t ur
 // (the caller closes it), or -1
 int android_open_document(const char *uri);
 
+// ---- building the game code on the phone (runtime/gamebuild.c)
+// The generator, its Python and the compiler's NDK pieces unpacked from the APK's assets into the app's internal
+// storage (once per app version; blocking): that folder, or NULL (an APK without them, or no space)
+const char *android_build_tools(void);
+// The build's foreground service (keeps the app running with the screen off: wake lock, a notification); on = false
+// ends it. text: what the notification says (any thread).
+void android_build_service(bool on, const char *title);
+void android_build_progress(int percent, const char *text);
+
 #ifdef __cplusplus
 }
 #endif

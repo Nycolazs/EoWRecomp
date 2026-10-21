@@ -85,6 +85,44 @@ int android_open_document(const char *uri) {
     return fd;
 }
 
+// ---- building the game code on the phone (EowActivity.buildTools / BuildService)
+const char *android_build_tools(void) {
+    static char dir[1024];
+    JNIEnv *env;
+    jclass cls;
+    jmethodID m = activity_method(&env, &cls, "buildTools", "()Ljava/lang/String;");
+    if (!m) return NULL;
+    jstring r = (jstring)(*env)->CallStaticObjectMethod(env, cls, m);
+    (*env)->DeleteLocalRef(env, cls);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return NULL; }
+    take_string(env, r, dir, sizeof dir);
+    return dir[0] ? dir : NULL;
+}
+
+void android_build_service(bool on, const char *title) {
+    JNIEnv *env;
+    jclass cls;
+    jmethodID m = activity_method(&env, &cls, "buildService", "(ZLjava/lang/String;)V");
+    if (!m) return;
+    jstring t = (*env)->NewStringUTF(env, title ? title : "");
+    (*env)->CallStaticVoidMethod(env, cls, m, (jboolean)on, t);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    (*env)->DeleteLocalRef(env, t);
+    (*env)->DeleteLocalRef(env, cls);
+}
+
+void android_build_progress(int percent, const char *text) {
+    JNIEnv *env;
+    jclass cls;
+    jmethodID m = activity_method(&env, &cls, "buildProgress", "(ILjava/lang/String;)V");
+    if (!m) return;
+    jstring t = (*env)->NewStringUTF(env, text ? text : "");
+    (*env)->CallStaticVoidMethod(env, cls, m, (jint)percent, t);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    (*env)->DeleteLocalRef(env, t);
+    (*env)->DeleteLocalRef(env, cls);
+}
+
 JNIEXPORT void JNICALL Java_com_eowrecomp_android_EowActivity_nativeFolderPicked(JNIEnv *env, jclass cls, jstring name) {
     (void)cls;
     const char *s = name ? (*env)->GetStringUTFChars(env, name, NULL) : NULL;

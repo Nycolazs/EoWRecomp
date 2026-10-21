@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">EoW Recomp</string>
+    <string name="build_channel">Building the game code</string>
+    <string name="build_title">Recompiling the game</string>
 </resources>

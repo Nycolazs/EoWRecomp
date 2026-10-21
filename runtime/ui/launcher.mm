@@ -291,6 +291,12 @@ static bool g_copy_skipped;                  // (only the game code to build: th
 static void setup_progress(uint64_t done, uint64_t) { g_done = g_phase_base + done; }
 static void build_progress(double f, const char *step) {
     g_build_frac = (float)f;
+#ifdef __ANDROID__
+    {   // (the notification: whole percents only)
+        static int last_pct = -1;
+        if ((int)(f * 100) != last_pct) last_pct = (int)(f * 100), android_build_progress(last_pct, step);
+    }
+#endif
     static const char *last;
     if (step != last) last = step, set_job(step);
 }
@@ -303,17 +309,26 @@ static float extract_progress(void) {
 // Builds the game code from the copied files (a few minutes); false = failed (the job line says so)
 static bool build_game_code(void) {
 #ifdef __ANDROID__
-    // (no generator on the phone yet: the game code comes in a personal APK built on a computer)
+    // A personal APK carries the game code already; the public one builds it on the phone (when it carries the
+    // builder: android/app/build.gradle onDeviceBuild), inside a foreground service so it goes on with the screen off
     if (gamelib_present(g_root.c_str())) return true;
-    set_job("The game code isn't in this app", true, "Build your personal APK on a computer from your own game files: "
-            "tools/android/build_game.sh <game folder> --apk (see README).");
-    return false;
+    if (!gamebuild_available()) {
+        set_job("The game code isn't in this app", true, "Build your personal APK on a computer from your own game files: "
+                "tools/android/build_game.sh <game folder> --apk (docs/BUILD-android.md).");
+        return false;
+    }
 #endif
     int cores = SDL_GetNumLogicalCPUCores(), ram_gb = SDL_GetSystemRAM() / 1024;
     GameBuildOpts o = {build_progress, cores < ram_gb - 2 ? cores : ram_gb - 2 > 1 ? ram_gb - 2 : 1};
     char why[256] = "";
     g_build_frac = 0;
+#ifdef __ANDROID__
+    android_build_service(true, "Recompiling the game");
+#endif
     bool ok = gamebuild_run(g_root.c_str(), &o, why, sizeof why);
+#ifdef __ANDROID__
+    android_build_service(false, NULL);
+#endif
     if (!ok) {
         fprintf(stderr, "[launcher] game code: %s\n", why);
         set_failure(FAIL_BUILD);

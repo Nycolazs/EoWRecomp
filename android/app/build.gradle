@@ -7,6 +7,14 @@ plugins {
 }
 
 def sdl = file('../../build/android/SDL3/android-project/app/src/main/java')
+// -PonDeviceBuild=true: the APK builds the game code on the phone from the player's own game files (python, zig and
+// the generator's libraries as lib*.so - extracted at install: Android runs programs only from the native library
+// folder - + assets/ondevice.zip and the license texts, all from tools/android/ondevice/build_all.sh: build/ondevice/).
+// Dev builds can leave it out.
+def onDevice = (project.findProperty('onDeviceBuild') ?: 'false') == 'true'
+def ondev = file('../../build/ondevice')
+if (onDevice && !(new File(ondev, 'stage/jniLibs/arm64-v8a/libzig.so').exists() && new File(ondev, 'assets/ondevice.zip').exists()))
+    throw new GradleException('-PonDeviceBuild: run tools/android/ondevice/build_all.sh first')
 
 android {
     namespace 'com.eowrecomp.android'
@@ -22,6 +30,7 @@ android {
         ndk {
             abiFilters 'arm64-v8a'
         }
+        manifestPlaceholders = [extractNativeLibs: onDevice ? 'true' : 'false']
         externalNativeBuild {
             cmake {
                 targets 'main', 'SDL3-shared'
@@ -71,6 +80,10 @@ android {
             assets.srcDirs += ["$buildDir/generated/eow-assets"]
             // a personal build with the game code inside (tools/android/build_game.sh --apk)
             if (project.hasProperty('eowGameLib')) jniLibs.srcDirs += [project.property('eowGameLib')]
+            if (onDevice) {
+                jniLibs.srcDirs += ["$ondev/stage/jniLibs"]
+                assets.srcDirs += ["$ondev/assets"]
+            }
         }
     }
 
@@ -81,7 +94,9 @@ android {
 
     packaging {
         jniLibs {
-            useLegacyPackaging false  // (stored uncompressed and mapped directly from the APK)
+            // stored uncompressed and mapped directly from the APK; the on-phone build: compressed in the APK and
+            // extracted at install (its programs must be files to run)
+            useLegacyPackaging onDevice
         }
     }
 }
@@ -93,3 +108,13 @@ tasks.register('eowAssets', Sync) {  // (Sync: a file gone from the sources goes
     into "$buildDir/generated/eow-assets"
 }
 preBuild.dependsOn eowAssets
+
+// The on-phone build's kit and asset archive again from this checkout's sources (quick: python and zig stay built), so
+// the headers and the generator inside the APK are the ones its game code id (tools/android/gamelib_id.sh) is made from
+if (onDevice) {
+    tasks.register('eowOnDeviceAssets', Exec) {
+        workingDir file('../..')
+        commandLine 'bash', '-c', 'tools/android/ondevice/build_cckit.sh && tools/android/ondevice/make_assets.sh'
+    }
+    preBuild.dependsOn eowOnDeviceAssets
+}

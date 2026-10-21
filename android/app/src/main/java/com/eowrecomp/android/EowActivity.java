@@ -206,6 +206,78 @@ public class EowActivity extends SDLActivity {
             if (k.dir && !k.name.startsWith(".")) find(cr, k, depth + 1, found);
     }
 
+    // ---- building the game code on the phone (runtime/gamebuild.c; docs/BUILD-android.md)
+
+    // The asset archive (assets/ondevice.zip: the generator, its Python's standard library and modules, the NDK pieces
+    // the compiler needs; tools/android/ondevice/make_assets.sh) unpacked into files/ondevice, once per app version.
+    // Returns that folder, or null (an APK built without it, or the unpacking failed). Blocking.
+    public static synchronized String buildTools() {
+        EowActivity a = (EowActivity) mSingleton;
+        if (a == null) return null;
+        File dir = new File(a.getFilesDir(), "ondevice");
+        File stamp = new File(dir, ".unpacked");
+        String want;
+        try {
+            android.content.pm.PackageInfo pi = a.getPackageManager().getPackageInfo(a.getPackageName(), 0);
+            want = pi.getLongVersionCode() + " " + pi.lastUpdateTime;
+        } catch (Exception e) {
+            want = "?";
+        }
+        try {
+            if (stamp.isFile() && want.equals(new String(java.nio.file.Files.readAllBytes(stamp.toPath())).trim()))
+                return dir.getAbsolutePath();
+        } catch (Exception ignored) {
+        }
+        try (InputStream raw = a.getAssets().open("ondevice.zip");
+             java.util.zip.ZipInputStream zin = new java.util.zip.ZipInputStream(new java.io.BufferedInputStream(raw, 1 << 16))) {
+            deleteTree(dir);
+            if (!dir.mkdirs()) return null;
+            String root = dir.getCanonicalPath() + File.separator;
+            byte[] buf = new byte[1 << 16];
+            for (java.util.zip.ZipEntry e; (e = zin.getNextEntry()) != null; ) {
+                File out = new File(dir, e.getName());
+                if (!out.getCanonicalPath().startsWith(root)) continue;  // (no ../ out of the folder)
+                if (e.isDirectory()) { out.mkdirs(); continue; }
+                File p = out.getParentFile();
+                if (p != null) p.mkdirs();
+                try (OutputStream os = new FileOutputStream(out)) {
+                    for (int n; (n = zin.read(buf)) > 0; ) os.write(buf, 0, n);
+                }
+            }
+            try (OutputStream os = new FileOutputStream(stamp)) { os.write(want.getBytes()); }
+            return dir.getAbsolutePath();
+        } catch (java.io.FileNotFoundException e) {
+            return null;  // (no assets/ondevice.zip: a build without -PonDeviceBuild)
+        } catch (Exception e) {
+            Log.e(TAG, "build tools", e);
+            return null;
+        }
+    }
+
+    private static void deleteTree(File f) {
+        File[] kids = f.listFiles();
+        if (kids != null) for (File k : kids) deleteTree(k);
+        f.delete();
+    }
+
+    // The build's foreground service (BuildService): on while it runs, off at its end
+    public static void buildService(boolean on, String title) {
+        final EowActivity a = (EowActivity) mSingleton;
+        if (a == null) return;
+        if (!on) { BuildService.stop(a); return; }
+        a.runOnUiThread(() -> {
+            // (Android 13+: its progress notification needs the permission - asked once; the build runs without it)
+            if (android.os.Build.VERSION.SDK_INT >= 33 &&
+                a.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+                a.requestPermissions(new String[] {android.Manifest.permission.POST_NOTIFICATIONS}, 4103);
+            BuildService.start(a, title);
+        });
+    }
+
+    public static void buildProgress(int percent, String text) {
+        BuildService.progress(percent, text);
+    }
+
     // ---- native (runtime/platform/android_jni.c)
     public static native void nativeFolderPicked(String name);
 }
