@@ -5,7 +5,7 @@
 //
 // Skipped with --play, EOWRECOMP_NO_LAUNCHER=1, or any scripted test run (EOWRECOMP_INPUT): tests boot straight in.
 // The in-game menu's "Title screen" comes back here without leaving the process (runtime/main.c reboots the game).
-#ifdef __APPLE__
+#ifdef EOW_METAL
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #endif
@@ -24,7 +24,7 @@
 #include "imgui_internal.h"  // (SetKeyOwner)
 #include "option_rows.h"
 #include "osk.h"
-#ifdef __APPLE__
+#ifdef EOW_METAL
 #include "imgui_impl_metal.h"
 #else
 #include "imgui_impl_vulkan.h"
@@ -45,7 +45,7 @@ extern "C" {
 void controls_bindings_draw(float scale);  // ui/controls_ui.mm
 void ui_window_init(void);
 SDL_Window *ui_window(void);
-#ifdef __APPLE__
+#ifdef EOW_METAL
 void *ui_metal_layer(void);
 void *ui_metal_device(void);
 #else
@@ -58,7 +58,7 @@ void vk_imgui_backend_shutdown(void);
 uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);
 #endif
 }
-#ifdef __APPLE__
+#ifdef EOW_METAL
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
@@ -82,7 +82,7 @@ static void save_png(id<MTLTexture> tex, const char *path) {
 }
 #endif
 
-static const uint8_t BUILD_ID[8] = {0xae, 0x16, 0xf7, 0x1e, 0x00, 0x2a, 0xf8, 0xcb};  // Link's Awakening v1.0.0 main
+static const uint8_t BUILD_ID[8] = {0xa5, 0x81, 0x40, 0x6b, 0xc9, 0x85, 0x86, 0x51};  // Echoes of Wisdom v1.0.0 main (docs/STATUS.md)
 // The release tag this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read
 // it): beta_<n> until 1.0, then v<major>.<minor>.<patch>.
 #define EOWRECOMP_VERSION "0.0.1-dev"
@@ -179,7 +179,7 @@ static std::string check_copied_files(const std::string &root) {
     size_t n = fread(id, 1, 8, f);
     fclose(f);
     if (n != 8 || memcmp(id, BUILD_ID, 8)) return "Wrong game version (needs v1.0.0)";
-    if (!file_exists(root + "/romfs/region_common") || !file_exists(root + "/romfs.bin")) return "Game data missing";
+    if (!file_exists(root + "/romfs.bin")) return "Game data missing";  // (the image the game reads: services/fs.c)
     return "";
 }
 
@@ -419,7 +419,7 @@ static void remove_fonts() {
 }
 
 // ------------------------------------------------------------------ background: a title movie frame
-#ifdef __APPLE__
+#ifdef EOW_METAL
 static id<MTLTexture> g_bg;
 #define BG_TEXID ((ImTextureID)(__bridge void *)g_bg)
 typedef id<MTLDevice> GpuDevice;
@@ -460,7 +460,7 @@ static void load_background(GpuDevice dev) {
                 int dst_ls[1] = {w * 4};
                 sws_scale(sws, fr->data, fr->linesize, 0, h, dst, dst_ls);
                 sws_freeContext(sws);
-#ifdef __APPLE__
+#ifdef EOW_METAL
                 MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                               width:w height:h mipmapped:NO];
                 g_bg = [dev newTextureWithDescriptor:td];
@@ -838,7 +838,7 @@ extern "C" void launcher_run(const char *root) {
     ui_window_init();
     SDL_Window *win = ui_window();
     g_launcher_win = win;
-#ifdef __APPLE__
+#ifdef EOW_METAL
     CAMetalLayer *layer = (__bridge CAMetalLayer *)ui_metal_layer();
     id<MTLDevice> dev = (__bridge id<MTLDevice>)ui_metal_device();
     id<MTLCommandQueue> queue = [dev newCommandQueue];
@@ -877,7 +877,7 @@ extern "C" void launcher_run(const char *root) {
     st.Colors[ImGuiCol_HeaderActive] = ImVec4(1, 1, 1, 0.14f);
     st.Colors[ImGuiCol_NavCursor] = ImVec4(0.95f, 0.78f, 0.35f, 1);
     st.FrameRounding = st.WindowRounding = 10;
-#ifdef __APPLE__
+#ifdef EOW_METAL
     ImGui_ImplSDL3_InitForMetal(win);
     ImGui_ImplMetal_Init(dev);
 #else
@@ -899,7 +899,7 @@ extern "C" void launcher_run(const char *root) {
     // EOWRECOMP_LAUNCHER_SHOT=<frame>[:<page>] (test): save build/launcher.png at that frame and exit; page: settings[:<tab>] / askdelete / setup
     long shot_at = getenv("EOWRECOMP_LAUNCHER_SHOT") ? atol(getenv("EOWRECOMP_LAUNCHER_SHOT")) : 0, frame = 0;
     if (shot_at) {
-#ifdef __APPLE__
+#ifdef EOW_METAL
         layer.framebufferOnly = NO;
 #endif
         const char *pg = strchr(getenv("EOWRECOMP_LAUNCHER_SHOT"), ':');
@@ -975,7 +975,7 @@ extern "C" void launcher_run(const char *root) {
         }
         was_busy = busy;
 
-#ifdef __APPLE__
+#ifdef EOW_METAL
         int w, h;
         SDL_GetWindowSizeInPixels(win, &w, &h);
         layer.drawableSize = CGSizeMake(w, h);
@@ -1270,8 +1270,8 @@ extern "C" void launcher_run(const char *root) {
                     dl->AddLine(ImVec2(x, cy), ImVec2(x + u * 0.35f, cy + u * 0.35f), g, fs * 0.11f);
                     dl->AddLine(ImVec2(x + u * 0.35f, cy + u * 0.35f), ImVec2(x + u, cy - u * 0.4f), g, fs * 0.11f);
                 };
-                std::string src_d = "The folder with your own game folders (exefs/romfs) of The Legend of Zelda: Link's "
-                                    "Awakening for Nintendo Switch, version 1.0.0. The game isn't included with EoWRecomp.";
+                std::string src_d = "The folder with your own game folders (exefs/romfs) of The Legend of Zelda: Echoes "
+                                    "of Wisdom for Nintendo Switch, version 1.0.0. The game isn't included with EoWRecomp.";
                 if (!src.empty()) src_d += "\n\nChosen: " + src;
                 // the step that's running / its result, under the rows and in the Set up row's explanation
                 const std::string &job_line = job;
@@ -1466,7 +1466,7 @@ extern "C" void launcher_run(const char *root) {
             typed_before = ui_text_busy();
 
             ImGui::Render();
-#ifdef __APPLE__
+#ifdef EOW_METAL
             ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cb, enc);
             [enc endEncoding];
             id<MTLTexture> shot = nil;
@@ -1496,7 +1496,7 @@ extern "C" void launcher_run(const char *root) {
     }
     // play: hand the window to the game
     settings_save();
-#ifdef __APPLE__
+#ifdef EOW_METAL
     ImGui_ImplMetal_Shutdown();
 #else
     vk_imgui_backend_shutdown();

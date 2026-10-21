@@ -1,6 +1,8 @@
 """Extract ExeFS and RomFS from a program NCA (NCA3), including compressed sections.
 
-Usage: nca_extract.py <prod.keys> <program.nca> <outdir> [--no-romfs] [--romfs-image] [--info]
+Usage: nca_extract.py <prod.keys> <program.nca | game.nsp> <outdir> [--no-romfs] [--romfs-image] [--info]
+
+An .nsp (a PFS0 of NCAs) is read in place: its program NCA is found by content type, nothing is copied out.
 
 hactool (SciresM) can't read this game's program NCA: its RomFS section is stored through the BucketTree
 compression layer (LZ4 blocks, firmware 12+), and hactool aborts on it before writing even the ExeFS. Layout as in
@@ -35,9 +37,56 @@ def aes_ecb_dec(key, data):
     return d.update(data) + d.finalize()
 
 
+class SubFile:
+    """A file inside a container (an NCA inside an NSP) seen as a file of its own."""
+
+    def __init__(self, path, base):
+        self.f, self.base = open(path, 'rb'), base
+        self.f.seek(base)
+
+    def seek(self, off):
+        self.f.seek(self.base + off)
+
+    def read(self, n):
+        return self.f.read(n)
+
+
+def nsp_ncas(path):
+    """[(name, offset, size)] of the .nca entries of an NSP (PFS0)."""
+    with open(path, 'rb') as f:
+        magic, n, strsz, _ = struct.unpack('<4sIII', f.read(0x10))
+        if magic != b'PFS0':
+            raise SystemExit(f'{path}: not an NSP (PFS0)')
+        ents = [struct.unpack('<QQII', f.read(0x18)) for _ in range(n)]
+        names = f.read(strsz)
+    data = 0x10 + n * 0x18 + strsz
+    end = data + max(off + size for off, size, _, _ in ents)
+    have = os.path.getsize(path)
+    if have < end:  # (a copy cut short: the ExeFS and the RomFS's compression table sit at the program NCA's end)
+        raise SystemExit(f'{path}: truncated, {have} bytes of {end} ({(end - have) / 2**20:.0f} MiB missing); '
+                         'copy the NSP again')
+    out = []
+    for off, size, no, _ in ents:
+        name = names[no:names.index(b'\0', no)].decode()
+        if name.endswith('.nca') and not name.endswith('.cnmt.nca'):
+            out.append((name, data + off, size))
+    return out
+
+
+def open_program_nca(path, keys):
+    if not path.lower().endswith('.nsp'):
+        return Nca(path, keys)
+    for name, off, _size in sorted(nsp_ncas(path), key=lambda e: -e[2]):
+        nca = Nca(path, keys, off, need_sections=False)
+        if nca.content_type == 0:
+            print(f'{path}: program NCA {name}')
+            return Nca(path, keys, off)
+    raise SystemExit(f'{path}: no program NCA')
+
+
 class Nca:
-    def __init__(self, path, keys):
-        self.f = open(path, 'rb')
+    def __init__(self, path, keys, base=0, need_sections=True):
+        self.f = SubFile(path, base)
         raw = self.f.read(0xC00)
         hk = bytes.fromhex(keys['header_key'])
         hdr = b''
@@ -49,6 +98,8 @@ class Nca:
         self.hdr = hdr
         self.content_type = hdr[0x205]
         self.title_id = struct.unpack_from('<Q', hdr, 0x210)[0]
+        if not need_sections:
+            return
         self.sdk = struct.unpack_from('<I', hdr, 0x21C)[0]
         gen = max(hdr[0x206], hdr[0x220])
         self.keygen = gen - 1 if gen else 0
@@ -248,7 +299,7 @@ def main():
     ap.add_argument('--info', action='store_true')
     ap.add_argument('--romfs-image', action='store_true')
     a = ap.parse_args()
-    nca = Nca(a.nca, load_keys(a.keys))
+    nca = open_program_nca(a.nca, load_keys(a.keys))
     print(f'title {nca.title_id:016x}  content type {nca.content_type}  sdk {nca.sdk >> 24}.{(nca.sdk >> 16) & 0xFF}.'
           f'{(nca.sdk >> 8) & 0xFF}  key generation {nca.keygen}')
     for s in nca.sections:

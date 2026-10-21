@@ -2,7 +2,7 @@
 //
 // Threads: SDL events arrive on the main thread and are queued; the menu is laid out and drawn on the
 // render thread inside backend_present, after the game image, into the same drawable.
-#ifdef __APPLE__
+#ifdef EOW_METAL
 #import <Metal/Metal.h>
 #endif
 #include <SDL3/SDL.h>
@@ -15,7 +15,7 @@
 #include "option_rows.h"
 #include "imgui_internal.h"  // (NavCursorVisible)
 #include "osk.h"
-#ifdef __APPLE__
+#ifdef EOW_METAL
 #include "imgui_impl_metal.h"
 #else
 #include "imgui_impl_vulkan.h"
@@ -310,7 +310,7 @@ static void style_init(void) {
 }
 
 
-#ifdef __APPLE__
+#ifdef EOW_METAL
 static void init(id<MTLDevice> dev) {
 #else
 static void init(void) {
@@ -345,7 +345,7 @@ static void init(void) {
     if (!g_font_big) g_font_big = g_font;
     if (!g_menu_font || !g_menu_font_big) g_menu_font = g_font, g_menu_font_big = g_font_big;
     style_init();
-#ifdef __APPLE__
+#ifdef EOW_METAL
     ImGui_ImplMetal_Init(dev);
 #else
     vk_imgui_backend_init();
@@ -463,7 +463,7 @@ static void tab_display(void) {
         if (opt_choice("Internal resolution", &ri, res, NRES, RES_MATCH_AT, d, false)) g_settings.res_mode = res_mode[ri];
     }
     {   // each OS's own upscaler next to bilinear (UPSCALE_SHARP: MetalFX on macOS, AMD FSR 1 on Windows)
-#ifdef __APPLE__
+#ifdef EOW_METAL
         static const char *ups[] = {"Bilinear", "MetalFX"};
         const char *ud = "How the image is scaled up to the window when it renders at a lower resolution. MetalFX: Apple's "
                          "upscaler, sharper. Bilinear: plain and soft.";
@@ -753,7 +753,7 @@ void menu_tabs_draw(float scale, ImFont *font, ImFont *font_big, bool in_game, v
     g_font = f0, g_font_big = f1;
 }
 
-#ifdef __APPLE__
+#ifdef EOW_METAL
 void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> target) {
     const double tw = target.width, th = target.height;
 #else
@@ -766,7 +766,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         return;
     }
-#ifdef __APPLE__
+#ifdef EOW_METAL
     if (!g_inited) init(dev);
 #else
     if (!g_inited) init();
@@ -785,7 +785,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     if (scale < 0.45f) scale = 0.45f;
     io.FontGlobalScale = scale;
 
-#ifdef __APPLE__
+#ifdef EOW_METAL
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = target;
     rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
@@ -800,7 +800,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         ImGui::GetStyle().ScaleAllSizes(scale);
         style_scale = scale;
     }
-#ifdef __APPLE__
+#ifdef EOW_METAL
     ImGui_ImplMetal_NewFrame(rp);
 #else
     ImGui_ImplVulkan_NewFrame();
@@ -865,7 +865,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     if (kbd) keyboard_draw(io, scale);
     ImGui::Render();
     g_text_busy = open && ui_text_busy();
-#ifdef __APPLE__
+#ifdef EOW_METAL
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
     ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cb, enc);
     [enc endEncoding];
