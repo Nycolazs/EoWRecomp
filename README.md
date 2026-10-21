@@ -11,6 +11,7 @@
 
 <p align="center">
   <img alt="status" src="https://img.shields.io/badge/status-early%20development-orange">
+  <a href="https://github.com/Nycolazs/EoWRecomp/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/Nycolazs/EoWRecomp?include_prereleases&label=release"></a>
   <img alt="platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows%20%7C%20Android-blue">
   <img alt="renderer" src="https://img.shields.io/badge/renderer-Vulkan%20(MoltenVK%20on%20macOS)-red">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -42,6 +43,24 @@ Frames of the recompiled game itself, captured by the runtime (native Linux buil
 | ![The opening: Link facing the Moblins in the dungeon](docs/screenshots/01_prologue.jpg) | ![The opening fight](docs/screenshots/02_prologue_fight.jpg) |
 | ![First controllable scene: the corridor, with the HUD](docs/screenshots/03_corridor_hud.jpg) | ![Walking and button prompts driven by input](docs/screenshots/04_room_prompts.jpg) |
 
+<p align="center">
+  <img src="docs/screenshots/05_android_start.jpg" width="720" alt="The Android app's start screen: choosing the game files folder"><br>
+  <sub>The Android app (alpha 1): setting the game up from your own files.</sub>
+</p>
+
+## Download
+
+**[Latest release](https://github.com/Nycolazs/EoWRecomp/releases/latest)** - *alpha 1, a preview: the start screen and
+the game setup, not the game yet* (see the warning above).
+
+| | File | Needs |
+|---|---|---|
+| **macOS** | `EoWRecomp-alpha_1-macOS-arm64.zip` | Apple Silicon (M1 or later), macOS 15+. Not notarized: the first time, right-click the app -> **Open**. |
+| **Android** | `EoWRecomp-alpha_1-Android-arm64.apk` | arm64 phone, Android 11+, Vulkan 1.3. Builds the game code on the phone from your files. |
+
+Neither contains anything from the game: you choose the folder with your own `.nsp` / `.xci` and `prod.keys`, and the
+game code is recompiled on your device. Checksums: `SHA256SUMS.txt` in the release.
+
 ## Features
 
 - **Set up from your own package**: choose the folder with your `.nsp` / `.xci` and `prod.keys`. Only the game's code
@@ -61,7 +80,7 @@ Frames of the recompiled game itself, captured by the runtime (native Linux buil
 | | Build | Start screen & setup | The game |
 |---|---|---|---|
 | **Linux** (x86-64) | ✅ | ✅ | ✅ opening + first scene (Vulkan, Intel Iris Xe) |
-| **macOS** (Apple Silicon) | ✅ `.app` with MoltenVK | ✅ tested on an M1 | ⏳ next |
+| **macOS** (Apple Silicon, 15+) | ✅ `.app` with MoltenVK | ✅ tested on an M1 | ⏳ next |
 | **Android** (arm64, Vulkan 1.3) | ✅ APK | ✅ tested on the Android 15 emulator | ⏳ next |
 | **Windows** (x86-64) | ✅ cross-compiled from Linux | - | untested |
 
