@@ -116,6 +116,7 @@ extern "C" bool touch_handle_event(const SDL_Event *e) {
     switch (e->type) {
     case SDL_EVENT_FINGER_DOWN: case SDL_EVENT_FINGER_MOTION: case SDL_EVENT_FINGER_UP: case SDL_EVENT_FINGER_CANCELED: break;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_KEY_DOWN:  // a controller / the keyboard: the controls go away
+        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_AC_BACK) return false;  // (Android's Back)
         if (g_visible.exchange(false)) release_all();
         return false;
     default: return false;

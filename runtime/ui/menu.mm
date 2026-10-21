@@ -159,7 +159,7 @@ bool menu_handle_event(const SDL_Event *e) {
     bool typing = g_kbd.load() == 1 || (g_open.load() && g_text_busy.load());
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN:
-        if (!e->key.repeat && (e->key.scancode == SDL_SCANCODE_F1 ||
+        if (!e->key.repeat && (e->key.scancode == SDL_SCANCODE_F1 || e->key.scancode == SDL_SCANCODE_AC_BACK ||  // (Android's Back)
                                (e->key.scancode == SDL_SCANCODE_ESCAPE && !g_open.load()))) {
             if (!typing) set_open(!g_open.load());  // (Esc with the menu open goes to ImGui below: it cancels a field)
             return true;
