@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../ui/touch.h"
 #include "../hle.h"
 #include "../nvn/nvn.h"
 #include "../nvn/renderer.h"
@@ -371,19 +372,21 @@ static void fill_state(Cpu *c) {
         LOG("[input] watching controller object %llx\n", c->x[1] - 8);
     }
     bool menu = menu_input_captured();  // the overlay menu / name entry has the controls (typing there isn't for the game)
-    uint64_t b = menu ? script_buttons : key_buttons | pad_buttons | script_buttons;
+    int32_t tlx = 0, tly = 0;  // (phones: the on-screen controls, runtime/ui/touch.h)
+    if (!menu) touch_stick(&tlx, &tly);
+    uint64_t b = menu ? script_buttons : key_buttons | pad_buttons | script_buttons | touch_buttons();
     {   // injected Plus: held for ~10 presented frames (the game polls several times per frame)
         extern uint64_t renderer_present_count(void);
         static uint64_t until;
         if (g_inject_plus > 0) { until = renderer_present_count() + 10; g_inject_plus = 0; }
         if (renderer_present_count() < until) b |= 1ull << BTN_PLUS;
     }
-    int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly) + script_ly);
+    int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx + tlx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly + tly) + script_ly);
     int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry) + script_ry);
     // d-pad / arrow keys walk (setting) while the stick is at rest. "At rest" has a dead zone: a controller's stick
     // never reads exactly 0 (a DualSense rests at a few hundred), which used to turn the d-pad off altogether.
     if (!menu && g_settings.dpad_move && (int64_t)lx * lx + (int64_t)ly * ly < 8000ll * 8000) {
-        uint64_t d = key_buttons | pad_buttons | script_buttons;
+        uint64_t d = key_buttons | pad_buttons | script_buttons | touch_buttons();
         int dx = (int)((d >> BTN_RIGHT) & 1) - (int)((d >> BTN_LEFT) & 1);
         int dy = (int)((d >> BTN_UP) & 1) - (int)((d >> BTN_DOWN) & 1);
         int32_t m = dx && dy ? 23170 : 32767;  // diagonals: same speed (32767 / sqrt 2)

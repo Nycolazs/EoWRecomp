@@ -40,6 +40,7 @@ extern "C" {
 #include "gamebuild.h"
 #include "gamelib.h"
 #include "nxpkg.h"
+#include "touch.h"
 #ifdef __ANDROID__
 #include "platform/android.h"
 #endif
@@ -1560,6 +1561,7 @@ extern "C" void launcher_run(const char *root) {
             osk_draw(g_font_menu, s * 0.7f);  // (a text field activated with the controller)
             typed_before = ui_text_busy();
 
+            if (getenv("EOWRECOMP_TOUCH_PREVIEW")) touch_preview(), touch_draw();  // (test: the controls' look)
             ImGui::Render();
 #ifdef EOW_METAL
             ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cb, enc);

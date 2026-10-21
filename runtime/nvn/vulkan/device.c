@@ -11,6 +11,7 @@
 #include "../../paths.h"
 #include "../../settings.h"
 #include "../../ui/menu.h"
+#include "../../ui/touch.h"
 #include "vk.h"
 #include "../output_scale.h"
 #include "../renderer.h"
@@ -778,6 +779,7 @@ int ui_run(void) {
             extern bool input_user_blocked(const SDL_Event *e);
             if (input_user_blocked(&e)) continue;  // scripted test runs: the real keyboard / mouse / pads do nothing (as metal.m)
             if (menu_handle_event(&e)) continue;
+            if (touch_handle_event(&e)) continue;  // (phones: the on-screen controls)
             input_handle_event(&e);
         }
         menu_apply_window_requests(window);

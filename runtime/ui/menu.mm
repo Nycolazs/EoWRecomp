@@ -25,6 +25,7 @@ extern "C" bool vk_imgui_backend_init(void);  // runtime/nvn/vulkan/imgui_glue.c
 extern "C" {
 #include "../hle.h"
 #include "../settings.h"
+#include "touch.h"
 #include "menu.h"
 void input_reset(void);
 void controls_bindings_draw(float scale);  // controls_ui.mm
@@ -57,6 +58,7 @@ static void push(const QEvent &e) {
 
 bool menu_is_open(void) { return g_open.load(); }
 static void set_open(bool open);
+extern "C" void menu_set_open(bool open) { set_open(open); }  // (the touch controls' menu button)
 extern "C" void menu_test_open(void) {
     set_open(true);
     if (getenv("EOWRECOMP_MENU_TAB")) { extern int g_tab_request_ext; g_tab_request_ext = atoi(getenv("EOWRECOMP_MENU_TAB")); }
@@ -762,7 +764,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
 #endif
     bool open = g_open.load();
     bool kbd = g_kbd.load() == 1;
-    if (!open && !kbd && !g_settings.show_fps) {
+    if (!open && !kbd && !g_settings.show_fps && !touch_visible()) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         return;
     }
@@ -863,6 +865,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     }
 
     if (kbd) keyboard_draw(io, scale);
+    if (!open && !kbd) touch_draw();  // (phones: the on-screen controls)
     ImGui::Render();
     g_text_busy = open && ui_text_busy();
 #ifdef EOW_METAL
