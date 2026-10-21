@@ -747,6 +747,18 @@ static void quick_exit_handler(void) {
 #endif
 }
 
+// macOS: the .app's own MoltenVK (Contents/Resources/vulkan/icd.d, tools/bundle_macos.sh), not another one installed
+// on the machine (Homebrew's: a different version, and the device listed twice); a source build has none. Before
+// SDL_Init: SDL's Vulkan loading scans the drivers too.
+static void use_bundled_driver(void) {
+#ifdef __APPLE__
+    char icd[1100];
+    if (!getenv("VK_DRIVER_FILES") && !getenv("VK_ICD_FILENAMES") &&
+        rt_resource("vulkan/icd.d/MoltenVK_icd.json", NULL, icd, sizeof icd))
+        setenv("VK_DRIVER_FILES", icd, 1);
+#endif
+}
+
 void ui_window_init(void) {
     if (window) return;
     atexit(quick_exit_handler);
@@ -756,6 +768,7 @@ void ui_window_init(void) {
     SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");  // (Back opens the menu, not "close the app")
 #endif
     settings_load();
+    use_bundled_driver();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) FATAL("SDL_Init: %s\n", SDL_GetError());
     int win_w = 1280, win_h = 720;
     if (getenv("EOWRECOMP_WINDOW")) sscanf(getenv("EOWRECOMP_WINDOW"), "%dx%d", &win_w, &win_h);
