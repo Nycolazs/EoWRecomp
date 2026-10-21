@@ -328,6 +328,7 @@ static void *extract_thread(void *) {
     g_done = 0, g_total = 0, g_phase_base = 0, g_build_frac = -1, g_copy_skipped = false;
     std::string exefs, romfs, package, keys;
     bool unusable = false;  // (compressed game packages)
+    bool cleaned = false;   // (an earlier setup's files removed already: the keys copied in since stay)
     if (src.empty() && check_copied_files(g_root).empty()) {  // copied already (an update needs new game code)
         g_copy_skipped = true;
         if (!build_game_code()) goto done;
@@ -339,7 +340,9 @@ static void *extract_thread(void *) {
         char uri[2048];
         rt_remove_game_files(g_root.c_str());
         mkdir(g_root.c_str(), 0755);
-        std::string kdir = g_root + "/keys";
+        cleaned = true;
+        // (absolute: the Java side has another working directory)
+        std::string kdir = (g_root[0] == '/' ? g_root : std::string(rt_data_root()) + "/" + g_root) + "/keys";
         const char *err = android_find_game_package(kdir.c_str(), uri, sizeof uri);
         if (err) {
             fprintf(stderr, "[launcher] %s\n", err);
@@ -359,13 +362,14 @@ static void *extract_thread(void *) {
                     "the same folder as the game and choose it again.");
             goto done;
         }
-        rt_remove_game_files(g_root.c_str());
+        if (!cleaned) rt_remove_game_files(g_root.c_str());
         mkdir(g_root.c_str(), 0755);
         set_job("Reading the game package...");
         char why[256] = "";
         uint64_t tid = 0;
         if (!nx_setup(package.c_str(), keys.c_str(), g_root.c_str(), &tid, why, sizeof why)) {
             fprintf(stderr, "[launcher] %s: %s\n", package.c_str(), why);
+            why[0] = (char)toupper((unsigned char)why[0]);
             set_job("Those files can't be used", true, why);
             goto done;
         }
@@ -916,6 +920,14 @@ extern "C" void launcher_run(const char *root) {
     ui_window_init();
     SDL_Window *win = ui_window();
     g_launcher_win = win;
+#ifdef __ANDROID__
+    {   // (the folder picked in an earlier session: its read permission is kept)
+        const char *saved = android_saved_game_folder();
+        pthread_mutex_lock(&g_lock);
+        if (saved && g_src.empty()) g_src = std::string(ANDROID_SRC) + saved;
+        pthread_mutex_unlock(&g_lock);
+    }
+#endif
 #ifdef EOW_METAL
     CAMetalLayer *layer = (__bridge CAMetalLayer *)ui_metal_layer();
     id<MTLDevice> dev = (__bridge id<MTLDevice>)ui_metal_device();
