@@ -81,7 +81,7 @@ BACKEND_OBJ := $(patsubst runtime/%.m,$(B)/rt/%.o,$(BACKEND_SRC))
 IMGUI_OBJ += $(B)/imgui/imgui_impl_metal.o
 UIFLAGS  := -fobjc-arc -DEOW_METAL
 else
-OSFLAGS  := -Wno-format
+OSFLAGS  := -Wno-format -Wno-nullability-completeness  # (VMA's header)
 DEPINC   += -I$(VKSDK)/include -Ibuild/deps-macos/include
 LDFLAGS  += -L$(VKSDK)/lib -lvulkan -lshaderc_combined -Wl,-rpath,$(VKSDK)/lib
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)

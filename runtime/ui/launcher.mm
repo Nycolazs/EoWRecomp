@@ -39,6 +39,7 @@ extern "C" {
 #include "paths.h"
 #include "gamebuild.h"
 #include "gamelib.h"
+#include "nxpkg.h"
 #include "romfs_build.h"
 #include "settings.h"
 #include "input_bind.h"
@@ -179,7 +180,8 @@ static std::string check_copied_files(const std::string &root) {
     size_t n = fread(id, 1, 8, f);
     fclose(f);
     if (n != 8 || memcmp(id, BUILD_ID, 8)) return "Wrong game version (needs v1.0.0)";
-    if (!file_exists(root + "/romfs.bin")) return "Game data missing";  // (the image the game reads: services/fs.c)
+    // the data the game reads (services/fs.c): an image, or the description of where it is in the game package
+    if (!file_exists(root + "/romfs.bin") && !file_exists(root + "/romfs.src")) return "Game data missing";
     return "";
 }
 
@@ -218,7 +220,7 @@ static void set_failure(int k) {
     static const char *const hint[] = {
         "",
         "Choose the folder that holds the game files.",
-        "Choose the folder that holds the game files.",
+        "Compressed packages (.nsz / .xcz) can't be read: decompress them to .nsp / .xci first.",
         "Make sure there's about 12 GB free and try again.",
         "EoWRecomp needs version 1.0.0 of the game, without updates.",
         "Some files are missing. Choose the folder again; if it happens again, copy your extracted game files again.",
@@ -231,26 +233,39 @@ static bool is_dir(const std::string &p) {
     return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-// exefs: the folder with main and main.npdm; romfs: the folder with region_common (the game's data root). Found
-// in the picked folder or a few levels below it (some folder layouts nest them).
-static void find_game(const std::string &dir, int depth, std::string &exefs, std::string &romfs, bool &unusable) {
+// exefs: the folder with main and main.npdm; romfs: a folder named romfs (the game's data root); or the game package
+// itself (package: .nsp / .xci / .nca, read in place by runtime/nxpkg.c) and the keys file beside it (prod.keys).
+// Found in the picked folder or a few levels below it (some folder layouts nest them).
+static void find_game(const std::string &dir, int depth, std::string &exefs, std::string &romfs, std::string &package,
+                      std::string &keys, bool &unusable) {
     if (depth > 4 || (!exefs.empty() && !romfs.empty())) return;
     if (exefs.empty() && file_exists(dir + "/main") && file_exists(dir + "/main.npdm")) exefs = dir;
-    if (romfs.empty() && is_dir(dir + "/region_common")) romfs = dir;
     DIR *d = opendir(dir.c_str());
     if (!d) return;
     std::vector<std::string> sub;
+    uint64_t best = 0;
     while (struct dirent *e = readdir(d)) {
-        std::string n = e->d_name;
+        std::string n = e->d_name, lower = n;
         if (n[0] == '.') continue;
-        std::string ext = n.size() > 4 ? n.substr(n.size() - 4) : "";
-        for (auto &ch : ext) ch = (char)tolower((unsigned char)ch);
-        if (ext == ".xci" || ext == ".nsp" || ext == ".nca" || ext == ".nsz" || ext == ".xcz") unusable = true;
-        if (n != "region_common" && is_dir(dir + "/" + n)) sub.push_back(dir + "/" + n);
+        for (auto &ch : lower) ch = (char)tolower((unsigned char)ch);
+        std::string ext = lower.size() > 4 ? lower.substr(lower.size() - 4) : "";
+        struct stat st;
+        if (stat((dir + "/" + n).c_str(), &st)) continue;
+        if (ext == ".nsz" || ext == ".xcz") unusable = true;  // (compressed packages: decompress them first)
+        if ((ext == ".xci" || ext == ".nsp" || ext == ".nca") && !S_ISDIR(st.st_mode) && (uint64_t)st.st_size > best &&
+            package.empty()) {
+            best = (uint64_t)st.st_size;  // (the biggest: the base game, not a small update or DLC)
+            package = dir + "/" + n;
+        }
+        if (lower == "prod.keys" && keys.empty()) keys = dir + "/" + n;
+        if (S_ISDIR(st.st_mode)) {
+            if (lower == "romfs" && romfs.empty()) romfs = dir + "/" + n;
+            else sub.push_back(dir + "/" + n);
+        }
     }
     closedir(d);
     std::sort(sub.begin(), sub.end());
-    for (auto &s : sub) find_game(s, depth + 1, exefs, romfs, unusable);
+    for (auto &s : sub) find_game(s, depth + 1, exefs, romfs, package, keys, unusable);
 }
 
 static bool build_id_ok(const std::string &main_path) {
@@ -301,15 +316,39 @@ static void *extract_thread(void *) {
     src = g_src;
     pthread_mutex_unlock(&g_lock);
     g_done = 0, g_total = 0, g_phase_base = 0, g_build_frac = -1, g_copy_skipped = false;
-    std::string exefs, romfs;
-    bool unusable = false;  // (game packages rather than its files)
+    std::string exefs, romfs, package, keys;
+    bool unusable = false;  // (compressed game packages)
     if (src.empty() && check_copied_files(g_root).empty()) {  // copied already (an update needs new game code)
         g_copy_skipped = true;
         if (!build_game_code()) goto done;
         goto check;
     }
     set_job("Looking for the game files...");
-    find_game(src, 0, exefs, romfs, unusable);
+    find_game(src, 0, exefs, romfs, package, keys, unusable);
+    if ((exefs.empty() || romfs.empty()) && !package.empty()) {  // the game package: ExeFS out, RomFS read in place
+        if (keys.empty()) {
+            set_job("No prod.keys beside the game package", true, "Put the keys file from your own Switch (prod.keys) in "
+                    "the same folder as the game and choose it again.");
+            goto done;
+        }
+        rt_remove_game_files(g_root.c_str());
+        mkdir(g_root.c_str(), 0755);
+        set_job("Reading the game package...");
+        char why[256] = "";
+        uint64_t tid = 0;
+        if (!nx_setup(package.c_str(), keys.c_str(), g_root.c_str(), &tid, why, sizeof why)) {
+            fprintf(stderr, "[launcher] %s: %s\n", package.c_str(), why);
+            set_job("Those files can't be used", true, why);
+            goto done;
+        }
+        if (tid != 0x01008CF01BAAC000ull || !build_id_ok(g_root + "/exefs/main")) {
+            rt_remove_game_files(g_root.c_str());
+            set_failure(FAIL_VERSION);
+            goto done;
+        }
+        if (!build_game_code()) goto done;
+        goto check;
+    }
     if (exefs.empty() || romfs.empty()) { set_failure(unusable ? FAIL_UNUSABLE : FAIL_NOT_FOUND); goto done; }
     if (!build_id_ok(exefs + "/main")) { set_failure(FAIL_VERSION); goto done; }
     {
@@ -1270,8 +1309,9 @@ extern "C" void launcher_run(const char *root) {
                     dl->AddLine(ImVec2(x, cy), ImVec2(x + u * 0.35f, cy + u * 0.35f), g, fs * 0.11f);
                     dl->AddLine(ImVec2(x + u * 0.35f, cy + u * 0.35f), ImVec2(x + u, cy - u * 0.4f), g, fs * 0.11f);
                 };
-                std::string src_d = "The folder with your own game folders (exefs/romfs) of The Legend of Zelda: Echoes "
-                                    "of Wisdom for Nintendo Switch, version 1.0.0. The game isn't included with EoWRecomp.";
+                std::string src_d = "The folder with your own copy of The Legend of Zelda: Echoes of Wisdom for Nintendo "
+                                    "Switch, version 1.0.0: the .nsp or .xci with the prod.keys of your Switch beside it, "
+                                    "or the extracted exefs / romfs folders. The game isn't included with EoWRecomp.";
                 if (!src.empty()) src_d += "\n\nChosen: " + src;
                 // the step that's running / its result, under the rows and in the Set up row's explanation
                 const std::string &job_line = job;

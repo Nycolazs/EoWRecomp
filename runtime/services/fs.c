@@ -9,6 +9,7 @@
 
 #include "../hle.h"
 #include "../ipc.h"
+#include "../nxpkg.h"
 
 // Replacement / extra RomFS files and separate save slots from a folder (in LAS Recomp: randomizer seeds). The
 // overlay machinery below stays for mod support; no folder is used yet.
@@ -25,6 +26,14 @@ static bool mod_romfs_override(const char *path, char *host, size_t n) {
 
 const char *g_save_dir = "save";
 static int romfs_fd = -1;
+// The RomFS: an image file (romfs.bin, tools/nca_extract.py --romfs-image) or read straight from the player's game
+// package (romfs.src, written by the start screen's setup: runtime/nxpkg.c)
+static NxRomfs *romfs_pkg;
+
+static ssize_t rom_pread(int fd, void *dst, size_t n, off_t off) {
+    if (fd == romfs_fd && romfs_pkg) return nx_romfs_pread(romfs_pkg, dst, n, (uint64_t)off);
+    return pread(fd, dst, n, off);
+}
 
 // ------------------------------------------------------------------ RomFS file index (offset -> path)
 typedef struct { uint64_t start, size; char *path; int fd; const uint8_t *mem; } Overlay;
@@ -55,8 +64,10 @@ RT_ON_RESET(fs_reset) {
     ov_meta = NULL, ov_meta_off = ov_meta_size = ov_end = 0;
     npatches = 0;
     rom_files = NULL, rom_nfiles = 0, rom_data_off = 0;
-    if (romfs_fd >= 0) close(romfs_fd);
+    if (romfs_fd >= 0 && !romfs_pkg) close(romfs_fd);
     romfs_fd = -1;
+    nx_romfs_close(romfs_pkg);
+    romfs_pkg = NULL;
     g_save_dir = "save";
 }
 
@@ -158,11 +169,11 @@ static void add_new_files(int fd, const uint64_t *h, const uint8_t *dmeta, uint6
     uint64_t hoff = h[5], hsz = h[6];
     uint8_t *dcopy = malloc(dsz), *hcopy = malloc(hsz), *head = malloc(0x50);
     memcpy(dcopy, dmeta, dsz);
-    if (pread(fd, hcopy, hsz, (off_t)hoff) != (ssize_t)hsz || pread(fd, head, 0x50, 0) != 0x50) return;
+    if (rom_pread(fd, hcopy, hsz, (off_t)hoff) != (ssize_t)hsz || rom_pread(fd, head, 0x50, 0) != 0x50) return;
     // the file-meta table to extend: the override-patched copy if there is one
     const uint8_t *base_meta = ov_meta;
     uint8_t *tmp = NULL;
-    if (!base_meta) { tmp = malloc(fsz); pread(fd, tmp, fsz, (off_t)h[7]); base_meta = tmp; }
+    if (!base_meta) { tmp = malloc(fsz); rom_pread(fd, tmp, fsz, (off_t)h[7]); base_meta = tmp; }
     uint64_t extra = 0;
     for (int i = 0; i < n; i++) {
         const char *name = strrchr(nf[i].rel, '/');
@@ -229,12 +240,12 @@ static void add_new_files(int fd, const uint64_t *h, const uint8_t *dmeta, uint6
 
 static void rom_index(int fd) {
     uint64_t h[10];
-    if (pread(fd, h, sizeof h, 0) != (ssize_t)sizeof h) return;
+    if (rom_pread(fd, h, sizeof h, 0) != (ssize_t)sizeof h) return;
     // header: size, dir hash (off,size), dir meta (off,size), file hash (off,size), file meta (off,size), data off
     uint64_t doff = h[3], dsz = h[4], foff = h[7], fsz = h[8];
     rom_data_off = h[9];
     uint8_t *dmeta = malloc(dsz), *fmeta = malloc(fsz);
-    if (pread(fd, dmeta, dsz, (off_t)doff) != (ssize_t)dsz || pread(fd, fmeta, fsz, (off_t)foff) != (ssize_t)fsz) return;
+    if (rom_pread(fd, dmeta, dsz, (off_t)doff) != (ssize_t)dsz || rom_pread(fd, fmeta, fsz, (off_t)foff) != (ssize_t)fsz) return;
     int cap = 4096;
     rom_files = malloc(sizeof(RomFile) * cap);
     for (uint64_t o = 0; o + 0x20 <= fsz;) {
@@ -295,7 +306,7 @@ static void rom_index(int fd) {
 
 // Virtual RomFS image read: original bytes, with the patched file table and appended replacement files.
 static ssize_t romfs_read(int fd, uint8_t *dst, uint64_t size, uint64_t off) {
-    if (!ov_n) return pread(fd, dst, size, (off_t)off);
+    if (!ov_n) return rom_pread(fd, dst, size, (off_t)off);
     uint64_t done = 0;
     while (done < size) {
         uint64_t o = off + done, n = size - done;
@@ -317,7 +328,7 @@ static ssize_t romfs_read(int fd, uint8_t *dst, uint64_t size, uint64_t off) {
             if ((uint64_t)r < n) memset(dst + done + r, 0, n - r);
         } else {
             if (o + n > ov[0].start) n = ov[0].start - o;
-            ssize_t r = pread(fd, dst + done, n, (off_t)o);
+            ssize_t r = rom_pread(fd, dst + done, n, (off_t)o);
             if (r < 0) r = 0;
             if ((uint64_t)r < n) memset(dst + done + r, 0, n - r);
             // overlay the patched tables (file meta, and with added files: header, dir meta, file hash)
@@ -376,19 +387,29 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
     }
 }
 
+#define ROMFS_PKG_FD 0x7FFFFFF0  // (romfs_fd while the RomFS comes from the package: rom_pread's tag, never a real fd)
+
 static Service *open_romfs_storage(void) {
     if (romfs_fd < 0) {
-        char path[1024];
+        char path[1024], src[1024], why[512] = "";
         snprintf(path, sizeof path, "%s.bin", g_romfs_dir);  // extracted/romfs.bin
+        snprintf(src, sizeof src, "%s.src", g_romfs_dir);    // extracted/romfs.src
         romfs_fd = open(path, O_RDONLY);
-        if (romfs_fd < 0) FATAL("cannot open %s (set up the game files on the start screen)\n", path);
+        if (romfs_fd < 0 && (romfs_pkg = nx_romfs_open(src, why, sizeof why))) {
+            romfs_fd = ROMFS_PKG_FD;
+            LOG("[fs] romfs from the game package (%llu bytes)\n", (unsigned long long)nx_romfs_size(romfs_pkg));
+        }
+        if (romfs_fd < 0) FATAL("cannot open %s or %s: %s (set up the game files on the start screen)\n", path, src, why);
         rom_index(romfs_fd);
     }
     Storage *st = calloc(1, sizeof *st);
     st->fd = romfs_fd;
-    struct stat sb;
-    fstat(romfs_fd, &sb);
-    st->size = sb.st_size;
+    if (romfs_pkg) st->size = nx_romfs_size(romfs_pkg);
+    else {
+        struct stat sb;
+        fstat(romfs_fd, &sb);
+        st->size = sb.st_size;
+    }
     return service_new("IStorage(romfs)", storage, st);
 }
 
