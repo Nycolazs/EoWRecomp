@@ -11,21 +11,21 @@
 #define LOG(...) fprintf(stderr, __VA_ARGS__)
 #define FATAL(...) (fprintf(stderr, "FATAL: " __VA_ARGS__), rt_fatal_trace())
 
-// ---- address space layout (guest addresses == host addresses)
+// ---- address space layout (guest addresses == host addresses; GUEST_SHIFT lower on Android, cpu.h)
 // macOS reserves 0x2_0000_0000-0x70_0000_0000, and guest addresses must fit in 39 bits, so the
 // guest lives in a 12.5 GB window at 0x70_0000_0000 claimed at startup (see main.c).
-#define GUEST_LO     0x7000000000ull
-#define GUEST_HI     0x7320000000ull
+#define GUEST_LO     GUEST(0x7000000000ull)
+#define GUEST_HI     GUEST(0x7320000000ull)
 // game modules: runtime/modules.h (0x7000000000 - 0x7010000000)
-#define HLE_BASE     0x7080000000ull   // fake addresses for host-implemented functions
+#define HLE_BASE     GUEST(0x7080000000ull)   // fake addresses for host-implemented functions
 #define HLE_SIZE     0x0000100000ull
-#define TLS_BASE     0x7090000000ull
+#define TLS_BASE     GUEST(0x7090000000ull)
 #define TLS_SIZE     0x0000100000ull
-#define HLE_HEAP     0x7092000000ull   // guest-visible memory owned by host code
+#define HLE_HEAP     GUEST(0x7092000000ull)   // guest-visible memory owned by host code
 #define HLE_HEAP_SIZE 0x000E000000ull
-#define ALIAS_BASE   0x7100000000ull   // alias region (svcMapMemory targets)
+#define ALIAS_BASE   GUEST(0x7100000000ull)   // alias region (svcMapMemory targets)
 #define ALIAS_SIZE   0x0100000000ull
-#define HEAP_BASE    0x7240000000ull
+#define HEAP_BASE    GUEST(0x7240000000ull)
 #define HEAP_MAX     0x00D0000000ull   // 3.25 GB
 
 // ---- loader.c

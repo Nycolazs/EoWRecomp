@@ -63,15 +63,34 @@ static inline void rt_set_fpsr(uint64_t v) { (void)v; }
 #endif
 
 // ---- memory: guest addresses are host addresses
+// Where the host can't give the guest the Switch-style window at 0x70_0000_0000 (Android: the zygote maps its
+// libraries and heaps there on 39-bit kernels), the whole guest layout sits GUEST_SHIFT lower. Recompiled functions and
+// labels keep their unshifted names (f_7000...), and so do patches and runtime/modules.h: only the values move.
+// tools/gen.py --shift must match (as in LASRecomp-Android-Plus).
+#if defined(__ANDROID__)
+#define GUEST_SHIFT 0x6000000000ull
+#else
+#define GUEST_SHIFT 0ull
+#endif
+#define GUEST(a) ((uint64_t)(a) - GUEST_SHIFT)  // an address of the unshifted (Switch) layout
 typedef uint16_t __attribute__((aligned(1), may_alias)) u16u;
 typedef uint32_t __attribute__((aligned(1), may_alias)) u32u;
 typedef uint64_t __attribute__((aligned(1), may_alias)) u64u;
 typedef uint8_t __attribute__((may_alias)) u8a;
 
-// Function-entry profiler (runtime/fnprof.c, EOWRECOMP_FNPROF): one predictable branch per call when off.
+// Function-entry profiler (runtime/fnprof.c, EOWRECOMP_FNPROF at run time): only in game code built with
+// -DEOWRECOMP_FNPROF (make FNPROF=1). Off, a call costs nothing: the check (a GOT load, a load and a branch on every
+// guest call) was ~10% of the game code's instructions (measured in LASRecomp-Android-Plus).
 RT_API extern volatile int g_fnprof;
 RT_API void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0);
+#ifdef EOWRECOMP_FNPROF
 #define FN_ENTER(a) do { if (__builtin_expect(g_fnprof, 0)) fnprof_hit(a, c->x[30], c->x[0]); } while (0)
+#else
+#define FN_ENTER(a) ((void)0)
+#endif
+// Generated functions take their Cpu as `Cpu *CPU_RESTRICT c`: guest memory never overlaps the host's Cpu, so stores
+// to guest memory don't make the compiler reload guest registers.
+#define CPU_RESTRICT __restrict
 
 #define LD8(a)  (*(const u8a *)(uintptr_t)(a))
 #define LD16(a) (*(const u16u *)(uintptr_t)(a))

@@ -46,6 +46,8 @@ GENARCH  ?= -mcpu=x86_64_v3  # (zig's spelling of x86-64-v3)
 endif
 IMGUI    := third_party/imgui
 GENFLAGS := -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
+# FNPROF=1: game code with the function-entry profiler's hook (EOWRECOMP_FNPROF; runtime/cpu.h FN_ENTER)
+GENFLAGS += $(if $(FNPROF),-DEOWRECOMP_FNPROF)
 
 # The game code (made by `make gen` from your own game files) is its own library next to the app (runtime/gamelib.h);
 # the app itself holds none of it

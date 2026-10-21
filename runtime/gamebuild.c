@@ -323,6 +323,12 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         add(&a, g->out);
         add(&a, "--hle");
         add(&a, t.hle);
+        if (GUEST_SHIFT) {  // (Android: the layout runtime/cpu.h moves)
+            char sh[32];
+            snprintf(sh, sizeof sh, "0x%llx", (unsigned long long)GUEST_SHIFT);
+            add(&a, "--shift");
+            add(&a, sh);
+        }
         g->p = spawn(a.v, g->log);
         args_free(&a);
         if (!g->p) { snprintf(why, why_size, "the game code builder didn't start"); ok = false; }

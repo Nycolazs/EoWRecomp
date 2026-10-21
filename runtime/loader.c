@@ -180,7 +180,7 @@ static void relocate(Module *m) {
 
 void loader_load(const char *exefs) {
     char path[1024];
-#define MOD(name, base) {#name, base},
+#define MOD(name, base) {#name, GUEST(base)},
     static const struct { const char *name; uint64_t base; } mods[] = {GAME_MODULES(MOD)};
     for (unsigned i = 0; i < GAME_NMODULES; i++) {
         Module *m = &g_modules[g_nmodules++];
