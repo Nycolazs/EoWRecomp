@@ -1,6 +1,7 @@
 """Differential test: lifted C vs Unicorn, one instruction at a time.
 
 Usage: test_lift.py <nso> <base> [count] [seed]
+       test_lift.py --synth <base> [count] [seed]   (no game files: encodings synthesized, see Synth)
 
 Environment: SIMD=asm|c (default: asm on AArch64 hosts, c elsewhere), CC (default clang), ONLY=<regex> (only
 encodings whose disassembly matches, e.g. ONLY='^(ld|st)a?xp|^cas|^swp|^ld(add|clr|eor|set|[su]max|[su]min)').
@@ -117,12 +118,38 @@ def run_unicorn(mu, n, w, pc, state, buf0):
     return ox, osp, onz, ov, opc, h
 
 
+class Synth:
+    """--synth: a stand-in for an NSO when no game files are at hand - a text of random encodings, most of them from
+    the families the SDK 16.2 brought (ARMv8.1 LSE atomics, CAS / CASP, exclusive pairs; tested before only on x86-64
+    hosts, --simd c) and the other exclusive / ordered loads and stores, the rest any 32-bit word (the lifter and
+    Unicorn agree on which are valid). Same interface as Nso for main(): image and text."""
+    FAMILIES = [  # (mask, value): the fixed bits of each family; the rest random
+        (0x3F200C00, 0x38200000),  # LDADD / LDCLR / LDEOR / LDSET / LD[SU]MAX / LD[SU]MIN / SWP (+A / L)
+        (0x3FA07C00, 0x08A07C00),  # CAS / CASA / CASL / CASAL
+        (0xBFA07C00, 0x08207C00),  # CASP (+A / L)
+        (0xBFA00000, 0x88200000),  # LDXP / STXP / LDAXP / STLXP
+        (0x3FA00000, 0x08000000),  # LDXR / STXR / LDAXR / STLXR
+        (0x3FA00000, 0x08800000),  # LDAR / STLR (+ the LORegion forms)
+    ]
+
+    def __init__(self, r, n=65536):  # (a multiple of 4 KB: Unicorn maps pages)
+        words = []
+        for i in range(n):
+            if i % 4 == 3:
+                words.append(r.getrandbits(32))
+            else:
+                m, v = r.choice(self.FAMILIES)
+                words.append((r.getrandbits(32) & ~m) | v)
+        self.image = bytearray(struct.pack(f'<{n}I', *words))
+        self.text = (0, len(self.image))
+
+
 def main():
     path, base = sys.argv[1], int(sys.argv[2], 0)
     count = int(sys.argv[3]) if len(sys.argv) > 3 else 3000
     seed = int(sys.argv[4]) if len(sys.argv) > 4 else 1
     r = random.Random(seed)
-    n = Nso(path)
+    n = Synth(r) if path == '--synth' else Nso(path)
     lo, hi = n.text[0], n.text[0] + n.text[1]
     words = struct.unpack(f'<{(hi - lo) // 4}I', bytes(n.image[lo:hi]))
 
@@ -150,6 +177,14 @@ def main():
         pc = base + lo + i * 4
         try:
             ins = lifter.lift(w, pc)
+            # (synthesized words: FP/SIMD passed through as host asm could be encodings this CPU doesn't run - the
+            # game's code is valid ARMv8.0 - and one SIGILL ends the whole harness)
+            if path == '--synth' and ins.kind == 'asm':
+                continue
+            # (Unicorn 2.1.4 compares LDSMAX / LDSMIN of 8 / 16 / 32 bits unsigned: those are checked against the CPU
+            # itself by tools/test_lse.c)
+            if (w & 0x3F200C00) == 0x38200000 and bits(w, 15, 1) == 0 and bits(w, 12, 3) in (4, 5) and bits(w, 30, 2) < 3:
+                continue
             body = to_test_body(ins, pc)
         except Unsupported as e:
             unsupported[str(e).split(' ')[0]] = unsupported.get(str(e).split(' ')[0], 0) + 1

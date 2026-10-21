@@ -265,6 +265,8 @@ class Lifter:
         if op == 7:  # EXTR
             rm, lsb = bits(w, 16, 5), bits(w, 10, 6)
             size = 64 if sf else 32
+            if lsb >= size or bits(w, 22, 1) != sf:  # (UNDEFINED: imms<5> set in 32-bit, N != sf)
+                raise Unsupported('extr')
             if lsb == 0:
                 return Insn('op', set_reg(sf, rd, R(sf, rm)))
             return Insn('op', set_reg(
@@ -532,6 +534,8 @@ class Lifter:
         rt = bits(w, 0, 5)
         if bits(w, 27, 3) == 0b011 and bits(w, 24, 2) == 0:  # literal -> LDR (imm, offset 0) via scratch
             opc = bits(w, 30, 2)
+            if opc == 3:  # (unallocated)
+                raise Unsupported('ldr simd literal opc 3')
             size, o = {0: (2, 1), 1: (3, 1), 2: (0, 3)}[opc]
             addr = pc + sext(bits(w, 5, 19), 19) * 4
             new = (size << 30) | 0x3D000000 | (o << 22) | (31 << 5) | rt
@@ -587,6 +591,8 @@ class Lifter:
                     sh, amt = bits(w, 22, 2), bits(w, 10, 6)
                     if sh == 3:
                         raise Unsupported('add shift ror')
+                    if not sf and amt >= 32:  # (UNDEFINED; a shift past the width in C)
+                        raise Unsupported('add shift amount')
                     a = R(sf, rn)
                     b = shift_expr(sf, R(sf, rm), sh, amt)
                     sp_ok = False
