@@ -84,7 +84,7 @@ static VkFmt fmt_of(uint32_t f) {
     case 0x39: return (VkFmt){VK_FORMAT_R4G4B4A4_UNORM_PACK16};   // Metal ABGR4Unorm
     case 0x3A: return (VkFmt){VK_FORMAT_R5G6B5_UNORM_PACK16};     // Metal B5G6R5Unorm
     case 0x3B: return (VkFmt){VK_FORMAT_R5G5B5A1_UNORM_PACK16};   // Metal A1BGR5Unorm
-    case 0x3C: return (VkFmt){VK_FORMAT_R5G6B5_UNORM_PACK16};
+    case 0x3C: return (VkFmt){VK_FORMAT_B5G6R5_UNORM_PACK16};     // NVN RGB565 names its components from the low bits: R is bits 0-4
     case 0x3D: return (VkFmt){VK_FORMAT_A2B10G10R10_UNORM_PACK32};
     case 0x3E: return (VkFmt){VK_FORMAT_A2B10G10R10_UINT_PACK32};
     case 0x3F: return (VkFmt){VK_FORMAT_B10G11R11_UFLOAT_PACK32};
