@@ -26,34 +26,41 @@ Build IDs dos módulos (endereços de patches/HLE valem só para estes):
 
 RomFS: 10 963 arquivos, 8 032 371 686 bytes (todos com magic válido: FRES, BNTX, MsgS, FSTM, SARC, FSHA, webm…).
 
-## Sessão 4 (2026-11-07, Linux + AYN Thor): o jogo roda no Android
+## Sessão 4 (2026-11-07, Linux + AYN Thor): o jogo roda e se joga no Android
 
-**Comprovado num aparelho real**: AYN Thor (Snapdragon 8 Gen 2 / QCS8550, **Adreno 740**, driver Vulkan 1.3.128 de
-2023-12, Android 13), APK pessoal (`tools/android/build_game.sh extracted --apk`), setup pela tela inicial com um NSP
-v1.0.0: a abertura roda, Link na masmorra do prólogo (`docs/screenshots/06_android_thor_prologue.jpg`), 5 min / 4.900
-frames sem travar.
+**Comprovado num aparelho real**: AYN Thor (Snapdragon 8 Gen 2 / QCS8550, **Adreno 740**, Android 13), APK pessoal
+(`tools/android/build_game.sh extracted --apk`), setup pela tela inicial com um NSP v1.0.0. Vulkan pelo **Turnip
+26.0.0 R8** (no APK, via libadrenotools; `EOWRECOMP_DRIVER=system` para o driver Qualcomm 1.3.128). Filme do título,
+seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p** (GPU ~13 ms por frame).
 
-### Corrigido
-- **Crash ao abrir (tela inicial)**: `vkCreateDevice` -> `VK_ERROR_FEATURE_NOT_PRESENT`. O Adreno 740 não tem
-  `uniformAndStorageBuffer8BitAccess`, que era pedido sem consultar o driver (e que os shaders não usam). Agora cada
-  feature 1.1/1.2/1.3 e de extensão só é pedida se o driver a tiver (as que faltam vão para o log);
-  `customBorderColorWithoutFormat` / `vertexAttributeInstanceRateDivisor` ausentes desligam a extensão.
-- `tools/nca_extract.py`: NSPs com rights ID (title key no ticket do NSP ou em `title.keys`), como `nxpkg.c` já fazia.
+### Corrigido (cada um visto no Thor)
+- Crash ao abrir: features Vulkan pedidas sem consultar o driver (`uniformAndStorageBuffer8BitAccess`).
+- `tools/nca_extract.py`: NSPs com title key (ticket / `title.keys`).
+- Tela preta no título: filmes lidos do RomFS (pacote / `romfs.bin`) por um `AVIOContext`, não só de `extracted/romfs/`.
+- 320 fps no título: o present respeita o intervalo do NVN (60 fps).
+- **Sem texto** na seleção de arquivo: o heap do guest são `AHardwareBuffer`s (blocos de 512 MB) mapeados em
+  `HEAP_BASE` e importados no Vulkan; os shaders leem a memória global por buffer address (`gmw()`), pois o Adreno não
+  tem `VK_EXT_external_memory_host` e o storage buffer vai só até 128 MB. Com o driver Qualcomm o texto continua faltando
+  (memória importada tipo 1, provavelmente sem coerência com o cache da CPU); com Turnip aparece.
+- Turnip 24.3 desenhava tudo preto; 26.0.0 R8 desenha.
+- **1 fps no prólogo** (Turnip): o vertex shader de skinning (12ee694000) tinha um BRX (tabela de salto pelo número de
+  ossos) e caía no laço de dispatch: 48 registros e ~575 spills. A tabela agora é lida das constantes do compilador e o
+  shader fica estruturado: 24 registros, sem spill, 3,3 ms -> ~0 por draw.
+- `LDC.64` na própria base lia a segunda palavra errada (matrizes das ossos): a **faixa vertical escura até o Link**
+  (problema aberto 2) sumiu junto.
+- Opção de resolução "720p" (padrão no Android). Ferramentas: `EOWRECOMP_GPUPROF_DRAWS`, `EOWRECOMP_VK_STATS`,
+  `EOWRECOMP_GLSL_OVERRIDE`.
 
-### Observado no Thor (ainda não corrigido)
-- **Primeira execução**: ~2 min de tela preta / cena incompleta enquanto o compilador do Adreno compila os pipelines
-  (4 threads a 100%; os draws ficam em "pipeline compiling"). As seguintes usam `cache/spirv` e `vk_pipelines.bin`.
-- **~16 fps** no prólogo com os pipelines prontos, limitado pela GPU (`wait` ~1,6 s a cada 2 s no log).
-- Faixa vertical (aqui azul) do topo da tela até o Link: o artefato 2 dos problemas abertos abaixo.
-- Sem `VK_EXT_external_memory_host` no Adreno: memória global dos compute shaders lê zero (sem efeito visível na
-  abertura até agora). 224 dispatches/2 s pulados: o compute `eb20…` (SUST) sem tradução.
+### Ainda errado no Thor
+- **Corações** do HUD / seleção: quadrados vermelhos com o coração escuro (igual no Linux: `03_corridor_hud.jpg`).
+- **Miniatura do save** preta (também em saves novos).
+- A lista "Which data would you like to load?" mostra as entradas vazias por alguns segundos.
+- Compute `eb20…` (SUST) sem tradução; primeira execução lenta enquanto o Turnip compila os pipelines.
 
 ### Próximo passo (Android)
-1. Desempenho de GPU no Adreno (`EOWRECOMP_VK_PROF=1`, `EOWRECOMP_GPUPROF_AT=<frame>` via `env.txt`): quais passes
-   custam os ~60 ms por frame.
-2. Caminho por cópia para a memória global dos compute shaders sem `VK_EXT_external_memory_host` (o `gfast` de
-   `exec.c` preenchido pela CPU em vez de `vkCmdCopyBuffer` do heap importado).
-3. Jogar além da abertura no Thor (controles do próprio aparelho) e conferir áudio e save.
+1. Corações e miniatura (formatos / swizzle de textura; a miniatura é uma cópia da GPU para a memória do guest).
+2. 60 fps: a GPU já cabe (~13 ms); ver o que segura o modo 30 do jogo e o custo de CPU.
+3. Áudio e save em jogo mais longo; SUST.
 
 ### Como testar no Android
 `tools/android/build_deps.sh`, `(cd android && ./gradlew assembleDebug)`, `tools/android/build_game.sh extracted --apk`,
