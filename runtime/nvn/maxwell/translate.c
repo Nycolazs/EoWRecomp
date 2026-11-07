@@ -1576,8 +1576,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int pd = (int)bits(w, 48, 3);
         if (c->stage == STAGE_VERTEX) {
             set_reg(c, d, R(a));  // no SIMD-group functions in vertex functions: lane-local value
-        } else if (c->glsl) {  // a quad xor (lane mask < 4) is the subgroup xor within the quad
-            static const char *const fn[] = {"subgroupShuffle", "subgroupShuffleUp", "subgroupShuffleDown", "subgroupShuffleXor"};
+        } else if (c->glsl) {  // 32-lane warps inside the subgroup (glsl_warp32); a quad xor (lane mask < 4) stays in its quad
+            static const char *const fn[] = {"wshfl", "wshfl_up", "wshfl_down", "wshfl_xor"};
             sprintf(t, "%s(%s, uint(%s))", fn[mode], R(a), bv);
             set_reg(c, d, t);
         } else if (mode == 3) {
@@ -1604,13 +1604,14 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         // Echoes of Wisdom's 50d9e3800007000e: VOTE.ANY R14, PT, PT (R14 = the active lanes).
         int mode = (int)bits(w, 48, 2), vp = (int)bits(w, 45, 3);
         if (mode > 2) fail(c, "vote mode %d", mode);
-        static const char *const gl[] = {"subgroupAll(vp_)", "subgroupAny(vp_)", "subgroupAllEqual(vp_)"};
+        static const char *const gl[] = {"(wballot(vp_) == wballot(true))", "(wballot(vp_) != 0u)",
+                                         "(wballot(vp_) == wballot(true) || wballot(vp_) == 0u)"};
         static const char *const ms[] = {"simd_all(vp_)", "simd_any(vp_)", "(simd_all(vp_) || !simd_any(vp_))"};
         bool lane = c->stage == STAGE_VERTEX;  // (no subgroup operations in vertex functions: this lane's own vote)
         sp(&c->body, "    { bool vp_ = %s;\n", P((int)bits(w, 39, 3), bits(w, 42, 1)));
         if (d != RZ) {
             c->reg_used[d] = 1;
-            sp(&c->body, "      r%d = %s;\n", d, lane ? "(vp_ ? 1u : 0u)" : c->glsl ? "subgroupBallot(vp_).x" : "uint(uint64_t(simd_ballot(vp_)))");
+            sp(&c->body, "      r%d = %s;\n", d, lane ? "(vp_ ? 1u : 0u)" : c->glsl ? "wballot(vp_)" : "uint(uint64_t(simd_ballot(vp_)))");
         }
         if (vp != PT) {
             c->pred_used[vp] = 1;
@@ -1748,7 +1749,7 @@ static void glsl_rewrite(Ctx *c, Str *o, const char *src) {
         {"float2", "vec2"}, {"float3", "vec3"}, {"float4", "vec4"}, {"int2", "ivec2"}, {"int3", "ivec3"},
         {"int4", "ivec4"}, {"uint2", "uvec2"}, {"uint3", "uvec3"}, {"uint4", "uvec4"}, {"bool2", "bvec2"},
         {"ulong", "uint64_t"}, {"rsqrt", "inversesqrt"}, {"rint", "roundEven"}, {"front_facing", "gl_FrontFacing"},
-        {"point_coord", "gl_PointCoord"}, {"lane", "gl_SubgroupInvocationID"}, {"vid", "uint(gl_VertexIndex)"},
+        {"point_coord", "gl_PointCoord"}, {"lane", "(gl_SubgroupInvocationID & 31u)"}, {"vid", "uint(gl_VertexIndex)"},
         {"iid", "uint(gl_InstanceIndex)"},
         // the MSL-named helpers of the GLSL preamble: Metal built-ins of the same names made MoltenVK's MSL
         // (SPIRV-Cross keeps function names) fail with "call to 'popcount' is ambiguous" (tools/test_moltenvk.sh)
@@ -1881,6 +1882,17 @@ static const char glsl_prelude[] =
     "uint hpack(vec2 r, uint merge, uint old) { if (merge == 1u) return floatBitsToUint(r.x); uint lo = packHalf2x16(vec2(r.x, 0.0f)), hi = packHalf2x16(vec2(r.y, 0.0f)); if (merge == 2u) return (old & 0xFFFF0000u) | lo; if (merge == 3u) return (old & 0xFFFFu) | (hi << 16); return lo | (hi << 16); }\n"
     "uint prmt(uint a, uint b, uint sel) { uint r = 0u; for (uint i = 0u; i < 4u; i++) { uint s = (sel >> (i * 4u)) & 7u; uint bt = s < 4u ? (a >> (s * 8u)) & 0xFFu : (b >> ((s - 4u) * 8u)) & 0xFFu; r |= bt << (i * 8u); } return r; }\n";
 
+// Maxwell warps have 32 lanes; Vulkan subgroups can be wider (64 / 128 on Adreno): each 32 lanes of the subgroup act
+// as one warp - lane ids, shuffles, ballots and votes stay inside it. Echoes of Wisdom's light loop (fs 12ee66f300)
+// merges its light lists over the warp (ballot + shuffles): with subgroup-wide operations the upper 32 lanes took the
+// lower half's lights - 2x2-pixel sparkles around every light on an Adreno 740. A 32-lane subgroup: as before.
+static const char glsl_warp32[] =
+    "uint wballot(bool p) { return subgroupBallot(p)[gl_SubgroupInvocationID >> 5]; }\n"
+    "uint wshfl(uint v, uint i) { return subgroupShuffle(v, (gl_SubgroupInvocationID & ~31u) | (i & 31u)); }\n"
+    "uint wshfl_xor(uint v, uint m) { return subgroupShuffleXor(v, m & 31u); }\n"
+    "uint wshfl_up(uint v, uint d) { uint l = gl_SubgroupInvocationID & 31u; uint s = subgroupShuffle(v, gl_SubgroupInvocationID - min(d, l)); return d <= l ? s : v; }\n"
+    "uint wshfl_down(uint v, uint d) { uint l = gl_SubgroupInvocationID & 31u; uint s = subgroupShuffle(v, gl_SubgroupInvocationID + min(d, 31u - l)); return l + d < 32u ? s : v; }\n";
+
 static const char *glsl_sampler_type(const ShaderTexture *t) {
     static const char *const names[][2] = {
         {"sampler1D", "sampler1DShadow"}, {"sampler2D", "sampler2DShadow"}, {"sampler3D", "sampler3D"},
@@ -1909,6 +1921,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
            glsl_prelude + strlen("#version 460\n"));
     else
         sp(&s, "%s", glsl_prelude);
+    if (stage != STAGE_VERTEX) sp(&s, "%s", glsl_warp32);
     for (int i = 0; i < 18; i++) {
         if (!(info->cbuf_mask & (1u << i))) continue;
         uint32_t n = info->cbuf_size[i] / 16;
