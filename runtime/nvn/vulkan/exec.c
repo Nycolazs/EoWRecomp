@@ -1198,6 +1198,26 @@ static void save_glsl(const char *src, uint64_t addr, const char *suffix) {
     if (f) { fputs(src, f); fclose(f); }
 }
 
+// EOWRECOMP_GLSL_OVERRIDE=<folder>: <code address>_vs.glsl / _fs.glsl there replaces that translation (experiments
+// on one shader without a rebuild: what a driver makes slow)
+static void override_glsl(ShaderInfo *si, uint64_t addr, const char *suffix) {
+    const char *dir = getenv("EOWRECOMP_GLSL_OVERRIDE");
+    if (!dir || !si->msl) return;
+    char path[1100];
+    snprintf(path, sizeof path, "%s/%llx_%s.glsl", dir, (unsigned long long)addr, suffix);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *s = malloc((size_t)n + 1);
+    s[fread(s, 1, (size_t)n, f)] = 0;
+    fclose(f);
+    free(si->msl);
+    si->msl = s;
+    LOG("[shader] %s replaced by %s\n", suffix, path);
+}
+
 static void compile_program(void *arg) {
     Prog *p = arg;
     size_t nv = 0, nf = 0;
@@ -1239,6 +1259,8 @@ static void translate_program(void *arg) {
         return;
     }
     p->vs_uses_vid = strstr(p->vi->msl, "gl_VertexIndex") != NULL;
+    override_glsl(p->vi, p->code[0], "vs");
+    override_glsl(p->fi, p->code[1], "fs");
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
     run_job(compile_program, p);
@@ -1535,10 +1557,31 @@ static void build_pipeline(void *arg) {
                                        .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = k->prog->layout};
+    if (g_vk.exec_stats) pi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
     if (r != VK_SUCCESS) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
+    } else if (g_vk.exec_stats) {  // the driver's view of each stage: one line per executable
+        VkPipelineExecutablePropertiesKHR ep[4];
+        uint32_t ne = 4;
+        for (int i = 0; i < 4; i++) ep[i] = (VkPipelineExecutablePropertiesKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR};
+        VkPipelineInfoKHR pinfo = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, .pipeline = pp->pipe};
+        vkGetPipelineExecutablePropertiesKHR(g_vk.dev, &pinfo, &ne, ep);
+        for (uint32_t e = 0; e < ne; e++) {
+            VkPipelineExecutableStatisticKHR s[32];
+            uint32_t ns = 32;
+            for (int i = 0; i < 32; i++) s[i] = (VkPipelineExecutableStatisticKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR};
+            VkPipelineExecutableInfoKHR xi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, .pipeline = pp->pipe, .executableIndex = e};
+            vkGetPipelineExecutableStatisticsKHR(g_vk.dev, &xi, &ns, s);
+            char line[1024];
+            int l = snprintf(line, sizeof line, "[vkstats] vs %llx fs %llx %s:", (unsigned long long)k->prog->code[0],
+                             (unsigned long long)k->prog->code[1], ep[e].name);
+            for (uint32_t i = 0; i < ns && l < (int)sizeof line - 40; i++)
+                l += snprintf(line + l, sizeof line - l, " %s=%llu", s[i].name, s[i].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR
+                              ? (unsigned long long)s[i].value.f64 : (unsigned long long)s[i].value.u64);
+            LOG("%s\n", line);
+        }
     }
     atomic_fetch_add(&stat_compiles, 1);
     atomic_store(&pp->state, r == VK_SUCCESS ? 1 : 2);
@@ -3035,6 +3078,13 @@ static void draw_(CmdRec *r, bool indexed) {
     bool run_gold[MAX_RUNS];
     int nruns = 0;
     if (!nruns) { run_at[0] = 0; run_n[0] = inst; nruns = 1; run_gold[0] = false; }
+    {   // EOWRECOMP_GPUPROF_DRAWS=1 (with EOWRECOMP_GPUPROF_AT): a row per draw, not per pass
+        static int per_draw = -1;
+        if (per_draw < 0) per_draw = getenv("EOWRECOMP_GPUPROF_DRAWS") != NULL;
+        if (per_draw && g_gpuprof_frame)
+            gp_mark(cb, "draw vs %llx fs %llx, %u %s", (unsigned long long)st.program->stages[0].code_addr,
+                    (unsigned long long)st.program->stages[1].code_addr, use_index ? icount : count, use_index ? "indices" : "vertices");
+    }
     for (int ri = 0; ri < nruns; ri++) {
         if (nruns > 1 || run_gold[0]) {  // this run's tint: a fragment set of its own
             float rtint[8] = {0};

@@ -218,6 +218,9 @@ static void create_device(void) {
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;
+    // EOWRECOMP_VK_STATS=1: the driver's own compile statistics of every pipeline (exec.c: instructions, registers, spills)
+    g_vk.exec_stats = getenv("EOWRECOMP_VK_STATS") && has_ext(ep, ne, "VK_KHR_pipeline_executable_properties");
+    if (g_vk.exec_stats) ext[n_ext++] = "VK_KHR_pipeline_executable_properties";
     free(ep);
 
     // Features the backend uses, each requested only when the driver has it: vkCreateDevice fails outright
@@ -272,6 +275,10 @@ static void create_device(void) {
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
                                            .pNext = &f11};
     VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : (void *)&f11};
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pe = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, .pipelineExecutableInfo = VK_TRUE,
+        .pNext = f.pNext};
+    if (g_vk.exec_stats) f.pNext = &pe;
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
     b->independentBlend = h->independentBlend;
     b->dualSrcBlend = h->dualSrcBlend;
