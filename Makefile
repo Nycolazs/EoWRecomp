@@ -148,7 +148,7 @@ RT_OBJ   := $(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC))
 RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -DEOW_RUNTIME -Iruntime -Iruntime/nvn $(DEPINC) $(OSFLAGS)
 CXXFLAGS := -O2 -g -std=c++17 -DEOW_RUNTIME -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime/nvn $(DEPINC)
 
-all: $(EXE) $(if $(GEN_SRC),$(GAMELIB))
+all: $(EXE) $(if $(strip $(GEN_SRC)),$(GAMELIB))
 
 $(B)/obj/%.o: $(GEN)/%.c runtime/cpu.h
 	@mkdir -p $(dir $@)
