@@ -43,6 +43,7 @@ ZIG      ?= build/zig-full/zig
 CC       := $(ZIG) cc -target x86_64-windows-gnu
 CXX      := $(ZIG) c++ -target x86_64-windows-gnu
 GENARCH  ?= -mcpu=x86_64_v3  # (zig's spelling of x86-64-v3)
+MANIFEST_RC := runtime/platform/windows_manifest.rc  # (UTF-8 paths; runtime/platform/eowrecomp.manifest)
 endif
 IMGUI    := third_party/imgui
 GENFLAGS := -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
@@ -188,9 +189,9 @@ $(B)/rt/%.o: runtime/%.m $(RT_HDRS)
 # linked to a temp file, then renamed over: a copy of the game still running keeps its (old) file - relinking in
 # place gets running copies killed by macOS (code signature of the changed pages). The temp file keeps the real name
 # (in a folder of its own): on Windows the import library records the name the game code library loads it by.
-$(EXE): $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ) $(IMGUI_OBJ)
+$(EXE): $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ) $(IMGUI_OBJ) $(MANIFEST_RC) $(if $(MANIFEST_RC),runtime/platform/eowrecomp.manifest)
 	@mkdir -p $(dir $@)link
-	$(CXX) -o $(dir $@)link/$(notdir $@) $^ $(LDFLAGS)
+	$(CXX) -o $(dir $@)link/$(notdir $@) $(filter-out %.manifest,$^) $(LDFLAGS)
 	mv -f $(dir $@)link/$(notdir $@) $@
 
 ifeq ($(PLATFORM),windows)
