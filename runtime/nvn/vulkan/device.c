@@ -168,9 +168,28 @@ static void create_device(void) {
     g_fault_ext = fault;
     free(ep);
 
-    // features the backend relies on (all present on current desktop drivers)
-    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    // Features the backend uses, each requested only when the driver has it: vkCreateDevice fails outright
+    // (VK_ERROR_FEATURE_NOT_PRESENT) on any unsupported one. Adreno 740 (AYN Thor, driver 1.3.128) has no
+    // uniformAndStorageBuffer8BitAccess, which the shaders don't need (no 8-bit types in uniform blocks).
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT hdiv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT hcbc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT,
+                                                         .pNext = g_vk.divisor ? &hdiv : NULL};
+    VkPhysicalDeviceVulkan13Features h13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+                                            .pNext = g_vk.custom_border ? (void *)&hcbc : g_vk.divisor ? (void *)&hdiv : NULL};
+    VkPhysicalDeviceVulkan12Features h12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &h13};
+    VkPhysicalDeviceVulkan11Features h11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &h12};
+    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &h11};
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+#define WANT(dst, src, field) do { dst.field = src.field; if (!src.field) LOG("[vk] warning: no " #field "\n"); } while (0)
+    // sampler border colours are created without a format (textures.c vk_sampler): the extension is useless without it
+    if (g_vk.custom_border && !hcbc.customBorderColorWithoutFormat) {
+        LOG("[vk] warning: no customBorderColorWithoutFormat: custom border colours off\n");
+        g_vk.custom_border = false;
+    }
+    if (g_vk.divisor && !hdiv.vertexAttributeInstanceRateDivisor) {
+        LOG("[vk] warning: no vertexAttributeInstanceRateDivisor\n");
+        g_vk.divisor = false;
+    }
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
         .vertexAttributeInstanceRateDivisor = VK_TRUE, .vertexAttributeInstanceRateZeroDivisor = VK_FALSE};
@@ -178,16 +197,22 @@ static void create_device(void) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, .customBorderColors = VK_TRUE,
         .customBorderColorWithoutFormat = VK_TRUE, .pNext = g_vk.divisor ? &div : NULL};
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-                                            .dynamicRendering = VK_TRUE, .synchronization2 = VK_TRUE,
-                                            .shaderDemoteToHelperInvocation = VK_TRUE, .shaderTerminateInvocation = VK_TRUE,
-                                            .maintenance4 = VK_TRUE,
                                             .pNext = g_vk.custom_border ? (void *)&cbc : g_vk.divisor ? (void *)&div : NULL};
-    VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-                                            .timelineSemaphore = VK_TRUE, .shaderInt8 = VK_TRUE, .samplerMirrorClampToEdge = VK_TRUE,
-                                            .uniformAndStorageBuffer8BitAccess = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,
-                                            .scalarBlockLayout = VK_TRUE, .pNext = &f13};
-    VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
-                                            .storageBuffer16BitAccess = VK_TRUE, .pNext = &f12};
+    WANT(f13, h13, dynamicRendering);
+    WANT(f13, h13, synchronization2);
+    WANT(f13, h13, shaderDemoteToHelperInvocation);
+    WANT(f13, h13, shaderTerminateInvocation);
+    WANT(f13, h13, maintenance4);
+    VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13};
+    WANT(f12, h12, timelineSemaphore);
+    WANT(f12, h12, shaderInt8);
+    WANT(f12, h12, samplerMirrorClampToEdge);
+    WANT(f12, h12, uniformAndStorageBuffer8BitAccess);
+    WANT(f12, h12, storageBuffer8BitAccess);
+    WANT(f12, h12, scalarBlockLayout);
+    VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &f12};
+    WANT(f11, h11, storageBuffer16BitAccess);
+#undef WANT
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
                                            .pNext = &f11};
     VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : (void *)&f11};
