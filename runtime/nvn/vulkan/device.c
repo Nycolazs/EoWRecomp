@@ -822,13 +822,27 @@ void backend_clear_window(void) {
     if (g_vk.dev && vk_frame_begin(black)) vk_frame_end(NULL);
 }
 
+// The next host event, waiting up to 16 ms. Android: SDL_WaitEventTimeout never sleeps there (each pump queues a poll
+// sentinel, whose wakeup makes Android_PumpEvents return at once): with a controller attached the UI thread spun on
+// a big core, 77% of the app's CPU cycles in clock_gettime / joystick polling (simpleperf on an AYN Thor). Poll, then
+// sleep 4 ms (input latency within a 33 ms frame).
+static bool next_event(SDL_Event *e) {
+#ifdef __ANDROID__
+    if (SDL_PollEvent(e)) return true;
+    SDL_DelayNS(4000000);
+    return false;
+#else
+    return SDL_WaitEventTimeout(e, 16);
+#endif
+}
+
 int ui_run(void) {
     ui_window_init();
     atomic_store(&ui_ready, true);
     for (;;) {
         if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
         SDL_Event e;
-        while (SDL_WaitEventTimeout(&e, 16)) {
+        while (next_event(&e)) {
             if (e.type == SDL_EVENT_QUIT) {
                 LOG("window closed\n");
                 exit(0);
