@@ -1,0 +1,76 @@
+name: Build Windows
+
+# Cross-compila o eowrecomp.exe (x86-64) a partir do Linux com tools/windows/build.sh.
+# Não há arquivos do jogo no repositório: o build não inclui eowgame.dll (generated/ não existe aqui).
+# O jogo é preparado na máquina do usuário, a partir dos arquivos dele.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - runtime/**
+      - tools/**
+      - third_party/**
+      - fonts/**
+      - Makefile
+      - .github/workflows/build-windows.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pacotes do sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends make zstd unzip xz-utils curl zip
+
+      - name: Zig 0.17.0 (cache)
+        id: zig-cache
+        uses: actions/cache@v4
+        with:
+          path: build/zig-full
+          key: zig-0.17.0-x86_64-linux
+
+      - name: Zig 0.17.0 (download)
+        if: steps.zig-cache.outputs.cache-hit != 'true'
+        run: |
+          N=zig-x86_64-linux-0.17.0
+          mkdir -p build/zig-dl
+          curl -fsSL --proto '=https' -o build/zig-dl/$N.tar.xz https://ziglang.org/download/0.17.0/$N.tar.xz
+          echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  build/zig-dl/$N.tar.xz" | sha256sum -c
+          tar -xJf build/zig-dl/$N.tar.xz -C build/zig-dl
+          mv build/zig-dl/$N build/zig-full
+
+      - name: Dependências do Windows (MSYS2 UCRT64 + FFmpeg)
+        uses: actions/cache@v4
+        with:
+          path: build/win/dl
+          key: win-deps-${{ hashFiles('tools/windows/fetch_deps.sh') }}
+
+      - name: Build
+        run: |
+          chmod +x tools/windows/*.sh
+          tools/windows/fetch_deps.sh
+          tools/windows/build.sh
+
+      - name: Empacotar
+        run: |
+          cd build/win/dist
+          zip -r ../../../EoWRecomp-windows-x64.zip EoWRecomp
+          cd ../../..
+          sha256sum EoWRecomp-windows-x64.zip | tee SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EoWRecomp-windows-x64
+          path: |
+            EoWRecomp-windows-x64.zip
+            SHA256SUMS.txt
+          if-no-files-found: error
