@@ -58,7 +58,7 @@ jobs:
         run: |
           chmod +x tools/windows/*.sh
           tools/windows/fetch_deps.sh
-          tools/windows/build.sh
+          tools/windows/build.sh RELEASE=1  # sem console: o log vai para eowrecomp.log, ao lado do .exe
 
       - name: Empacotar
         run: |
