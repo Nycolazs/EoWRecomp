@@ -57,17 +57,30 @@ seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p*
 - **Brilho no chão** perto das luzes (Link, bombas): pixels 2x2 com as luzes erradas. O laço de luzes (fs 12ee66f300)
   junta as listas de luzes no warp (ballot + shuffles) e os subgroups do Adreno têm 64/128 lanes: agora cada 32 lanes
   do subgroup são um warp (lane, shuffle, ballot, vote).
+- Compute 12a4723000 (filtra cube maps em quatro mapas 2D) não traduzia (`SUST.P.B`): agora vira `imageStore`
+  (imagens ligadas com `nvnCommandBufferBindImage(s)`, `c[2][0x120 + 8 * slot]`; texturas com
+  `NVN_TEXTURE_FLAGS_IMAGE` ganham uso storage). 0 dispatches pulados; no dungeon do prólogo a imagem não muda.
+- **Thread de UI girando um core grande**: o `SDL_WaitEventTimeout` do Android nunca dorme (cada pump enfileira um
+  sentinel que acorda o loop). Agora `SDL_PollEvent` + 4 ms: CPU do app 3,1 -> 1,2 G ciclos/s (simpleperf), mesmo fps.
 
-### Ainda errado no Thor
-- A lista "Which data would you like to load?" mostra as entradas vazias por alguns segundos.
-- Compute `eb20…` (SUST) sem tradução (~7 dispatches por frame pulados); primeira visita a uma cena trava alguns
-  segundos enquanto o Turnip compila os pipelines.
+### Ainda errado / medido no Thor
+- A lista "Which data would you like to load?" vazia por alguns segundos e objetos que aparecem um pouco depois na
+  primeira visita: são os draws pulados enquanto os pipelines compilam (assíncrono de propósito: sem travadas).
+  Com o cache quente acontece quase só durante o fade do carregamento.
+- Thread do jogo (simpleperf, prólogo): 42% código do jogo, 22% kernel (sincronização: ~2500 trocas de contexto/s
+  no thread principal, 0 page faults), 21% runtime (`rt_dispatch` 9%: saltos indiretos), 4% Turnip.
+- Testado nesta sessão sem defeitos novos: cutscene de abertura do novo jogo (profundidade de campo), combate,
+  bombas e explosões, tochas, escadas, menus de pausa (Key Items / System), lista de saves.
 
 ### Próximo passo (Android)
-1. 30 fps estáveis é a meta do MVP (usuário): o prólogo fica em 30,0 (CPU do thread do jogo ~28 ms por frame no modo
-   30; GPU ~13 ms). Medir outras áreas (overworld) quando o jogo avançar.
-2. SUST (imagens de armazenamento) e o ruído do chão.
+1. 30 fps estáveis (meta do MVP) no prólogo; medir o overworld quando o jogo chegar lá.
+2. CPU do thread do jogo: a sincronização entre threads do guest (tempo no kernel) e `rt_dispatch`.
 3. Áudio e save em jogo mais longo.
+
+### Testes no aparelho (scripts)
+`adb shell input swipe` usa um ponteiro só (pular andando não funciona). Multi-toque: `sendevent` em
+`/dev/input/event6` (`fts_ts`, tela principal; protocolo B: slot 0 o stick, slot 1 o botão; com a tela em paisagem
+raw_x = 1080 - y, raw_y = x).
 
 ### Como testar no Android
 `tools/android/build_deps.sh`, `(cd android && ./gradlew assembleDebug)`, `tools/android/build_game.sh extracted --apk`,
