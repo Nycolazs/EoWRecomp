@@ -1749,12 +1749,12 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (!c->glsl) sp(&c->body, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
         else if (c->stage == STAGE_COMPUTE) sp(&c->body, "    barrier();\n");
         else sp(&c->body, "    /* bar */\n");  // GLSL barrier() is compute / tessellation only
-    } else if (OPM(0xeb20000000000000ull, 0xfff8000000000000ull)) {  // SUST.P.B: formatted image store, handle in a register
+    } else if (c->glsl && OPM(0xeb20000000000000ull, 0xfff8000000000000ull)) {  // SUST.P.B: formatted image store, handle in a register
         // fields per Ryujinx's InstSustB: data 0-7, coordinates 8-15, rgba mask 20-23, dimension 33-35, handle 39-46.
         // Checked on Echoes of Wisdom's eb20138600f70018: SUST.P.B.2D.RGBA [R0], R24, R39 in compute 12a4723000,
         // which filters cube maps into four 2D maps (handles from c[2][0x120..0x138]: bound images 0-3).
         int hc = (int)bits(w, 39, 8), dim = (int)bits(w, 33, 3);
-        if (!c->glsl || c->stage != STAGE_COMPUTE || dim != 3 || bits(w, 20, 4) != 15) { fail(c, "sust dim %d rgba %d", dim, (int)bits(w, 20, 4)); return; }
+        if (c->stage != STAGE_COMPUTE || dim != 3 || bits(w, 20, 4) != 15) { fail(c, "sust dim %d rgba %d", dim, (int)bits(w, 20, 4)); return; }
         // the handle register is loaded from the binding table a few instructions back (MOV Rh, c[2][0x120 + 8 * slot])
         const uint64_t *ins = (const uint64_t *)c->code;
         uint32_t off = 0;
