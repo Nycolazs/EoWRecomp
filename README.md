@@ -25,9 +25,10 @@ replaces the Switch's operating system (Horizon) and its graphics API (NVN), dra
 and on its Android port [LASRecomp-Android-Plus](https://github.com/Nycolazs/LASRecomp-Android-Plus).
 
 > [!WARNING]
-> **Early development - not fully playable yet.** The game boots, plays its opening and the first controllable scene
-> with working input (Linux / Vulkan). The macOS and Android builds start, set the game up from your own package and
-> are tested without the game; running the game on them is the next step. See [docs/STATUS.md](docs/STATUS.md).
+> **Early development - not fully playable yet.** The game boots, plays its opening and the first controllable scenes
+> with working input on Linux (Vulkan) and on an **Android phone** (AYN Thor, Adreno 740, the Turnip driver: the
+> prologue at 30 fps, 720p). The macOS build starts and sets the game up from your own package; running the game there
+> is the next step. See [docs/STATUS.md](docs/STATUS.md).
 
 > [!IMPORTANT]
 > **No game files are included**, and none ever will be - not in this repository, not in any build. EoWRecomp needs
@@ -43,9 +44,17 @@ Frames of the recompiled game itself, captured by the runtime (native Linux buil
 | ![The opening: Link facing the Moblins in the dungeon](docs/screenshots/01_prologue.jpg) | ![The opening fight](docs/screenshots/02_prologue_fight.jpg) |
 | ![First controllable scene: the corridor, with the HUD](docs/screenshots/03_corridor_hud.jpg) | ![Walking and button prompts driven by input](docs/screenshots/04_room_prompts.jpg) |
 
+**Android** (alpha 2): the same game on an AYN Thor (Snapdragon 8 Gen 2 / Adreno 740, Android 13), Vulkan through the
+bundled Turnip driver, 720p, 30 fps.
+
+| | |
+|---|---|
+| ![Android: the prologue dungeon, torches and stairs](docs/screenshots/07_android_torches.jpg) | ![Android: climbing the stairs, with the HUD](docs/screenshots/08_android_stairs.jpg) |
+| ![Android: the pause menu](docs/screenshots/09_android_pause_menu.jpg) | ![Android: the on-screen controls in play](docs/screenshots/06_android_thor_prologue.jpg) |
+
 <p align="center">
   <img src="docs/screenshots/05_android_start.jpg" width="720" alt="The Android app's start screen: choosing the game files folder"><br>
-  <sub>The Android app (alpha 1): setting the game up from your own files.</sub>
+  <sub>The Android app: setting the game up from your own files.</sub>
 </p>
 
 ## Download
@@ -72,7 +81,9 @@ game code is recompiled on your device. Checksums: `SHA256SUMS.txt` in the relea
   [MoltenVK](https://github.com/KhronosGroup/MoltenVK) on Apple Silicon. The game's Maxwell GPU shaders are translated
   to GLSL at run time (and tested against Metal's compiler for MoltenVK).
 - **Android**: touch controls with every Switch button, controllers, a pre-rotated swapchain (no compositor rotation
-  pass), Android performance hints, and the game code built on the phone itself (Python + clang inside the APK).
+  pass), Android performance hints, and the game code built on the phone itself (Python + clang inside the APK). Adreno
+  GPUs run on the bundled Mesa **Turnip** driver (libadrenotools; `EOWRECOMP_DRIVER=system` for the phone's own);
+  internal resolution 720p by default.
 - Upscaling (AMD FSR 1), SMAA, unlocked aspect ratio, control remapping, in-game settings menu (`F1` / `Esc`).
 
 ## Platforms
@@ -81,7 +92,7 @@ game code is recompiled on your device. Checksums: `SHA256SUMS.txt` in the relea
 |---|---|---|---|
 | **Linux** (x86-64) | ✅ | ✅ | ✅ opening + first scene (Vulkan, Intel Iris Xe) |
 | **macOS** (Apple Silicon, 15+) | ✅ `.app` with MoltenVK | ✅ tested on an M1 | ⏳ next |
-| **Android** (arm64, Vulkan 1.3) | ✅ APK | ✅ tested on the Android 15 emulator | ⏳ next |
+| **Android** (arm64, Vulkan 1.3) | ✅ APK | ✅ emulator + AYN Thor | ✅ prologue, 30 fps 720p (AYN Thor, Adreno 740, Turnip 26) |
 | **Windows** (x86-64) | ✅ cross-compiled from Linux | - | untested |
 
 ## Progress
@@ -92,7 +103,7 @@ game code is recompiled on your device. Checksums: `SHA256SUMS.txt` in the relea
 | M2 - the runtime links and boots into the game | ✅ |
 | M3 - first frame presented | ✅ |
 | M4 - first correct image | ✅ the opening |
-| M5 - title screen, audio, input, new game, first playable scene | 🔶 input works, first scene reachable |
+| M5 - title screen, audio, input, new game, first playable scene | 🔶 Android: title, new game, the prologue playable (combat, bombs, menus, saving and loading); Linux: the opening and first scene |
 | M6 - playable start to finish, saves | ⬜ |
 | M7 - PC features: resolution, free aspect ratio, unlocked frame rate, remapping, button icons | ⬜ |
 
