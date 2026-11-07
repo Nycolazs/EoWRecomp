@@ -54,10 +54,11 @@ seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p*
 - **Miniatura do save**: saves novos têm a imagem (a cópia textura -> buffer chega à memória do guest); os antigos
   foram gravados com a cena preta e ficam pretos até serem sobrescritos.
 - Cache de pipelines gravado a cada 30 s enquanto surgem pipelines novos (o Android mata apps sem `exit()`).
+- **Brilho no chão** perto das luzes (Link, bombas): pixels 2x2 com as luzes erradas. O laço de luzes (fs 12ee66f300)
+  junta as listas de luzes no warp (ballot + shuffles) e os subgroups do Adreno têm 64/128 lanes: agora cada 32 lanes
+  do subgroup são um warp (lane, shuffle, ballot, vote).
 
 ### Ainda errado no Thor
-- O chão perto do Link "respira" de leve: pixels esparsos numa faixa diagonal mudam com a animação dele (parece ruído
-  de shadow map / luz; não é a precisão do depth: igual com D32). Prioridade baixa (usuário).
 - A lista "Which data would you like to load?" mostra as entradas vazias por alguns segundos.
 - Compute `eb20…` (SUST) sem tradução (~7 dispatches por frame pulados); primeira visita a uma cena trava alguns
   segundos enquanto o Turnip compila os pipelines.
