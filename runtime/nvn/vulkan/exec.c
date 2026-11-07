@@ -37,6 +37,7 @@ uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
 #define PROF_T0() uint64_t prof_t0_ = prof ? SDL_GetTicksNS() : 0
 #define PROF_ADD(v) do { if (prof) v += SDL_GetTicksNS() - prof_t0_; } while (0)
 static _Atomic int stat_compiles;
+_Atomic unsigned vk_pipelines_made;  // (never reset: device.c saves the pipeline cache when it grew)
 static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
 static char stats_text[2048];
@@ -1211,7 +1212,7 @@ static void compile_program(void *arg) {
     free(sv);
     free(sf);
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
-    atomic_fetch_add(&stat_compiles, 1);
+    atomic_fetch_add(&stat_compiles, 1), atomic_fetch_add(&vk_pipelines_made, 1);
     atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
 }
 
@@ -1540,7 +1541,7 @@ static void build_pipeline(void *arg) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
     }
-    atomic_fetch_add(&stat_compiles, 1);
+    atomic_fetch_add(&stat_compiles, 1), atomic_fetch_add(&vk_pipelines_made, 1);
     atomic_store(&pp->state, r == VK_SUCCESS ? 1 : 2);
 }
 
@@ -2549,7 +2550,7 @@ static void build_compute(void *arg) {
                                                 .pSpecializationInfo = &spec},
                                       .layout = cp->p.layout};
     VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
-    atomic_fetch_add(&stat_compiles, 1);
+    atomic_fetch_add(&stat_compiles, 1), atomic_fetch_add(&vk_pipelines_made, 1);
     atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
     if (r != VK_SUCCESS) LOG("[compute] pipeline failed: %d\n", r);
 }
