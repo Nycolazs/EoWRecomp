@@ -1191,6 +1191,7 @@ static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, V
 
 static void save_glsl(const char *src, uint64_t addr, const char *suffix) {
     if (!getenv("EOWRECOMP_SAVE_MSL")) return;
+    mkdir("build", 0755);  // (a fresh Android data directory has no build/)
     mkdir("build/glsl", 0755);
     char path[256];
     snprintf(path, sizeof path, "build/glsl/%llx_%s.glsl", (unsigned long long)addr, suffix);
