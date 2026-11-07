@@ -1,8 +1,12 @@
 name: Build Windows
 
-# Cross-compila o eowrecomp.exe (x86-64) a partir do Linux com tools/windows/build.sh.
-# Não há arquivos do jogo no repositório: o build não inclui eowgame.dll (generated/ não existe aqui).
-# O jogo é preparado na máquina do usuário, a partir dos arquivos dele.
+# Pacote do Windows (x86-64), em três jobs:
+#   exe     - eowrecomp.exe + DLLs, cross-compilados do Linux (tools/windows/build.sh), e a biblioteca de importação
+#             que o código do jogo usa para falar com o .exe (eowrecomp.lib)
+#   helper  - eowgen.exe, o gerador do código do jogo (PyInstaller: só roda no Windows)
+#   package - junta tudo com o zig (compilador) e os headers em gamelib-src/, como o runtime espera
+#             (runtime/gamebuild.c find_tools): a tela inicial recompila o jogo na máquina do usuário.
+# Não há arquivos do jogo nem código gerado nele: isso vem dos arquivos do próprio usuário.
 
 on:
   workflow_dispatch:
@@ -20,7 +24,7 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  exe:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -60,12 +64,81 @@ jobs:
           tools/windows/fetch_deps.sh
           tools/windows/build.sh RELEASE=1  # sem console: o log vai para eowrecomp.log, ao lado do .exe
 
-      - name: Empacotar
+      - name: Separar o que o pacote usa
         run: |
-          cd build/win/dist
-          zip -r ../../../EoWRecomp-windows-x64.zip EoWRecomp
-          cd ../../..
+          mkdir stage
+          cp -r build/win/dist/EoWRecomp stage/EoWRecomp
+          cp build/win/eowrecomp.lib stage/eowrecomp.lib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exe-dist
+          path: stage
+          if-no-files-found: error
+
+  helper:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: eowgen (PyInstaller)
+        shell: bash
+        run: |
+          python -m pip install capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5 pyinstaller==6.22.3
+          python -m PyInstaller --noconfirm --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller tools/eowgen.spec
+          python tools/pe_no_cfg.py build/helper/eowgen/eowgen.exe
+          du -sh build/helper/eowgen
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eowgen-helper
+          path: build/helper/eowgen
+          if-no-files-found: error
+
+  package:
+    needs: [exe, helper]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: exe-dist
+          path: pkg-in/exe
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: eowgen-helper
+          path: pkg-in/eowgen
+
+      - name: Zig para Windows (o compilador da tela inicial)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends unzip curl zip
+          ZIG_TARGET=x86_64-windows tools/fetch_zig.sh
+
+      - name: Montar o pacote
+        run: |
+          OUT=EoWRecomp
+          cp -r pkg-in/exe/EoWRecomp "$OUT"
+          cp pkg-in/exe/eowrecomp.lib "$OUT/eowrecomp.dll.a"  # (a biblioteca de importação, com o nome que gamebuild.c procura)
+          cp -r pkg-in/eowgen "$OUT/eowgen"
+          cp -r build/zig "$OUT/zig"
+          mkdir "$OUT/gamelib-src"
+          cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h runtime/modules.h tools/gamelib_entry.c \
+             runtime/hle/hle_symbols.txt "$OUT/gamelib-src/"
+          for f in eowrecomp.exe eowrecomp.dll.a eowgen/eowgen.exe zig/zig.exe gamelib-src/cpu.h gamelib-src/hle_symbols.txt; do
+            [ -f "$OUT/$f" ] || { echo "falta $OUT/$f"; exit 1; }
+          done
+          zip -qr EoWRecomp-windows-x64.zip "$OUT"
           sha256sum EoWRecomp-windows-x64.zip | tee SHA256SUMS.txt
+          du -sh "$OUT" EoWRecomp-windows-x64.zip
 
       - uses: actions/upload-artifact@v4
         with:
