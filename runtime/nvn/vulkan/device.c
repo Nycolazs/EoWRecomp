@@ -30,8 +30,50 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
     return VK_FALSE;
 }
 
+#ifdef __ANDROID__
+#include <adrenotools/driver.h>
+#include <dlfcn.h>
+#include <libgen.h>
+// Vulkan through a custom driver: Turnip (Mesa; the APK's res/vulkan.ad07xx.so, tools/android/build_deps.sh) by
+// default - phones' own Qualcomm drivers are often old (an AYN Thor's, 1.3.128 of 2023: no shaderInt64, no host memory
+// import). libadrenotools opens the system loader onto it (it does the presentation: a driver alone can't).
+// EOWRECOMP_DRIVER=system: the phone's own; =<file in res/>: another driver.
+static void *custom_vulkan;  // the loader opened by libadrenotools (NULL: the system one, through volk / SDL)
+static PFN_vkGetInstanceProcAddr custom_driver(void) {
+    const char *want = getenv("EOWRECOMP_DRIVER");
+    char drv[1100], dir[1100], hooks[1100];
+    Dl_info di;
+    if ((want && !strcmp(want, "system")) || !rt_resource(want ? want : "vulkan.ad07xx.so", NULL, drv, sizeof drv) ||
+        !dladdr((void *)custom_driver, &di) || !di.dli_fname)
+        return NULL;
+    snprintf(dir, sizeof dir, "%s/", dirname(strdup(drv)));
+    snprintf(hooks, sizeof hooks, "%s/", dirname(strdup(di.dli_fname)));  // (the native library folder: libmain.so's)
+    custom_vulkan = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, NULL, hooks, dir, basename(drv), NULL, NULL);
+    PFN_vkGetInstanceProcAddr gipa = custom_vulkan ? (PFN_vkGetInstanceProcAddr)dlsym(custom_vulkan, "vkGetInstanceProcAddr") : NULL;
+    LOG("[vk] driver %s: %s\n", drv, gipa ? "loaded" : "failed, the system's instead");
+    return gipa;
+}
+#endif
+
+// The window's surface: made with the loader in use (SDL's would be another copy of it with a custom driver)
+static bool create_surface(void) {
+#ifdef __ANDROID__
+    if (custom_vulkan) {
+        VkAndroidSurfaceCreateInfoKHR ci = {.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+            .window = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL)};
+        return ci.window && vkCreateAndroidSurfaceKHR(g_vk.inst, &ci, NULL, &g_vk.surface) == VK_SUCCESS;
+    }
+#endif
+    return SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface);
+}
+
 // EOWRECOMP_VK_VALIDATION=1: Khronos validation layer (MSYS2 package vulkan-validation-layers)
 static void create_instance(void) {
+#ifdef __ANDROID__
+    PFN_vkGetInstanceProcAddr gipa = custom_driver();
+    if (gipa) volkInitializeCustom(gipa);
+    else
+#endif
 #ifdef VK_NO_PROTOTYPES
     if (volkInitialize() != VK_SUCCESS) FATAL("no Vulkan driver\n");
 #endif
@@ -161,6 +203,16 @@ static void create_device(void) {
     if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     g_vk.host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);  // guest heap as a GPU buffer (exec.c)
     if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+#ifdef __ANDROID__
+    // without it (Adreno): the heap is an AHardwareBuffer (platform/android.c), imported and read through buffer
+    // device addresses - a storage buffer can't span it (maxStorageBufferRange 128 MB there) (exec.c gmem_import)
+    g_vk.ahb_import = !g_vk.host_import && has_ext(ep, ne, "VK_ANDROID_external_memory_android_hardware_buffer") &&
+                      has_ext(ep, ne, "VK_EXT_queue_family_foreign");
+    if (g_vk.ahb_import) {
+        ext[n_ext++] = "VK_ANDROID_external_memory_android_hardware_buffer";
+        ext[n_ext++] = "VK_EXT_queue_family_foreign";
+    }
+#endif
     // a portability implementation (MoltenVK) must have its subset extension enabled when it lists it
     if (has_ext(ep, ne, "VK_KHR_portability_subset")) ext[n_ext++] = "VK_KHR_portability_subset";
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
@@ -210,6 +262,10 @@ static void create_device(void) {
     WANT(f12, h12, uniformAndStorageBuffer8BitAccess);
     WANT(f12, h12, storageBuffer8BitAccess);
     WANT(f12, h12, scalarBlockLayout);
+    if (g_vk.ahb_import) {
+        WANT(f12, h12, bufferDeviceAddress);
+        g_vk.ahb_import = h12.bufferDeviceAddress;
+    }
     VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &f12};
     WANT(f11, h11, storageBuffer16BitAccess);
 #undef WANT
@@ -429,7 +485,7 @@ static void new_surface(void) {
     g_vk.swapchain = VK_NULL_HANDLE;
     if (g_vk.surface) vkDestroySurfaceKHR(g_vk.inst, g_vk.surface, NULL);
     g_vk.surface = VK_NULL_HANDLE;
-    if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) {
+    if (!create_surface()) {
         LOG("[vk] new surface: %s\n", SDL_GetError());
         atomic_store(&g_surface_stale, true);  // (the window isn't back yet: next frame)
         return;
@@ -589,6 +645,10 @@ void vk_frame_end(const char *shot_path) {
 }
 
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
+    // absolute: on Android SDL resolves relative paths against the app's internal storage / its assets, not the
+    // working directory (the data folder)
+    char full[1200], cwd[1024];
+    if (path[0] != '/' && getcwd(cwd, sizeof cwd)) snprintf(full, sizeof full, "%s/%s", cwd, path), path = full;
     SDL_Surface *s = SDL_CreateSurfaceFrom((int)w, (int)h, SDL_PIXELFORMAT_ABGR8888, (void *)rgba, (int)w * 4);
     if (!s || !SDL_SavePNG(s, path)) LOG("[vk] saving %s failed: %s\n", path, SDL_GetError());
     else LOG("[vk] saved %s (%ux%u)\n", path, w, h);
@@ -710,7 +770,8 @@ void backend_present(NvnTexture *t) {
     {   // EOWRECOMP_SHOT_AT=<frame>,<frame>,... (ascending): the game image at those frames -> build/frames/frame_N.png
         static const char *next;
         static int init;
-        if (!init) { init = 1; next = getenv("EOWRECOMP_SHOT_AT"); if (next) mkdir("build/frames", 0755); }
+        // (build/ first: the Android data folder has none)
+        if (!init) { init = 1; next = getenv("EOWRECOMP_SHOT_AT"); if (next) mkdir("build", 0755), mkdir("build/frames", 0755); }
         while (next && *next) {
             long at = strtol(next, (char **)&next, 10);
             if ((long)total_frames < at) { while (next > getenv("EOWRECOMP_SHOT_AT") && next[-1] != ',') next--; break; }
@@ -726,6 +787,7 @@ void backend_present(NvnTexture *t) {
     if (shot_from < 0) { const char *e = getenv("EOWRECOMP_SCREENSHOT_FROM"); shot_from = e ? atol(e) : 0; }
     if (shot_every && total_frames % shot_every == 0 && (long)total_frames >= shot_from) {
         char path[256];
+        mkdir("build", 0755);
         if (shot_from) mkdir("build/frames", 0755);
         snprintf(path, sizeof path, shot_from ? "build/frames/frame_%05llu.png" : "build/frame_%05llu.png",
                  (unsigned long long)total_frames);
@@ -816,7 +878,7 @@ void ui_window_init(void) {
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
     if (g_settings.fullscreen && !getenv("EOWRECOMP_WINDOW") && !getenv("EOWRECOMP_HIDDEN")) SDL_SetWindowFullscreen(window, true);
     create_instance();
-    if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
+    if (!create_surface()) FATAL("creating the window surface: %s\n", SDL_GetError());
     pick_device();
     create_device();
     create_swapchain();

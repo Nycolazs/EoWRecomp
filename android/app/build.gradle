@@ -30,10 +30,11 @@ android {
         ndk {
             abiFilters 'arm64-v8a'
         }
-        manifestPlaceholders = [extractNativeLibs: onDevice ? 'true' : 'false']
+        // (extracted: libadrenotools hooks the Vulkan loader with libraries from the native library folder)
+        manifestPlaceholders = [extractNativeLibs: 'true']
         externalNativeBuild {
             cmake {
-                targets 'main', 'SDL3-shared'
+                targets 'main', 'SDL3-shared', 'main_hook', 'hook_impl'
                 arguments '-DANDROID_STL=c++_static'
             }
         }
@@ -94,17 +95,19 @@ android {
 
     packaging {
         jniLibs {
-            // stored uncompressed and mapped directly from the APK; the on-phone build: compressed in the APK and
-            // extracted at install (its programs must be files to run)
-            useLegacyPackaging onDevice
+            // compressed in the APK and extracted at install: libadrenotools loads its hooks from the native library
+            // folder, and the on-phone build's programs must be files to run
+            useLegacyPackaging true
         }
     }
 }
 
-// What the app ships besides code (runtime/paths.c android_resources): the start screen fonts and the icon
+// What the app ships besides code (runtime/paths.c android_resources): the start screen fonts, the icon, and the
+// Turnip Vulkan driver (MIT, tools/android/build_deps.sh; runtime/nvn/vulkan/device.c)
 tasks.register('eowAssets', Sync) {  // (Sync: a file gone from the sources goes from the APK too)
     from('../../third_party/fonts') { include '**/*.ttf'; eachFile { path = name }; includeEmptyDirs = false }
     from('../../docs/icon/icon_1024.png') { rename { 'icon.png' } }
+    from('../../build/android/deps/turnip') { include 'vulkan.ad07xx.so' }
     into "$buildDir/generated/eow-assets"
 }
 preBuild.dependsOn eowAssets

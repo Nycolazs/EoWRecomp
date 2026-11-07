@@ -39,6 +39,7 @@ typedef struct {
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import;
+    bool ahb_import;           // (Android) guest heap imported from its AHardwareBuffer, read through buffer addresses
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;

@@ -87,6 +87,15 @@ typedef struct {
 #define GMAP_MAX 16  // ranges in the table (GMap { uvec4 gmap[GMAP_MAX + 1]; }: [i] = addr lo, addr hi, size, word offset;
                      // [GMAP_MAX].x = count)
 extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
+// (GLSL) global memory through buffer addresses instead of a storage buffer: binding GMEM_BUFFER_INDEX is then
+// `uniform GMemBase { uvec4 gmem_base[GMEM_CHUNKS]; }`, [i].xy the address of the heap's i-th GMEM_CHUNK_BYTES (the
+// heap's memory comes in pieces of that size, maxwell_gmem_size in all), read with GL_EXT_buffer_reference(_uvec2).
+// For drivers that can't import guest memory as a host pointer (Android / Adreno). Either way the shaders reach a
+// 32-bit word of global memory as gmw(word index).
+extern bool maxwell_gmem_bda;
+#define GMEM_CHUNK_LOG2 29  // 512 MB
+#define GMEM_CHUNK_BYTES (1ull << GMEM_CHUNK_LOG2)
+#define GMEM_CHUNKS 8       // (HEAP_MAX, 3.25 GB, in 512 MB pieces: 7)
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;
