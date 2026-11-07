@@ -1,6 +1,6 @@
 # Status
 
-Atualizado: 2026-10-20 (sessão 3: macOS / Android).
+Atualizado: 2026-11-07 (sessão 4: o jogo roda num celular Android).
 
 ## Jogo fixado (único build suportado)
 
@@ -25,6 +25,41 @@ Build IDs dos módulos (endereços de patches/HLE valem só para estes):
 | rtld | `2f1967113a281280a48ce3fc6dc23049327bf924` | 7 358 B |
 
 RomFS: 10 963 arquivos, 8 032 371 686 bytes (todos com magic válido: FRES, BNTX, MsgS, FSTM, SARC, FSHA, webm…).
+
+## Sessão 4 (2026-11-07, Linux + AYN Thor): o jogo roda no Android
+
+**Comprovado num aparelho real**: AYN Thor (Snapdragon 8 Gen 2 / QCS8550, **Adreno 740**, driver Vulkan 1.3.128 de
+2023-12, Android 13), APK pessoal (`tools/android/build_game.sh extracted --apk`), setup pela tela inicial com um NSP
+v1.0.0: a abertura roda, Link na masmorra do prólogo (`docs/screenshots/06_android_thor_prologue.jpg`), 5 min / 4.900
+frames sem travar.
+
+### Corrigido
+- **Crash ao abrir (tela inicial)**: `vkCreateDevice` -> `VK_ERROR_FEATURE_NOT_PRESENT`. O Adreno 740 não tem
+  `uniformAndStorageBuffer8BitAccess`, que era pedido sem consultar o driver (e que os shaders não usam). Agora cada
+  feature 1.1/1.2/1.3 e de extensão só é pedida se o driver a tiver (as que faltam vão para o log);
+  `customBorderColorWithoutFormat` / `vertexAttributeInstanceRateDivisor` ausentes desligam a extensão.
+- `tools/nca_extract.py`: NSPs com rights ID (title key no ticket do NSP ou em `title.keys`), como `nxpkg.c` já fazia.
+
+### Observado no Thor (ainda não corrigido)
+- **Primeira execução**: ~2 min de tela preta / cena incompleta enquanto o compilador do Adreno compila os pipelines
+  (4 threads a 100%; os draws ficam em "pipeline compiling"). As seguintes usam `cache/spirv` e `vk_pipelines.bin`.
+- **~16 fps** no prólogo com os pipelines prontos, limitado pela GPU (`wait` ~1,6 s a cada 2 s no log).
+- Faixa vertical (aqui azul) do topo da tela até o Link: o artefato 2 dos problemas abertos abaixo.
+- Sem `VK_EXT_external_memory_host` no Adreno: memória global dos compute shaders lê zero (sem efeito visível na
+  abertura até agora). 224 dispatches/2 s pulados: o compute `eb20…` (SUST) sem tradução.
+
+### Próximo passo (Android)
+1. Desempenho de GPU no Adreno (`EOWRECOMP_VK_PROF=1`, `EOWRECOMP_GPUPROF_AT=<frame>` via `env.txt`): quais passes
+   custam os ~60 ms por frame.
+2. Caminho por cópia para a memória global dos compute shaders sem `VK_EXT_external_memory_host` (o `gfast` de
+   `exec.c` preenchido pela CPU em vez de `vkCmdCopyBuffer` do heap importado).
+3. Jogar além da abertura no Thor (controles do próprio aparelho) e conferir áudio e save.
+
+### Como testar no Android
+`tools/android/build_deps.sh`, `(cd android && ./gradlew assembleDebug)`, `tools/android/build_game.sh extracted --apk`,
+`adb install -r android/app/build/outputs/apk/debug/app-debug.apk` (a release alpha_1 tem outra chave: desinstalar
+antes). Log: `Android/data/com.eowrecomp.android/files/eowrecomp.log` ou `adb logcat -s EoWRecomp`. Gradle 8.14 não
+roda no Java 25: usar um JDK 21.
 
 ## Sessão 3 (2026-10-20, MacBook Air M1 8 GB, macOS 27): macOS e Android
 
