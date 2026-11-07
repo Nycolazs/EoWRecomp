@@ -87,6 +87,7 @@ typedef struct {
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
+static size_t prev_insn(size_t i) { return i % 4 == 1 ? i - 2 : i - 1; }  // (index of the previous instruction, skipping control words)
 static int64_t sbits(uint64_t w, int lo, int n) {
     int64_t v = (int64_t)bits(w, lo, n);
     return (v & (1ll << (n - 1))) ? v - (1ll << n) : v;
@@ -493,6 +494,22 @@ static int tex_slot(Ctx *c, uint32_t index, int type, bool shadow, bool array) {
     t->type = (uint8_t)type;
     t->shadow = shadow;
     t->is_array = array;
+    return s;
+}
+
+// bound image (SUST.B): one slot per handle location in the driver's binding table (c[2]: textures from 0x20, the
+// images bound with nvnCommandBufferBindImage(s) from 0x120, 8 bytes each)
+static int img_slot(Ctx *c, uint32_t offset) {
+    for (int s = 0; s < c->info->ntex; s++) {
+        const ShaderTexture *t = &c->info->tex[s];
+        if (t->is_image && t->handle_offset == offset) return s;
+    }
+    int s = c->info->ntex++;
+    if (s >= 31) { fail(c, "too many textures"); return 0; }
+    ShaderTexture *t = &c->info->tex[s];
+    t->type = TEXTYPE_2D;
+    t->is_image = true;
+    t->handle_offset = offset;
     return s;
 }
 
@@ -1732,6 +1749,25 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (!c->glsl) sp(&c->body, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
         else if (c->stage == STAGE_COMPUTE) sp(&c->body, "    barrier();\n");
         else sp(&c->body, "    /* bar */\n");  // GLSL barrier() is compute / tessellation only
+    } else if (OPM(0xeb20000000000000ull, 0xfff8000000000000ull)) {  // SUST.P.B: formatted image store, handle in a register
+        // fields per Ryujinx's InstSustB: data 0-7, coordinates 8-15, rgba mask 20-23, dimension 33-35, handle 39-46.
+        // Checked on Echoes of Wisdom's eb20138600f70018: SUST.P.B.2D.RGBA [R0], R24, R39 in compute 12a4723000,
+        // which filters cube maps into four 2D maps (handles from c[2][0x120..0x138]: bound images 0-3).
+        int hc = (int)bits(w, 39, 8), dim = (int)bits(w, 33, 3);
+        if (!c->glsl || c->stage != STAGE_COMPUTE || dim != 3 || bits(w, 20, 4) != 15) { fail(c, "sust dim %d rgba %d", dim, (int)bits(w, 20, 4)); return; }
+        // the handle register is loaded from the binding table a few instructions back (MOV Rh, c[2][0x120 + 8 * slot])
+        const uint64_t *ins = (const uint64_t *)c->code;
+        uint32_t off = 0;
+        for (size_t k = pc / 8, n = 0; k > 1 && n < 64; n++) {
+            k = prev_insn(k);
+            if (bits(ins[k], 0, 8) != (uint64_t)hc) continue;
+            if ((ins[k] & 0xfff8000000000000ull) == 0x4c98000000000000ull && bits(ins[k], 34, 5) == 2) off = (uint32_t)bits(ins[k], 20, 14) * 4;
+            break;
+        }
+        if (off < 0x120 || off >= 0x160 || off % 8) { fail(c, "sust handle r%d not a bound image", hc); return; }
+        int s = img_slot(c, off);
+        sp(&c->body, "    imageStore(t%d, ivec2(int(%s), int(%s)), vec4(as_f(%s), as_f(%s), as_f(%s), as_f(%s)));\n", s, R(a), R(a + 1),
+           R(d), R(d + 1), R(d + 2), R(d + 3));
     } else {
         fail(c, "unknown instruction %016llx at %#x", (unsigned long long)w, pc);
     }
@@ -1965,6 +2001,10 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     }
     for (int i = 0; i < info->ntex; i++) {
         ShaderTexture *t = &info->tex[i];
+        if (t->is_image) {  // (written only; no format qualifier: shaderStorageImageWriteWithoutFormat)
+            sp(&s, "layout(set = %d, binding = %d) uniform writeonly image2D t%d;\n", set, 32 + i, i);
+            continue;
+        }
         sp(&s, "layout(set = %d, binding = %d) uniform %s t%d;\n", set, 32 + i, glsl_sampler_type(t), i);
         // size of level l as (width, height, depth or layers)
         switch (t->type) {
@@ -2079,7 +2119,6 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
 // structured form then takes the BRX as one more forward jump. Anything else: false (the dispatch loop as before).
 // Echoes of Wisdom's skinning vertex shader (12ee694000, a switch on the bone count) fell back to the dispatch loop:
 // 48 registers and ~575 spill loads/stores on Turnip, 3.3 ms a draw on an Adreno 740.
-static size_t prev_insn(size_t i) { return i % 4 == 1 ? i - 2 : i - 1; }
 static bool brx_targets(const uint8_t *code, const uint8_t *blob, size_t max_size, size_t i, size_t end, uint8_t *label) {
     const uint64_t *ins = (const uint64_t *)code;
     uint64_t brx = ins[i];
@@ -2122,6 +2161,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     // compute programs have no SPH. Older NVN (Link's Awakening): no header either, code starts at the blob. Newer NVN
     // (Echoes of Wisdom, SDK 16.2): a 0x100-byte header starting with the magic 0x12345679 (graphics: 0x12345678).
     if (stage == STAGE_COMPUTE) code = *(const uint32_t *)blob == 0x12345679u ? blob + 0x100 : blob;
+    c->code = code;
     if (stage == STAGE_FRAGMENT) {
         c->omap_target = *(const uint32_t *)(sph + 0x48);
         c->omap_depth = (*(const uint32_t *)(sph + 0x4C) >> 1) & 1;

@@ -443,9 +443,10 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
             if (s->npools == 16) FATAL("descriptor pools exhausted\n");
             VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
                                             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
-                                            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024}};
+                                            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},
+                                            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}};
             VkDescriptorPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 8192,
-                                             .poolSizeCount = 5, .pPoolSizes = sizes};
+                                             .poolSizeCount = 6, .pPoolSizes = sizes};
             VK_CHECK(vkCreateDescriptorPool(g_vk.dev, &ci, NULL, &s->pools[s->npools++]));
         }
         VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -2464,6 +2465,25 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     *out = (VkDescriptorImageInfo){smp, view, VK_IMAGE_LAYOUT_GENERAL};
 }
 
+// Bound image (SUST): driver binding table offset 0x120 + 8 * slot = st.img[stage][slot], the texture pool ID
+// (nvnDeviceGetImageHandle), registered with nvnTexturePoolRegisterImage
+static VkImageView image_view(int stage, ShaderInfo *si, int i) {
+    int slot = i < si->ntex ? ((int)si->tex[i].handle_offset - 0x120) / 8 : -1;
+    uint64_t h = slot >= 0 && slot < 8 ? st.img[stage][slot] : 0;
+    uint32_t id = h & 0xFFFFF;
+    VkImageView v = VK_NULL_HANDLE;
+    if (h && st.tpool && id < (uint32_t)st.tpool->count) {
+        NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[id];
+        if (e->tex) v = vk_storage_view(e->tex, &e->view, e->has_view);
+    }
+    if (!v && h) {
+        static int nlog;
+        NvnTexture *t = st.tpool && id < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[id].tex : NULL;
+        if (nlog++ < 10) LOG("[vk] image slot %d (id %u) not storable: nvn fmt %#x flags %#x\n", slot, id, t ? t->format : 0, t ? t->flags : 0);
+    }
+    return v ? v : vk_dummy_storage_view();
+}
+
 // Writes the descriptor set of one stage. gx..gz: compute group counts (driver constants).
 // pre_ii: texture descriptors already resolved by the caller (draw: fragment textures, needed earlier for the
 // viewport decision), or NULL.
@@ -2492,6 +2512,9 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 tex_sc[sg][ti][0] = sc[0]; tex_sc[sg][ti][1] = sc[1];
                 tex_wh[sg][ti][0] = wh[0]; tex_wh[sg][ti][1] = wh[1];
             }
+            w[n].pImageInfo = &ii[n];
+        } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && b->binding >= 32) {
+            ii[n] = (VkDescriptorImageInfo){VK_NULL_HANDLE, image_view(stage, si, (int)b->binding - 32), VK_IMAGE_LAYOUT_GENERAL};
             w[n].pImageInfo = &ii[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding == GMEM_BUFFER_INDEX) {
             bi[n] = gmem_base_info();  // (buffer address mode: the heap's address)

@@ -310,6 +310,21 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     VkImageCreateFlags flags = 0;
     if (!depthfmt) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // format views (NVN texture views, raw sRGB views)
     if (type == VK_IMAGE_TYPE_2D && layers >= 6 && tw == th && samples == 1) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    // NVN_TEXTURE_FLAGS_IMAGE (0x4): written by shader image stores (SUST; e.g. Echoes of Wisdom's 2D maps filtered
+    // from cube maps). Only those get the storage usage: it can turn off Adreno's framebuffer compression. sRGB is not
+    // storable: written through a UNORM view (the stored values are raw, as the store does no encoding).
+    b->storage_format = 0;
+    if ((t->flags & 4) && !depthfmt && samples == 1) {
+        VkFormat sf = vf == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : vf == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM
+                    : vf == VK_FORMAT_A8B8G8R8_SRGB_PACK32 ? VK_FORMAT_A8B8G8R8_UNORM_PACK32 : vf;
+        if (format_supports(sf, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+            usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+            if (!format_supports(vf, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+            b->storage_format = sf;
+        } else {
+            LOG("[vk] image texture format %d (nvn %#x) not storable: its shader stores are dropped\n", vf, t->format);
+        }
+    }
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = type, .format = vf,
                             .extent = {tw, th, depth}, .mipLevels = levels, .arrayLayers = layers,
                             .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
@@ -321,9 +336,10 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         ci.format = vf = VK_FORMAT_R8G8B8A8_UNORM;
         ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        ci.flags &= ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+        ci.flags &= ~(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
         VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL));
         depthfmt = false;
+        b->storage_format = 0;
     }
     b->format = vf;
     b->width = tw; b->height = th; b->depth = depth; b->layers = layers; b->levels = levels; b->samples = samples;
@@ -738,6 +754,34 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
     if (nlog++ < 30) LOG("[tex] type mismatch: want %d have %d (%ux%ux%u target %u fmt %#x layers %u)\n", want, have, t->width,
                          t->height, t->depth, t->target, t->format, b->layers);
     return vk_dummy_view(want_textype);
+}
+
+// Storage view of an image texture (SUST): the level and layer the game registered (nvnTexturePoolRegisterImage
+// with a texture view), as a 2D image in the storage format.
+VkImageView vk_storage_view(NvnTexture *t, const NvnTextureView *v, bool has_view) {
+    TexBackend *b = vk_tex(t, true);
+    if (!b->storage_format || b->base_type == VK_IMAGE_VIEW_TYPE_3D) return VK_NULL_HANDLE;
+    if (!has_view) v = NULL;
+    uint32_t lv0 = v && (v->setmask & 1) ? v->base_level : 0, ly0 = v && (v->setmask & 2) ? v->min_layer : 0;
+    if (lv0 >= b->levels || ly0 >= b->layers) return VK_NULL_HANDLE;
+    return vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->storage_format, lv0, 1, ly0, 1, IDENTITY, VK_IMAGE_ASPECT_COLOR_BIT);
+}
+
+// 1x1 storage image for unbound or unstorable image slots: the stores land there
+VkImageView vk_dummy_storage_view(void) {
+    static TexBackend b;
+    static VkImageView view;
+    if (view) return view;
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+                            .extent = {1, 1, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                            .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_STORAGE_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &b.image, &b.mem, NULL));
+    vk_image_init_layout(vk_upload_cmd(), b.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    b.format = VK_FORMAT_R8G8B8A8_UNORM;
+    b.levels = b.layers = 1;
+    view = vk_image_view(&b, VK_IMAGE_VIEW_TYPE_2D, b.format, 0, 1, 0, 1, IDENTITY, VK_IMAGE_ASPECT_COLOR_BIT);
+    return view;
 }
 
 // 1x1 black textures for unbound slots, per type
