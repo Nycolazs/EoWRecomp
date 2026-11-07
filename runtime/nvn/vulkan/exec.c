@@ -473,7 +473,8 @@ static int new_chunk(uint64_t size) {
                              .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO,
+    // (coherent: nothing here flushes its writes - Turnip's first host-visible type isn't, and everything drew black)
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO, .requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
     if (getenv("EOWRECOMP_VK_RING_SYSMEM")) ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;  // (test: a GPU without resizable BAR)
     VmaAllocationInfo info;
@@ -483,8 +484,9 @@ static int new_chunk(uint64_t size) {
     if (!nchunks) {  // where the ring lives: device-local (resizable BAR) or system memory read across PCIe
         VkMemoryPropertyFlags f;
         vmaGetMemoryTypeProperties(g_vk.vma, info.memoryType, &f);
-        LOG("[vk] transient ring: memory type %u (%s%s%s)\n", info.memoryType, f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? "device-local " : "system memory ",
-            f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ? "host-visible " : "", f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? "cached" : "");
+        LOG("[vk] transient ring: memory type %u (%s%s%s%s)\n", info.memoryType, f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? "device-local " : "system memory ",
+            f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ? "host-visible " : "", f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ? "coherent " : "",
+            f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? "cached" : "");
     }
     return nchunks++;
 }
@@ -528,7 +530,7 @@ VkSpan vk_readback(uint64_t size) {
         if (buf) { vk_wait_seq(submit_seq); vmaDestroyBuffer(g_vk.vma, buf, mem); }
         cap = (size + (16 << 20) - 1) & ~((16ull << 20) - 1);
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = cap, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST, .requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                       .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
         VmaAllocationInfo info;
         VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &buf, &mem, &info));
@@ -1213,11 +1215,12 @@ static void compile_program(void *arg) {
     atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
 }
 
+static void gmem_translate_params(void);
+
 static void translate_program(void *arg) {
     Prog *p = arg;
     { static int g = -1; if (g < 0) { const char *e = getenv("EOWRECOMP_SHADER_GUARD"); g = e ? atoi(e) : 0; if (g > 0) maxwell_loop_guard = (uint32_t)g; } }
-    maxwell_gmem_base = HEAP_BASE;
-    maxwell_gmem_size = HEAP_MAX;
+    gmem_translate_params();
     pthread_mutex_lock(&translate_lock);
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
@@ -1916,10 +1919,25 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
 // Global memory (shader LDG/STG, maxwell_gmem_base = HEAP_BASE): the guest heap imported as a GPU buffer
 // (VK_EXT_external_memory_host), zero-copy like metal.m's g_guest_buffer, so compute results land in guest
 // memory. The import pins its pages, so it covers only the heap the game set up (SetHeapSize), made on first use.
+// Android (Adreno: no host pointer import): the heap is an AHardwareBuffer (platform/android.c), imported as is; the
+// shaders reach it through its buffer address (maxwell_gmem_bda), a storage buffer being limited to 128 MB there.
 // EOWRECOMP_VK_NO_GMEM=1: no import, reads return zero.
 static VkBuffer gmem_buf;
 static VkDeviceMemory gmem_mem;
 static uint64_t gmem_size;
+static int gmem_gen = -1;  // (AHardwareBuffer import) the heap memory's generation it was made for (plat_heap_gpu_handle)
+static pthread_mutex_t gmem_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void gmem_replace(VkBuffer buf, VkDeviceMemory mem, uint64_t size) {
+    if (gmem_buf) {  // the heap grew: the old import may still be in use by submitted work
+        vk_wait_seq(submit_seq);
+        vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
+        vkFreeMemory(g_vk.dev, gmem_mem, NULL);
+    }
+    gmem_buf = buf;
+    gmem_mem = mem;
+    gmem_size = size;
+}
 
 static bool gmem_import(uint64_t size) {
     PFN_vkGetMemoryHostPointerPropertiesEXT props =
@@ -1943,33 +1961,116 @@ static bool gmem_import(uint64_t size) {
     VkBuffer buf;
     if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) { vkFreeMemory(g_vk.dev, mem, NULL); return false; }
     vkBindBufferMemory(g_vk.dev, buf, mem, 0);
-    if (gmem_buf) {  // the heap grew: the old import may still be in use by submitted work
-        vk_wait_seq(submit_seq);
-        vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
-        vkFreeMemory(g_vk.dev, gmem_mem, NULL);
-    }
-    gmem_buf = buf;
-    gmem_mem = mem;
-    gmem_size = size;
+    gmem_replace(buf, mem, size);
     LOG("[vk] guest heap imported for shader global memory: %llu MB\n", (unsigned long long)(size >> 20));
     return true;
+}
+
+// (gmem_lock held) The heap's AHardwareBuffers imported, again whenever the heap got new memory: their buffer
+// addresses in gmem_addrs (binding GMEM_BUFFER_INDEX, buffer address mode). false: none / failed.
+static VkBuffer gmem_ahb_buf[GMEM_CHUNKS];
+static VkDeviceMemory gmem_ahb_mem[GMEM_CHUNKS];
+static VkDeviceAddress gmem_addrs[GMEM_CHUNKS];
+static uint64_t gmem_ahb_size;
+static bool gmem_import_ahb(void) {
+#ifdef __ANDROID__
+    uint64_t size;
+    int gen;
+    if (!plat_heap_gpu_handle(0, &size, &gen)) return false;
+    if (gmem_ahb_size && gen == gmem_gen) return true;
+    static int failed_gen = -1;
+    if (gen == failed_gen) return false;
+    failed_gen = gen;
+    if (gmem_ahb_size) {  // (the heap got new memory: the old imports may still be in use by submitted work)
+        vk_wait_seq(submit_seq);
+        for (int i = 0; i < GMEM_CHUNKS; i++)
+            if (gmem_ahb_buf[i]) vkDestroyBuffer(g_vk.dev, gmem_ahb_buf[i], NULL), vkFreeMemory(g_vk.dev, gmem_ahb_mem[i], NULL);
+        memset(gmem_ahb_buf, 0, sizeof gmem_ahb_buf), memset(gmem_addrs, 0, sizeof gmem_addrs);
+        gmem_ahb_size = 0;
+    }
+    PFN_vkGetAndroidHardwareBufferPropertiesANDROID get =
+        (PFN_vkGetAndroidHardwareBufferPropertiesANDROID)vkGetDeviceProcAddr(g_vk.dev, "vkGetAndroidHardwareBufferPropertiesANDROID");
+    for (int i = 0; i < GMEM_CHUNKS; i++) {
+        struct AHardwareBuffer *ahb = plat_heap_gpu_handle(i, &size, &gen);
+        if (!ahb) break;
+        uint64_t len = size - (uint64_t)i * GMEM_CHUNK_BYTES < GMEM_CHUNK_BYTES ? size - (uint64_t)i * GMEM_CHUNK_BYTES : GMEM_CHUNK_BYTES;
+        VkAndroidHardwareBufferPropertiesANDROID pr = {.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
+        VkResult r = get ? get(g_vk.dev, ahb, &pr) : VK_ERROR_EXTENSION_NOT_PRESENT;
+        if (r != VK_SUCCESS || !pr.memoryTypeBits) { LOG("[vk] heap AHardwareBuffer properties: %d\n", r); return false; }
+        VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                               .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = len,
+                                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
+        if ((r = vkCreateBuffer(g_vk.dev, &bi, NULL, &gmem_ahb_buf[i])) != VK_SUCCESS) { LOG("[vk] heap buffer: %d\n", r); return false; }
+        VkImportAndroidHardwareBufferInfoANDROID imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, .buffer = ahb};
+        VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = &imp, .buffer = gmem_ahb_buf[i]};
+        VkMemoryAllocateFlagsInfo fl = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .pNext = &ded,
+                                        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &fl, .allocationSize = pr.allocationSize,
+                                   .memoryTypeIndex = (uint32_t)__builtin_ctz(pr.memoryTypeBits)};
+        if ((r = vkAllocateMemory(g_vk.dev, &ai, NULL, &gmem_ahb_mem[i])) != VK_SUCCESS) {
+            LOG("[vk] heap AHardwareBuffer import: %d\n", r);  // (the pieces made so far stay until the next generation)
+            return false;
+        }
+        vkBindBufferMemory(g_vk.dev, gmem_ahb_buf[i], gmem_ahb_mem[i], 0);
+        VkBufferDeviceAddressInfo da = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = gmem_ahb_buf[i]};
+        gmem_addrs[i] = vkGetBufferDeviceAddress(g_vk.dev, &da);
+        if (!i) LOG("[vk] guest heap imported from its AHardwareBuffers: %llu MB (memory type %d)\n", (unsigned long long)(size >> 20),
+                    __builtin_ctz(pr.memoryTypeBits));
+    }
+    gmem_ahb_size = size;
+    gmem_gen = gen;
+    return true;
+#else
+    return false;
+#endif
+}
+
+// How the translator addresses global memory: the heap window, or (the heap's AHardwareBuffer imported) through its
+// buffer address, bounded by the imported size - past it the GPU would fault rather than read zero.
+static void gmem_translate_params(void) {
+    maxwell_gmem_base = HEAP_BASE;
+    maxwell_gmem_size = HEAP_MAX;
+    maxwell_gmem_bda = false;
+    if (!g_vk.ahb_import || getenv("EOWRECOMP_VK_NO_GMEM")) return;
+    pthread_mutex_lock(&gmem_lock);
+    if (gmem_import_ahb()) maxwell_gmem_bda = true, maxwell_gmem_size = gmem_ahb_size;
+    pthread_mutex_unlock(&gmem_lock);
 }
 
 static uint64_t gmem_tried;  // heap size the import was last attempted for (gmem_info imports / re-imports)
 
 static VkDescriptorBufferInfo gmem_info(void) {
     static int off = -1;
-    if (off < 0) off = getenv("EOWRECOMP_VK_NO_GMEM") != NULL || !g_vk.host_import;
-    uint64_t want = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
-    if (want > HEAP_MAX) want = HEAP_MAX;
-    if (!off && want > gmem_size && !gmem_import(want)) {
-        LOG("[vk] guest heap import failed (%llu MB): shader global memory reads return zero\n", (unsigned long long)(want >> 20));
-        off = 1;
+    if (off < 0) off = getenv("EOWRECOMP_VK_NO_GMEM") != NULL || (!g_vk.host_import && !g_vk.ahb_import);
+    if (!off && g_vk.ahb_import) {
+        pthread_mutex_lock(&gmem_lock);
+        gmem_import_ahb();
+        pthread_mutex_unlock(&gmem_lock);
+    } else {
+        uint64_t want = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
+        if (want > HEAP_MAX) want = HEAP_MAX;
+        if (!off && want > gmem_size && !gmem_import(want)) {
+            LOG("[vk] guest heap import failed (%llu MB): shader global memory reads return zero\n", (unsigned long long)(want >> 20));
+            off = 1;
+        }
     }
-    if (gmem_buf) return (VkDescriptorBufferInfo){gmem_buf, 0, gmem_size};
+    if (gmem_buf) {  // (a storage buffer can't be larger than the device allows: 128 MB on Adreno)
+        uint64_t range = gmem_size < g_vk.props.limits.maxStorageBufferRange ? gmem_size : g_vk.props.limits.maxStorageBufferRange;
+        return (VkDescriptorBufferInfo){gmem_buf, 0, range};
+    }
     static uint32_t zero[1024];
     VkSpan s = vk_transient_copy(zero, sizeof zero, 256);
     return (VkDescriptorBufferInfo){s.buf, s.off, sizeof zero};
+}
+
+// (buffer address mode) binding GMEM_BUFFER_INDEX: the heap pieces' buffer addresses, uvec2 each (translate.c)
+static VkDescriptorBufferInfo gmem_base_info(void) {
+    gmem_info();
+    uint32_t v[GMEM_CHUNKS][4] = {{0}};
+    for (int i = 0; i < GMEM_CHUNKS; i++) v[i][0] = (uint32_t)gmem_addrs[i], v[i][1] = (uint32_t)(gmem_addrs[i] >> 32);
+    VkSpan s = vk_transient_copy(v, sizeof v, 256);
+    return (VkDescriptorBufferInfo){s.buf, s.off, sizeof v};
 }
 
 // Compute dispatches that use global memory: the imported heap is host memory across PCIe on a discrete GPU, and a
@@ -2392,6 +2493,9 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 tex_wh[sg][ti][0] = wh[0]; tex_wh[sg][ti][1] = wh[1];
             }
             w[n].pImageInfo = &ii[n];
+        } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding == GMEM_BUFFER_INDEX) {
+            bi[n] = gmem_base_info();  // (buffer address mode: the heap's address)
+            w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding < 17) {
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
             w[n].pBufferInfo = &bi[n];
@@ -2460,8 +2564,7 @@ static CsProg *compute_program(NvnProgram *np) {
     for (int i = 0; i < n; i++) if (tab[i].addr == ss->code_addr) return tab[i].cp;
     CsProg *cp = calloc(1, sizeof *cp);
     if (n < 256) { tab[n].addr = ss->code_addr; tab[n].cp = cp; g_cs_n = n + 1; }
-    maxwell_gmem_base = HEAP_BASE;
-    maxwell_gmem_size = HEAP_MAX;
+    gmem_translate_params();
     ShaderKey k = {0};
     k.glsl = 1;
     pthread_mutex_lock(&translate_lock);
@@ -2959,9 +3062,9 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         pr->vi->cbuf_mask, pr->fi->cbuf_mask, st.rt.ncolor);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format);
     if (st.rt.depth) LOG(" d%#x %p", st.rt.depth->format, (void *)st.rt.depth);
-    LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n", st.viewport[0][0], st.viewport[0][1],
-        st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
-        st.channel_mask);
+    LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x | gmem vs %d fs %d\n", st.viewport[0][0],
+        st.viewport[0][1], st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2],
+        st.poly[0], st.poly[1], st.channel_mask, pr->vi->uses_gmem, pr->fi->uses_gmem);
     if (getenv("EOWRECOMP_DEBUG_DATA")) {  // vertex streams 0-1 and fragment cbufs: the first floats
         for (int s = 0; s < 2; s++) {
             if (!st.vbuf[s].addr) continue;

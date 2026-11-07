@@ -41,6 +41,11 @@ fetch https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/archive/
       c4f6bbe6b5a45c2eb610ca9d231158e313086d5b1a40c9922cb42b597419b14e VulkanMemoryAllocator-3.3.0.tar.gz
 fetch https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.4.350.1.tar.gz \
       078a9411298e4e0f60f5f5398c890783427c25a414619294ca8e69587bbd5eae volk-1.4.350.1.tar.gz
+# libadrenotools (BSD-2) + liblinkernsbypass: the system Vulkan loader opened onto a custom driver (Turnip, below)
+fetch https://github.com/bylaws/libadrenotools/archive/8fae8ce254dfc1344527e05301e43f37dea2df80.tar.gz \
+      ceffce971676d4cfdf348a082df06fc92a1dca6d95bea892a480d63f200961cb libadrenotools-8fae8ce.tar.gz
+fetch https://github.com/bylaws/liblinkernsbypass/archive/aa3975893d83ef1bc84c321ec60c65fbf1287887.tar.gz \
+      da1128c8aa771c4d24766b53a47822d0717baa5c536ca8491220402942b80638 liblinkernsbypass-aa39758.tar.gz
 
 if [ ! -f build/android/SDL3/CMakeLists.txt ]; then
     rm -rf build/android/SDL3 && mkdir -p build/android/SDL3
@@ -57,6 +62,11 @@ fi
 if [ ! -f "$P/include/volk/volk.c" ]; then
     unpack volk-1.4.350.1.tar.gz volk
     mkdir -p "$P/include/volk" && cp "$W/volk/volk.h" "$W/volk/volk.c" "$W/volk/LICENSE.md" "$P/include/volk/"
+fi
+if [ ! -f build/android/adrenotools/CMakeLists.txt ]; then
+    rm -rf build/android/adrenotools && mkdir -p build/android/adrenotools/lib/linkernsbypass
+    tar -xf "$S/libadrenotools-8fae8ce.tar.gz" -C build/android/adrenotools --strip-components 1
+    tar -xf "$S/liblinkernsbypass-aa39758.tar.gz" -C build/android/adrenotools/lib/linkernsbypass --strip-components 1
 fi
 
 # FFmpeg: static, LGPL only, just the movies' codecs (WebM: VP9 + Vorbis; the rest as on the other systems)
@@ -88,17 +98,14 @@ if [ ! -f "$P/lib/libshaderc_combined.a" ]; then
     cp "$W/shaderc/LICENSE" "$P/shaderc-LICENSE.txt"
     rm -rf "$W/shaderc"  # (~1 GB of sources and objects)
 fi
-# Mesa Turnip (MIT), the Vulkan 1.3 driver the app carries for Adreno 6xx / 7xx phones whose own driver is older (the
-# Galaxy S20 FE's is 1.1). K11MCH1's 24.3.0 R9v2 build: on the S20 FE (Adreno 650) it ran 28 of 28 test runs clean and
-# draws the overworld at native resolution in 24 ms of GPU time a frame, where 24.1.0 R18 (bundled before) took 35;
-# newer ones hung the GPU now and then (Mesa main 26.3.0-20261013: ~1 run in 8 of the overworld, kgsl "GPU hang
-# detected" between frames, also with TU_DEBUG=noubwc; 25.3.0 R11: device lost at the title; 26.0.0 R8: device lost
-# in the first frames; WeabChan's 25.3.0 Oct 2025 patched: 6% less GPU time in the overworld, but it restarted the
-# phone within a minute of play). Players can install another from the Video settings.
-TURNIP=turnip_v24.3.0_R9v2.zip
+# Mesa Turnip (MIT), the Vulkan driver the app carries for Adreno phones whose own driver is old (runtime/nvn/vulkan/
+# device.c loads it through libadrenotools; EOWRECOMP_DRIVER=system: the phone's). K11MCH1's 26.0.0 R8 build (Vulkan
+# 1.4.335): on an AYN Thor (Adreno 740) Echoes of Wisdom draws with it, where 24.3.0 R9v2 (LAS Recomp's choice for the
+# Adreno 650: newer ones hung that GPU) drew every pass black; it also has the shaderInt64 Qualcomm's 1.3.128 lacks.
+TURNIP=Turnip_v26.0.0_R8.zip
 if [ ! -f "$P/turnip/meta.json" ] || [ "$(cat "$P/turnip.zip.name" 2>/dev/null)" != "$TURNIP" ]; then
-    fetch https://github.com/K11MCH1/AdrenoToolsDrivers/releases/download/v24.3.0_r9/$TURNIP \
-          8a781186ed96d7f9b1620ae4caa508eb121b78af4b3777f0907dada34ce6714a $TURNIP
+    fetch https://github.com/K11MCH1/AdrenoToolsDrivers/releases/download/v26.0.0-rc08/$TURNIP \
+          e634db0f929e2205e95511c769071817d0390180ec72c8e690bc76375e813715 $TURNIP
     rm -rf "$P/turnip" && mkdir -p "$P/turnip" && unzip -o -q "$S/$TURNIP" -d "$P/turnip" && echo "$TURNIP" > "$P/turnip.zip.name"
 fi
 echo "deps: $P"

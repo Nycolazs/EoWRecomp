@@ -30,6 +30,12 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
 enum { PLAT_PROT_NONE = 0, PLAT_PROT_READ = 1, PLAT_PROT_RW = 3 };
 int plat_protect(uint64_t addr, uint64_t size, int prot);  // 0 on success
 #define PLAT_PAGE 0x4000ull  // largest page size we deal with (macOS 16K; multiple of Windows' 4K)
+// The guest heap [addr, addr+size) as memory the GPU can use in place (Android: an AHardwareBuffer mapped there, the
+// drivers having no VK_EXT_external_memory_host); its first old_size bytes are kept. false: not done, plain memory.
+bool plat_heap_gpu_backing(uint64_t addr, uint64_t size, uint64_t old_size);
+// That memory for the graphics API (Android: AHardwareBuffer i, each GMEM_CHUNK_BYTES of the heap), the heap's size,
+// and a generation that changes whenever the heap gets new memory (grown, rebooted). NULL: none.
+void *plat_heap_gpu_handle(int i, uint64_t *size, int *gen);
 
 // ---- time
 uint64_t plat_now_ns(void);                // monotonic

@@ -568,9 +568,11 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     case 0x01: {  // SetHeapSize
         uint64_t size = x[1];
         if (size > HEAP_MAX) { x[0] = R_OUT_OF_RESOURCE; break; }
+        uint64_t old = heap_size;
         heap_size = size;
         region_remove(HEAP_BASE);
         if (size) region_add(HEAP_BASE, size, 5, 3);
+        if (size) plat_heap_gpu_backing(HEAP_BASE, size, old);  // (phones: GPU-visible memory, runtime/platform/android.c)
         x[0] = R_OK;
         x[1] = HEAP_BASE;
         break;
