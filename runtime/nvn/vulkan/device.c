@@ -598,6 +598,15 @@ void backend_present(NvnTexture *t) {
     TexBackend *b = vk_tex(t, true);
     b->presented = true;
     vk_end_pass();
+    {   // the pipeline cache to disk every 30 s while new pipelines appear: phones end apps without exit() or a
+        // background event (killed, crashed), and Turnip takes seconds per new pipeline on an Adreno 740
+        extern _Atomic unsigned vk_pipelines_made;
+        static unsigned saved;
+        static uint64_t at;
+        uint64_t now = SDL_GetTicksNS();
+        unsigned m = atomic_load(&vk_pipelines_made);
+        if (m != saved && now - at > 30000000000ull) saved = m, at = now, vk_pipeline_cache_save();
+    }
     static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = SDL_GetTicksNS();
     bool have = vk_frame_begin(black);
