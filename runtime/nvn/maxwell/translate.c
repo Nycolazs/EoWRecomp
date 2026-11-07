@@ -920,6 +920,9 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int n = sz == 5 ? 2 : 1;
         char rb[16];
         const char *dyn = a == RZ ? NULL : reg(c, a, rb);
+        // LDC.64 into its own base register (R6 = c[R6 + 0x28], R7 = c[R6 + 0x2c]): both words from the base as it was -
+        // the second load read the first one's result (skinning matrices from the wrong bones)
+        if (dyn && n == 2) { sp(&c->body, "    { uint ldc_b = %s;\n", dyn); dyn = "ldc_b"; }
         for (int i = 0; i < n; i++) {
             char cb[256];
             cbuf_ref(c, idx, off + 4 * i, dyn, cb);
@@ -927,6 +930,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             if (dyn) c->info->cbuf_size[idx] = 0x10000;
             set_reg(c, d + i, cb);
         }
+        if (dyn && n == 2) sp(&c->body, "    }\n");
     } else if (OPM(0xd000000000000000ull, 0xf600000000000000ull)) {  // TEXS
         emit_texs(c, w, false);
     } else if (OPM(0xd200000000000000ull, 0xf600000000000000ull)) {  // TLDS
@@ -1696,7 +1700,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     p2r_done:;
     } else if (OPM(0xe250000000000000ull, 0xfff0000000000020ull)) {  // BRX reg + imm (relative)
         // computed targets can name a scheduling word; execution continues at the next slot (as for BRA)
-        sp(&c->body, "    { uint t = %uu + %s + 0x%08xu; if (((t >> 3) & 3u) == 0u) t += 8u; pc = t; continue; }\n", pc + 8, R(a),
+        sp(&c->body, c->fwd ? "    { uint t = %uu + %s + 0x%08xu; if (((t >> 3) & 3u) == 0u) t += 8u; pc = t; break; }\n"
+                            : "    { uint t = %uu + %s + 0x%08xu; if (((t >> 3) & 3u) == 0u) t += 8u; pc = t; continue; }\n", pc + 8, R(a),
            (uint32_t)sbits(w, 20, 24));
     } else if (OPM(0x50a0000000000000ull, 0xfff8000000000000ull)) {  // CSETP (zero/sign flags only)
         int test = (int)bits(w, 8, 5);
@@ -2042,6 +2047,41 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     return info;
 }
 
+// A BRX through a jump table, as the NVN compiler makes it: `IMNMX Ri, Ri, bound` (min, true predicate), `LDC Rd,
+// c[0x1][Ri' + off]` (Ri' = Ri << 2 in between), `BRX Rd + imm`, the table among the compiler's constants (cbuf 1, at
+// the blob's const_offset = max_size). Its bound + 1 targets go into label[] when all lie ahead in the program: the
+// structured form then takes the BRX as one more forward jump. Anything else: false (the dispatch loop as before).
+// Echoes of Wisdom's skinning vertex shader (12ee694000, a switch on the bone count) fell back to the dispatch loop:
+// 48 registers and ~575 spill loads/stores on Turnip, 3.3 ms a draw on an Adreno 740.
+static size_t prev_insn(size_t i) { return i % 4 == 1 ? i - 2 : i - 1; }
+static bool brx_targets(const uint8_t *code, const uint8_t *blob, size_t max_size, size_t i, size_t end, uint8_t *label) {
+    const uint64_t *ins = (const uint64_t *)code;
+    uint64_t brx = ins[i];
+    if (max_size >= 0x10000 || i < 6) return false;  // (no compiler constants known)
+    size_t li = prev_insn(i);
+    uint64_t ldc = ins[li];
+    if ((ldc & 0xfff8000000000000ull) != 0xef90000000000000ull || bits(ldc, 36, 5) != 1 || bits(ldc, 48, 3) == 5 ||
+        bits(ldc, 0, 8) != bits(brx, 8, 8))
+        return false;
+    int64_t bound = -1;
+    for (size_t k = li, n = 0; k > 4 && n < 8 && bound < 0; n++) {  // the clamp of the index, a few instructions back
+        k = prev_insn(k);
+        uint64_t w = ins[k];
+        if ((w & 0xfef8000000000000ull) == 0x3820000000000000ull && bits(w, 39, 3) == 7 && !bits(w, 42, 1) && !bits(w, 56, 1))
+            bound = (int64_t)bits(w, 20, 19);
+    }
+    uint32_t off = (uint32_t)bits(ldc, 20, 16);
+    if (bound < 0 || bound > 63) return false;
+    const uint32_t *table = (const uint32_t *)(blob + max_size + off);
+    uint32_t pc = (uint32_t)(i * 8);
+    for (int64_t k = 0; k <= bound; k++) {
+        int64_t t = norm_target((int64_t)pc + 8 + (int32_t)table[k] + sbits(brx, 20, 24));
+        if (t <= (int64_t)pc || (size_t)(t / 8) >= end || t % 8) return false;
+    }
+    for (int64_t k = 0; k <= bound; k++) label[norm_target((int64_t)pc + 8 + (int32_t)table[k] + sbits(brx, 20, 24)) / 8] = 1;
+    return true;
+}
+
 ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
     ShaderInfo *info = calloc(1, sizeof *info);
     info->stage = stage;
@@ -2111,10 +2151,12 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
                 }
             }
         }
-        if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) {  // BRX: any instruction may be a target
+        if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) {  // BRX: a known jump table, else any instruction a target
             any_branch = true;
-            forward = false;
-            memset(label, 1, end);
+            if (!brx_targets(code, blob, max_size, i, end, label)) {
+                forward = false;
+                memset(label, 1, end);
+            }
         }
         if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull || (w & 0xfff0000000000000ull) == 0xe340000000000000ull ||
             (w & 0xfff0000000000000ull) == 0xe350000000000000ull)
