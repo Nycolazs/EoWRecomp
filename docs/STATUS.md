@@ -50,17 +50,23 @@ seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p*
   (problema aberto 2) sumiu junto.
 - Opção de resolução "720p" (padrão no Android). Ferramentas: `EOWRECOMP_GPUPROF_DRAWS`, `EOWRECOMP_VK_STATS`,
   `EOWRECOMP_GLSL_OVERRIDE`.
+- **Corações** (HUD / seleção) eram quadrados vermelhos, também no Linux: o RGB565 do NVN é `B5G6R5` no Vulkan.
+- **Miniatura do save**: saves novos têm a imagem (a cópia textura -> buffer chega à memória do guest); os antigos
+  foram gravados com a cena preta e ficam pretos até serem sobrescritos.
+- Cache de pipelines gravado a cada 30 s enquanto surgem pipelines novos (o Android mata apps sem `exit()`).
 
 ### Ainda errado no Thor
-- **Corações** do HUD / seleção: quadrados vermelhos com o coração escuro (igual no Linux: `03_corridor_hud.jpg`).
-- **Miniatura do save** preta (também em saves novos).
+- O chão perto do Link "respira" de leve: pixels esparsos numa faixa diagonal mudam com a animação dele (parece ruído
+  de shadow map / luz; não é a precisão do depth: igual com D32). Prioridade baixa (usuário).
 - A lista "Which data would you like to load?" mostra as entradas vazias por alguns segundos.
-- Compute `eb20…` (SUST) sem tradução; primeira execução lenta enquanto o Turnip compila os pipelines.
+- Compute `eb20…` (SUST) sem tradução (~7 dispatches por frame pulados); primeira visita a uma cena trava alguns
+  segundos enquanto o Turnip compila os pipelines.
 
 ### Próximo passo (Android)
-1. Corações e miniatura (formatos / swizzle de textura; a miniatura é uma cópia da GPU para a memória do guest).
-2. 60 fps: a GPU já cabe (~13 ms); ver o que segura o modo 30 do jogo e o custo de CPU.
-3. Áudio e save em jogo mais longo; SUST.
+1. 30 fps estáveis é a meta do MVP (usuário): o prólogo fica em 30,0 (CPU do thread do jogo ~28 ms por frame no modo
+   30; GPU ~13 ms). Medir outras áreas (overworld) quando o jogo avançar.
+2. SUST (imagens de armazenamento) e o ruído do chão.
+3. Áudio e save em jogo mais longo.
 
 ### Como testar no Android
 `tools/android/build_deps.sh`, `(cd android && ./gradlew assembleDebug)`, `tools/android/build_game.sh extracted --apk`,
