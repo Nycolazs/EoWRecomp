@@ -3201,7 +3201,7 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
 
 static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     NvnTexture *t = (NvnTexture *)(uintptr_t)src->tex;
-    if (!t || !dst || dst < HEAP_BASE) return;
+    if (!t || !dst || dst < HEAP_BASE) { LOG("[copytex] to buffer skipped: destination %llx outside the heap\n", (unsigned long long)dst); return; }
     t = alias_read(t);
     vk_end_pass();
     const FormatInfo *fi;
@@ -3209,7 +3209,7 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     int level;
     uint64_t row, img;
     copy_region_dims(t, src, &fi, rg, &level, &row, &img);
-    if (!fi || !fi->bpb || fi->bpb == 3 || row % fi->bpb) return;
+    if (!fi || !fi->bpb || fi->bpb == 3 || row % fi->bpb) { LOG("[copytex] to buffer skipped: format %#x\n", t->format); return; }
     TexBackend *b = vk_tex(t, false);
     float tsx, tsy;
     renderer_texture_scale(t, &tsx, &tsy);

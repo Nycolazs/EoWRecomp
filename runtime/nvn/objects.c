@@ -453,7 +453,7 @@ NVN(nvnTextureWriteTexels) {
 }
 NVN(nvnTextureWriteTexelsStrided) { LOG("[nvn] WriteTexelsStrided not implemented\n"); (void)c; }
 NVN(nvnTextureReadTexels) { LOG("[nvn] ReadTexels not implemented\n"); (void)c; }
-NVN(nvnTextureReadTexelsStrided) { (void)c; }
+NVN(nvnTextureReadTexelsStrided) { LOG("[nvn] ReadTexelsStrided not implemented\n"); (void)c; }
 
 // ================================================================== samplers
 // SamplerBuilder (guest memory): only 0x40 bytes are guaranteed - Echoes of Wisdom keeps them on its stack, right
