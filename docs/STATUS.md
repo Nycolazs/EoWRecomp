@@ -68,7 +68,9 @@ seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p*
   primeira visita: são os draws pulados enquanto os pipelines compilam (assíncrono de propósito: sem travadas).
   Com o cache quente acontece quase só durante o fade do carregamento.
 - Thread do jogo (simpleperf, prólogo): 42% código do jogo, 22% kernel (sincronização: ~2500 trocas de contexto/s
-  no thread principal, 0 page faults), 21% runtime (`rt_dispatch` 9%: saltos indiretos), 4% Turnip.
+  no thread principal, 0 page faults), 21% runtime (`rt_dispatch` 9%: saltos indiretos), 4% Turnip. Onde os threads
+  bloqueiam (simpleperf `sched:sched_switch`): `svc_wait_process_wide_key` (condvar) e `svc_arbitrate_lock` (mutex
+  disputado), chamados de f_700c4f82b0 / f_700c4fa1f0 do SDK pelos workers do jogo (~17 000 trocas/s no processo).
 - Testado nesta sessão sem defeitos novos: cutscene de abertura do novo jogo (profundidade de campo), combate,
   bombas e explosões, tochas, escadas, menus de pausa (Key Items / System), lista de saves.
 
