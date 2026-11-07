@@ -355,6 +355,18 @@ const char *romfs_file_at(uint64_t off) {
     return NULL;
 }
 
+// A RomFS file's place in the image (rel: "region_common/movie/title.webm"), for host-side readers of game files
+// (hle/movie.c): the image is often no folder on disk (romfs.bin, or the game package itself: romfs.src).
+bool romfs_find(const char *rel, uint64_t *off, uint64_t *size) {
+    for (int i = 0; i < rom_nfiles; i++)
+        if (!strcmp(rom_files[i].path, rel)) { *off = rom_files[i].off; *size = rom_files[i].size; return true; }
+    return false;
+}
+
+ssize_t romfs_read_image(void *dst, uint64_t size, uint64_t off) {
+    return romfs_fd < 0 ? -1 : romfs_read(romfs_fd, dst, size, off);
+}
+
 // ------------------------------------------------------------------ IStorage (raw RomFS image)
 typedef struct { int fd; uint64_t size; } Storage;
 

@@ -164,12 +164,39 @@ static void ok(Cpu *c) { c->x[0] = 0; }
 // ------------------------------------------------------------------ Extractor
 typedef struct {
     AVFormatContext *fmt;
+    AVIOContext *io;                     // reads of the movie file inside the RomFS image (ex_set_data_source)
+    uint64_t rom_off, rom_size, rom_pos;
     int map[16], ntracks;  // exposed track -> stream
     uint64_t selected;  // bitmask of streams
     AVPacket *pkt;
     bool have_pkt, eof;
     bool skippable;  // the launch opening (forced on the first launch, no save yet): A / B / + ends it
 } Extractor;
+
+static void ex_close(Extractor *e) {
+    if (e->fmt) avformat_close_input(&e->fmt);
+    if (e->io) { av_freep(&e->io->buffer); avio_context_free(&e->io); }
+}
+
+static int rom_io_read(void *opaque, uint8_t *buf, int n) {
+    Extractor *e = opaque;
+    if (e->rom_pos >= e->rom_size) return AVERROR_EOF;
+    if ((uint64_t)n > e->rom_size - e->rom_pos) n = (int)(e->rom_size - e->rom_pos);
+    ssize_t r = romfs_read_image(buf, (uint64_t)n, e->rom_off + e->rom_pos);
+    if (r <= 0) return AVERROR(EIO);
+    e->rom_pos += (uint64_t)r;
+    return (int)r;
+}
+
+static int64_t rom_io_seek(void *opaque, int64_t off, int whence) {
+    Extractor *e = opaque;
+    whence &= ~AVSEEK_FORCE;
+    if (whence == AVSEEK_SIZE) return (int64_t)e->rom_size;
+    int64_t base = whence == SEEK_CUR ? (int64_t)e->rom_pos : whence == SEEK_END ? (int64_t)e->rom_size : 0;
+    if (base + off < 0) return AVERROR(EINVAL);
+    e->rom_pos = (uint64_t)(base + off);
+    return (int64_t)e->rom_pos;
+}
 
 static bool g_skip_held;           // ex_fill: A / B held at the last look
 static double g_skip_pressed_at;    // when they were pressed (0 = not yet)
@@ -213,13 +240,27 @@ static void ex_fill(Extractor *e) {
 static void ex_set_data_source(Cpu *c) {
     Extractor *e = self_state(c);
     const char *path = (const char *)(uintptr_t)c->x[2];
-    // "rom:/region_common/movie/title.webm" -> extracted/romfs/region_common/movie/title.webm
+    // "rom:/region_common/movie/title.webm": read from the game's RomFS image (romfs.bin, or the game package itself
+    // after the start screen's setup); a dev tree's extracted/romfs/ folder otherwise
     const char *rel = path && strstr(path, ":/") ? strstr(path, ":/") + 2 : path;
     char host[1024];
     snprintf(host, sizeof host, "%s/%s", g_romfs_dir, rel ? rel : "");
-    LOG("[movie] open %s -> %s\n", path ? path : "(null)", host);
-    if (avformat_open_input(&e->fmt, host, NULL, NULL) < 0 || avformat_find_stream_info(e->fmt, NULL) < 0) {
-        LOG("[movie] cannot open %s\n", host);
+    int r;
+    if (rel && romfs_find(rel, &e->rom_off, &e->rom_size)) {
+        LOG("[movie] open %s (RomFS image, %llu bytes)\n", path, (unsigned long long)e->rom_size);
+        e->rom_pos = 0;
+        uint8_t *buf = av_malloc(64 << 10);
+        e->io = avio_alloc_context(buf, 64 << 10, 0, e, rom_io_read, NULL, rom_io_seek);
+        e->fmt = avformat_alloc_context();
+        e->fmt->pb = e->io;
+        r = avformat_open_input(&e->fmt, NULL, NULL, NULL);
+    } else {
+        LOG("[movie] open %s -> %s\n", path ? path : "(null)", host);
+        r = avformat_open_input(&e->fmt, host, NULL, NULL);
+    }
+    if (r < 0 || avformat_find_stream_info(e->fmt, NULL) < 0) {
+        LOG("[movie] cannot open %s\n", path ? path : "(null)");
+        ex_close(e);
         c->x[0] = 1;
         return;
     }
@@ -345,7 +386,7 @@ static void movie_track(int kind, void *p, bool add) {
 
 static void ex_dtor(Cpu *c) {
     Extractor *e = self_state(c);
-    if (e && e->fmt) avformat_close_input(&e->fmt);
+    if (e) ex_close(e);
     if (e) movie_track(0, e, false);
     c->x[0] = 0;
 }
@@ -762,7 +803,7 @@ static void dec_dtor(Cpu *c) {
 RT_ON_RESET(movie_reset) {
     for (int i = 0; i < MAX_MOVIE_OBJS; i++) {
         Extractor *e = g_movie_objs[0][i];
-        if (e && e->fmt) avformat_close_input(&e->fmt);
+        if (e) ex_close(e);
         Decoder *d = g_movie_objs[1][i];
         if (d && d->ctx) avcodec_free_context(&d->ctx);
         g_movie_objs[0][i] = g_movie_objs[1][i] = NULL;

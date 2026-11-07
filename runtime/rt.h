@@ -84,3 +84,7 @@ void guest_call(Cpu *c, uint64_t addr);   // call guest function at addr (saves/
 uint64_t guest_sym(const char *name);     // cached loader_find_symbol, fatal if missing
 void *hle_alloc(uint64_t size);           // zeroed guest-visible memory (never freed)
 extern const char *g_romfs_dir;
+// RomFS files for host-side readers (services/fs.c; the image is open once the game mounted it): where `rel` is in
+// the image, and a read of the image (thread-safe).
+bool romfs_find(const char *rel, uint64_t *off, uint64_t *size);
+ssize_t romfs_read_image(void *dst, uint64_t size, uint64_t off);
