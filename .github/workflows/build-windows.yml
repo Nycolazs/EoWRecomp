@@ -68,7 +68,9 @@ jobs:
         run: |
           mkdir stage
           cp -r build/win/dist/EoWRecomp stage/EoWRecomp
-          cp build/win/eowrecomp.lib stage/eowrecomp.lib
+          # a biblioteca de importação do .exe (o Makefile só a gera junto com o eowgame.dll, que aqui não existe):
+          # o mesmo comando da regra $(IMPLIB)
+          build/zig-full/zig dlltool -m i386:x86-64 -D eowrecomp.exe -d tools/windows/eowrecomp.def -l stage/eowrecomp.lib
 
       - uses: actions/upload-artifact@v4
         with:
