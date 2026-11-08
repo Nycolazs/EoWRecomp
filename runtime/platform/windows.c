@@ -76,6 +76,10 @@ void plat_commit(uint64_t addr, uint64_t size) {
                 (unsigned long long)size, GetLastError());
 }
 
+// (the GPU imports the heap with VK_EXT_external_memory_host here)
+bool plat_heap_gpu_backing(uint64_t addr, uint64_t size, uint64_t old_size) { (void)addr, (void)size, (void)old_size; return false; }
+void *plat_heap_gpu_handle(int i, uint64_t *size, int *gen) { (void)i, *size = 0, *gen = 0; return NULL; }
+
 int plat_protect(uint64_t addr, uint64_t size, int prot) {
     DWORD p = prot == PLAT_PROT_NONE ? PAGE_NOACCESS : prot == PLAT_PROT_READ ? PAGE_READONLY : PAGE_READWRITE, old;
     if (addr >= g_lo && addr < g_hi) plat_commit(addr, size);
@@ -395,5 +399,6 @@ void plat_terminate(void) { TerminateProcess(GetCurrentProcess(), 0); }
 
 // (phones only: runtime/platform/android.c)
 void plat_thread_core(int role) { (void)role; }
+void plat_children_elsewhere(bool begin) { (void)begin; }
 void plat_frame_work(uint64_t busy_ns, uint64_t target_ns) { (void)busy_ns, (void)target_ns; }
 void plat_thread_name(const char *name) { (void)name; }

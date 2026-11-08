@@ -1,6 +1,7 @@
 // NVN objects, builders, and state objects (everything except command recording).
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "../kernel.h"
 #include "nvn.h"
@@ -453,7 +454,7 @@ NVN(nvnTextureWriteTexels) {
 }
 NVN(nvnTextureWriteTexelsStrided) { LOG("[nvn] WriteTexelsStrided not implemented\n"); (void)c; }
 NVN(nvnTextureReadTexels) { LOG("[nvn] ReadTexels not implemented\n"); (void)c; }
-NVN(nvnTextureReadTexelsStrided) { (void)c; }
+NVN(nvnTextureReadTexelsStrided) { LOG("[nvn] ReadTexelsStrided not implemented\n"); (void)c; }
 
 // ================================================================== samplers
 // SamplerBuilder (guest memory): only 0x40 bytes are guaranteed - Echoes of Wisdom keeps them on its stack, right
@@ -694,6 +695,18 @@ NVN(nvnQueuePresentTexture) {
     static int first = 1;  // (milestone marker: the game got as far as showing a frame)
     if (first) { first = 0; LOG("[nvn] first nvnQueuePresentTexture (window %llx, texture %d of %d)\n", A(1), i, w->num); }
     if (i >= 0 && i < w->num) backend_present(HOST(NvnTexture, w->textures[i]));
+    // NVN shows at most one image per `interval` vsyncs: a game presenting faster waits here, as on the console (the
+    // title screen's movie loop presented ~320 times a second on an Adreno 740, the GPU busy for nothing). Only with
+    // the vsync timer running (runtime/hle/vi.c starts it when the game asks for the vsync event); 0 = unpaced.
+    extern volatile uint64_t g_vsync_count;
+    static uint64_t last;
+    uint64_t v = __atomic_load_n(&g_vsync_count, __ATOMIC_RELAXED);
+    for (int n = 0; w->interval > 0 && v && last && v < last + (uint64_t)w->interval && n < 100; n++) {
+        struct timespec ts = {0, 1000000};
+        nanosleep(&ts, NULL);
+        v = __atomic_load_n(&g_vsync_count, __ATOMIC_RELAXED);
+    }
+    last = v;
 }
 
 // ================================================================== small state objects

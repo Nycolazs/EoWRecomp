@@ -4,6 +4,7 @@
 // eowrecomp.log in the data folder), backtraces come from the unwinder, and the "executable" is libmain.so.
 #define _GNU_SOURCE
 #include <SDL3/SDL.h>
+#include <android/hardware_buffer.h>
 #include <android/log.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -16,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/ucontext.h>
@@ -42,11 +44,104 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
 }
 
 static void wt_forget(uint64_t lo, uint64_t hi);
+static void heap_gpu_release(void);
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
     bool ok = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
                    -1, 0) == (void *)(uintptr_t)lo;
     wt_forget(lo, hi);  // (fresh writable pages: none of them clean)
+    heap_gpu_release();  // (its mapping is gone: the next SetHeapSize makes a new one)
     return ok;
+}
+
+// ---- the guest heap as GPU memory
+// Adreno drivers have no VK_EXT_external_memory_host, so the GPU couldn't see guest memory (shader global memory /
+// storage buffers read zero: no text on the file select, which draws its glyphs from a storage buffer). Instead the
+// heap itself is AHardwareBuffers (BLOBs the GPU can use as buffers) of GMEM_CHUNK_BYTES each (gralloc refuses one of
+// 3.2 GB): their dma-bufs are mapped one after another from HEAP_BASE, and Vulkan imports the same buffers
+// (VK_ANDROID_external_memory_android_hardware_buffer, nvn/vulkan/exec.c). The dma-buf's file descriptor comes
+// through AHardwareBuffer_sendHandleToUnixSocket, the NDK's way to hand a buffer to another process.
+// ponytail: the whole heap is real memory from the start (3.2 GB on Echoes of Wisdom); fine on the 12-16 GB phones
+// that can run the game at all. EOWRECOMP_HEAP_AHB=0: plain memory as before.
+#include "../nvn/maxwell/shader.h"  // (GMEM_CHUNK_BYTES, GMEM_CHUNKS)
+static AHardwareBuffer *heap_ahb[GMEM_CHUNKS];
+static uint64_t heap_ahb_size;
+static int heap_ahb_gen;
+
+static void heap_gpu_release(void) {
+    for (int i = 0; i < GMEM_CHUNKS; i++)
+        if (heap_ahb[i]) AHardwareBuffer_release(heap_ahb[i]), heap_ahb[i] = NULL;  // (Vulkan's import holds its own reference)
+    heap_ahb_size = 0, heap_ahb_gen++;
+}
+
+static int ahb_fd(AHardwareBuffer *b) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv)) return -1;
+    int fd = -1;
+    if (AHardwareBuffer_sendHandleToUnixSocket(b, sv[0]) == 0) {
+        char data[4096], ctl[CMSG_SPACE(16 * sizeof(int))];
+        struct iovec iov = {data, sizeof data};
+        struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof ctl};
+        if (recvmsg(sv[1], &m, 0) > 0)
+            for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
+                if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
+                int *fds = (int *)CMSG_DATA(c), nf = (int)((c->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+                for (int i = 0; i < nf; i++) {  // the first is the buffer's memory; the rest (gralloc metadata) not needed
+                    if (fd < 0) fd = fds[i];
+                    else close(fds[i]);
+                }
+            }
+    }
+    close(sv[0]), close(sv[1]);
+    return fd;
+}
+
+bool plat_heap_gpu_backing(uint64_t addr, uint64_t size, uint64_t old_size) {
+    static int on = -1;
+    if (on < 0) on = !getenv("EOWRECOMP_HEAP_AHB") || atoi(getenv("EOWRECOMP_HEAP_AHB"));
+    if (!on || !size || size > GMEM_CHUNKS * GMEM_CHUNK_BYTES) return false;
+    if (heap_ahb_size && size <= heap_ahb_size) return true;
+    int n = (int)((size + GMEM_CHUNK_BYTES - 1) / GMEM_CHUNK_BYTES);
+    AHardwareBuffer *b[GMEM_CHUNKS] = {0};
+    int fd[GMEM_CHUNKS];
+    uint8_t *tmp[GMEM_CHUNKS];
+    for (int i = 0; i < n; i++) {  // all pieces made and mapped aside first: a failure leaves the heap as it was
+        uint64_t len = i < n - 1 ? GMEM_CHUNK_BYTES : size - (uint64_t)i * GMEM_CHUNK_BYTES;
+        AHardwareBuffer_Desc d = {.width = (uint32_t)len, .height = 1, .layers = 1, .format = AHARDWAREBUFFER_FORMAT_BLOB,
+                                  .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
+                                           AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER};
+        fd[i] = -1, tmp[i] = MAP_FAILED;
+        if (AHardwareBuffer_allocate(&d, &b[i]) == 0 && (fd[i] = ahb_fd(b[i])) >= 0)
+            tmp[i] = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd[i], 0);
+        if (tmp[i] == MAP_FAILED) {
+            fprintf(stderr, "[heap] AHardwareBuffer %d of %llu MB failed (fd %d, errno %d): the GPU can't read guest memory\n", i,
+                    (unsigned long long)(len >> 20), fd[i], errno);
+            for (int k = 0; k <= i; k++) {
+                if (k < i) munmap(tmp[k], GMEM_CHUNK_BYTES);
+                if (fd[k] >= 0) close(fd[k]);
+                if (b[k]) AHardwareBuffer_release(b[k]);
+            }
+            return false;
+        }
+    }
+    for (int i = 0; i < n; i++) {  // the heap's contents so far (a grown heap), then the new memory in its place
+        uint64_t off = (uint64_t)i * GMEM_CHUNK_BYTES, len = i < n - 1 ? GMEM_CHUNK_BYTES : size - off;
+        if (old_size > off) memcpy(tmp[i], (void *)(uintptr_t)(addr + off), old_size - off < len ? old_size - off : len);
+        if (mmap((void *)(uintptr_t)(addr + off), len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd[i], 0) != (void *)(uintptr_t)(addr + off))
+            FATAL("[heap] remapping the heap failed (errno %d)\n", errno);  // (part of the old mapping is gone by now)
+        munmap(tmp[i], len);
+        close(fd[i]);
+    }
+    wt_forget(addr, addr + size);  // (new pages, all writable)
+    heap_gpu_release();
+    memcpy(heap_ahb, b, sizeof b);
+    heap_ahb_size = size;
+    fprintf(stderr, "[heap] %llu MB as GPU-visible memory (%d AHardwareBuffers)\n", (unsigned long long)(size >> 20), n);
+    return true;
+}
+
+void *plat_heap_gpu_handle(int i, uint64_t *size, int *gen) {
+    *size = heap_ahb_size, *gen = heap_ahb_gen;
+    return i >= 0 && i < GMEM_CHUNKS ? heap_ahb[i] : NULL;
 }
 
 
@@ -430,6 +525,24 @@ void plat_thread_core(int role) {
     CPU_OR(&big, &big, &g_core_sets[PLAT_CORE_MAIN]);
     if (role == PLAT_CORE_OTHER || sched_setaffinity(0, sizeof big, &big) != 0)
         fprintf(stderr, "[cpu] affinity: %s\n", strerror(errno));
+}
+
+// Threads inherit their creator's affinity: SDL's audio threads (SDLAudioP*, Java's AudioTrack), opened from a thread on
+// the render core, sat on the fastest core with the render thread. Around such a creation the caller moves to the
+// other cores and back.
+void plat_children_elsewhere(bool begin) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    static __thread cpu_set_t saved;
+    static __thread bool have;
+    pthread_once(&once, core_scan);
+    if (!g_core_on) return;
+    if (begin) {
+        have = sched_getaffinity(0, sizeof saved, &saved) == 0;
+        if (have) sched_setaffinity(0, sizeof g_core_sets[PLAT_CORE_OTHER], &g_core_sets[PLAT_CORE_OTHER]);
+    } else if (have) {
+        sched_setaffinity(0, sizeof saved, &saved);
+        have = false;
+    }
 }
 
 void plat_frame_work(uint64_t busy_ns, uint64_t target_ns) {

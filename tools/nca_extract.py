@@ -2,7 +2,9 @@
 
 Usage: nca_extract.py <prod.keys> <program.nca | game.nsp> <outdir> [--no-romfs] [--romfs-image] [--info]
 
-An .nsp (a PFS0 of NCAs) is read in place: its program NCA is found by content type, nothing is copied out.
+An .nsp (a PFS0 of NCAs) is read in place: its program NCA is found by content type, nothing is copied out. An NCA
+with a rights ID (most NSPs) is decrypted with its title key, as runtime/nxpkg.c does: from the NSP's ticket
+(<rights id>.tik), else from title.keys beside prod.keys.
 
 hactool (SciresM) can't read this game's program NCA: its RomFS section is stored through the BucketTree
 compression layer (LZ4 blocks, firmware 12+), and hactool aborts on it before writing even the ExeFS. Layout as in
@@ -51,8 +53,8 @@ class SubFile:
         return self.f.read(n)
 
 
-def nsp_ncas(path):
-    """[(name, offset, size)] of the .nca entries of an NSP (PFS0)."""
+def nsp_files(path):
+    """[(name, offset, size)] of all entries of an NSP (PFS0)."""
     with open(path, 'rb') as f:
         magic, n, strsz, _ = struct.unpack('<4sIII', f.read(0x10))
         if magic != b'PFS0':
@@ -65,27 +67,45 @@ def nsp_ncas(path):
     if have < end:  # (a copy cut short: the ExeFS and the RomFS's compression table sit at the program NCA's end)
         raise SystemExit(f'{path}: truncated, {have} bytes of {end} ({(end - have) / 2**20:.0f} MiB missing); '
                          'copy the NSP again')
-    out = []
-    for off, size, no, _ in ents:
-        name = names[no:names.index(b'\0', no)].decode()
-        if name.endswith('.nca') and not name.endswith('.cnmt.nca'):
-            out.append((name, data + off, size))
+    return [(names[no:names.index(b'\0', no)].decode(), data + off, size) for off, size, no, _ in ents]
+
+
+def nsp_ncas(path):
+    """[(name, offset, size)] of the .nca entries of an NSP (PFS0)."""
+    return [e for e in nsp_files(path) if e[0].endswith('.nca') and not e[0].endswith('.cnmt.nca')]
+
+
+def encrypted_title_keys(nsp, keys_path):
+    """{rights id: encrypted title key}: the NSP's tickets (title key block at 0x180, rights id at 0x2A0), then
+    title.keys beside prod.keys (<rights id> = <key>) for what they lack."""
+    out = {}
+    tk = os.path.join(os.path.dirname(keys_path), 'title.keys')
+    if os.path.exists(tk):
+        out.update({k.lower(): bytes.fromhex(v) for k, v in load_keys(tk).items()})
+    if nsp:
+        with open(nsp, 'rb') as f:
+            for name, off, size in nsp_files(nsp):
+                if name.endswith('.tik') and size >= 0x2B0:
+                    f.seek(off)
+                    tik = f.read(0x2B0)
+                    out[tik[0x2A0:0x2B0].hex()] = tik[0x180:0x190]
     return out
 
 
-def open_program_nca(path, keys):
+def open_program_nca(path, keys, keys_path):
     if not path.lower().endswith('.nsp'):
-        return Nca(path, keys)
+        return Nca(path, keys, title_keys=encrypted_title_keys(None, keys_path))
+    tks = encrypted_title_keys(path, keys_path)
     for name, off, _size in sorted(nsp_ncas(path), key=lambda e: -e[2]):
         nca = Nca(path, keys, off, need_sections=False)
         if nca.content_type == 0:
             print(f'{path}: program NCA {name}')
-            return Nca(path, keys, off)
+            return Nca(path, keys, off, title_keys=tks)
     raise SystemExit(f'{path}: no program NCA')
 
 
 class Nca:
-    def __init__(self, path, keys, base=0, need_sections=True):
+    def __init__(self, path, keys, base=0, need_sections=True, title_keys=None):
         self.f = SubFile(path, base)
         raw = self.f.read(0xC00)
         hk = bytes.fromhex(keys['header_key'])
@@ -103,10 +123,15 @@ class Nca:
         self.sdk = struct.unpack_from('<I', hdr, 0x21C)[0]
         gen = max(hdr[0x206], hdr[0x220])
         self.keygen = gen - 1 if gen else 0
-        if any(hdr[0x230:0x240]):
-            raise SystemExit('rights ID set: titlekey crypto is not supported (XCI program NCAs use the key area)')
-        kaek = bytes.fromhex(keys[f'key_area_key_application_{self.keygen:02x}'])
-        self.key_area = aes_ecb_dec(kaek, hdr[0x300:0x340])
+        rights = hdr[0x230:0x240]
+        if any(rights):  # title key crypto: the section key is the title key, decrypted with titlekek_<keygen>
+            enc = (title_keys or {}).get(rights.hex())
+            if enc is None:
+                raise SystemExit(f'rights ID {rights.hex()}: no title key (no ticket in the NSP, none in title.keys)')
+            self.ctr_key = aes_ecb_dec(bytes.fromhex(keys[f'titlekek_{self.keygen:02x}']), enc)
+        else:
+            kaek = bytes.fromhex(keys[f'key_area_key_application_{self.keygen:02x}'])
+            self.ctr_key = aes_ecb_dec(kaek, hdr[0x300:0x340])[0x20:0x30]  # AES-CTR key (index 2)
         self.sections = []
         for i in range(4):
             st, en = struct.unpack_from('<II', hdr, 0x240 + i * 16)
@@ -123,7 +148,7 @@ class Section:
         self.nca, self.idx, self.offset, self.size, self.fh = nca, idx, offset, size, fh
         self.version, self.fs_type, self.hash_type, self.enc_type = struct.unpack_from('<HBBB', fh, 0)
         self.ctr_hi = fh[0x140:0x148][::-1]  # generation + secure value, as the IV's upper half
-        self.key = nca.key_area[0x20:0x30]  # AES-CTR key (index 2)
+        self.key = nca.ctr_key
         if any(fh[0x148:0x178]) and struct.unpack_from('<Q', fh, 0x150)[0]:
             raise SystemExit(f'section {idx}: sparse storage is not supported')
         self.comp_off, self.comp_size = struct.unpack_from('<QQ', fh, 0x178)
@@ -299,7 +324,7 @@ def main():
     ap.add_argument('--info', action='store_true')
     ap.add_argument('--romfs-image', action='store_true')
     a = ap.parse_args()
-    nca = open_program_nca(a.nca, load_keys(a.keys))
+    nca = open_program_nca(a.nca, load_keys(a.keys), a.keys)
     print(f'title {nca.title_id:016x}  content type {nca.content_type}  sdk {nca.sdk >> 24}.{(nca.sdk >> 16) & 0xFF}.'
           f'{(nca.sdk >> 8) & 0xFF}  key generation {nca.keygen}')
     for s in nca.sections:

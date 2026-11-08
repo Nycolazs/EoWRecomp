@@ -23,6 +23,7 @@
 #include "shader.h"
 
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
+bool maxwell_gmem_bda;
 // Iteration limit of a branching shader's dispatch loop (a mistranslated branch can't hang the GPU forever).
 // EOWRECOMP_SHADER_GUARD overrides it (backends read it): a small one shows which shaders loop.
 uint32_t maxwell_loop_guard = 100000;
@@ -86,6 +87,7 @@ typedef struct {
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
+static size_t prev_insn(size_t i) { return i % 4 == 1 ? i - 2 : i - 1; }  // (index of the previous instruction, skipping control words)
 static int64_t sbits(uint64_t w, int lo, int n) {
     int64_t v = (int64_t)bits(w, lo, n);
     return (v & (1ll << (n - 1))) ? v - (1ll << n) : v;
@@ -160,6 +162,13 @@ static const char *operand_b(Ctx *c, uint64_t w, bool float_imm, char *buf) {
     }
 }
 #define B(fi) operand_b(c, w, (fi), alloca(128))
+
+// A video-instruction (VMNMX...) source: width 0/1 = byte, 2 = short (picked by the selector), 3 = the whole word.
+static void video_operand(char *buf, const char *v, int width, int sel, bool sgn) {
+    if (width == 3) { sprintf(buf, "%s", v); return; }
+    int len = width == 2 ? 16 : 8;
+    sprintf(buf, "%s(%s, 0x%xu)", sgn ? "bfe_s" : "bfe_u", v, (unsigned)((len << 8) | (sel * len)));
+}
 
 // The "C" operand of three-source ops: REG_39, or the cbuf/reg swap form (0x51/0x53/... classes).
 static const char *operand_c_for_ffma(Ctx *c, uint64_t w, char *buf, const char **b_out, char *bbuf) {
@@ -495,6 +504,22 @@ static int tex_slot(Ctx *c, uint32_t index, int type, bool shadow, bool array) {
     return s;
 }
 
+// bound image (SUST.B): one slot per handle location in the driver's binding table (c[2]: textures from 0x20, the
+// images bound with nvnCommandBufferBindImage(s) from 0x120, 8 bytes each)
+static int img_slot(Ctx *c, uint32_t offset) {
+    for (int s = 0; s < c->info->ntex; s++) {
+        const ShaderTexture *t = &c->info->tex[s];
+        if (t->is_image && t->handle_offset == offset) return s;
+    }
+    int s = c->info->ntex++;
+    if (s >= 31) { fail(c, "too many textures"); return 0; }
+    ShaderTexture *t = &c->info->tex[s];
+    t->type = TEXTYPE_2D;
+    t->is_image = true;
+    t->handle_offset = offset;
+    return s;
+}
+
 static const char *tex_type_name(int t) {
     switch (t) {
     case TEXTYPE_1D: return "1d";
@@ -509,8 +534,9 @@ static const char *tex_type_name(int t) {
 
 // Write texture results: component mask selects which of r,g,b,a go to consecutive registers.
 static void write_tex_result(Ctx *c, int slot, const char *call, uint32_t mask, int d0, int d1, bool texs, bool f16) {
-    sp(&c->body, "    { float4 t = %s;\n", call);
-    (void)slot;
+    // a stencil view (ShaderKey.stencil_tex): Maxwell returns the stencil value as the register's bits
+    bool stencil = c->glsl && c->key && slot >= 0 && slot < 16 && ((c->key->stencil_tex >> slot) & 1);
+    sp(&c->body, stencil ? "    { float4 t = uintBitsToFloat(%s);\n" : "    { float4 t = %s;\n", call);
     if (f16) {
         // TEXS/TLDS .F16: components (in mask order) packed as half pairs into d0 (lo, hi) and d1 (lo, hi)
         int comps[4], n = 0;
@@ -838,6 +864,60 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     write_tex_result(c, slot, call, mask, d, RZ, false, false);
 }
 
+// RED / ATOM on global memory: value register vr, address register a (a 64-bit pair with .E, bit 48) + signed offset
+// 28-47, size 0 = U32 / 1 = S32, op ADD MIN MAX INC DEC AND OR XOR EXCH; the old word goes to dst (RZ: dropped).
+static void gmem_atomic(Ctx *c, uint64_t w, int a, int vr, int dst, int size, int op) {
+    bool wide = bits(w, 48, 1);
+    int64_t off = sbits(w, 28, 20);
+    if (size > 1 || op > 8) { fail(c, "atomic size %d op %d", size, op); return; }
+    bool cas = (op == 1 || op == 2) && size == 1;  // S32 min/max: the uint words' atomicMin/Max would compare unsigned
+    if (op == 3 || op == 4) cas = true;                // INC / DEC (wrapping at the value, as CUDA's atomicInc/Dec)
+    if (cas && !c->glsl && op > 2) { fail(c, "atomic inc/dec"); return; }
+    static const char *const gl_op[] = {"atomicAdd", "atomicMin", "atomicMax", "", "", "atomicAnd", "atomicOr", "atomicXor",
+                                        "atomicExchange"};
+    static const char *const ms_op[] = {"atomic_fetch_add_explicit", "atomic_fetch_min_explicit", "atomic_fetch_max_explicit", "", "",
+                                        "atomic_fetch_and_explicit", "atomic_fetch_or_explicit", "atomic_fetch_xor_explicit",
+                                        "atomic_exchange_explicit"};
+    // GLSL compare-and-swap loop for the ops the uint atomics lack: the new word from the old one (o_) and the value (v_)
+    static const char *const gl_cas[] = {"", "uint(min(int(o_), int(v_)))", "uint(max(int(o_), int(v_)))",
+                                         "(o_ >= v_ ? 0u : o_ + 1u)", "((o_ == 0u || o_ > v_) ? v_ : o_ - 1u)"};
+    c->info->uses_gmem = true;
+    c->uses_gmem_store = true;
+    c->info->uses_gmem_store = true;
+    char addr[256];
+    if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
+    else if (wide) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
+    else sprintf(addr, "(ulong(%s) + ulong(%lld))", R(a), (long long)off);
+    sp(&c->body, "    { ulong ga = %s - 0x%llxul; bool ok = ga < 0x%llxul; uint v_ = %s, o_ = 0u;\n", addr,
+       (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size, R(vr));
+    if (c->glsl && cas) {
+        const char *word = "gmw(uint(ga >> 2))";
+        if (c->stage == STAGE_COMPUTE) {
+            c->info->uses_gmem_map = true;
+            sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
+            sp(&c->body, "      if (fw != 0xFFFFFFFFu) { o_ = gfast_.w[fw]; for (;;) { uint p_ = atomicCompSwap(gfast_.w[fw], o_, %s); "
+               "if (p_ == o_) break; o_ = p_; } }\n      else ", gl_cas[op]);
+        } else {
+            sp(&c->body, "      ");
+        }
+        sp(&c->body, "if (ok) { o_ = %s; for (;;) { uint p_ = atomicCompSwap(%s, o_, %s); if (p_ == o_) break; o_ = p_; } }\n",
+           word, word, gl_cas[op]);
+    } else if (c->glsl && c->stage == STAGE_COMPUTE) {  // (the dispatch's storage buffers have a device-local copy: see LDG / STG)
+        c->info->uses_gmem_map = true;
+        sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
+        sp(&c->body, "      if (fw != 0xFFFFFFFFu) o_ = %s(gfast_.w[fw], v_); else if (ok) o_ = %s(gmw(uint(ga >> 2)), v_);\n",
+           gl_op[op], gl_op[op]);
+    } else if (c->glsl) {
+        sp(&c->body, "      if (ok) o_ = %s(gmw(uint(ga >> 2)), v_);\n", gl_op[op]);
+    } else if (cas) {  // MSL: signed min/max on the word as an atomic_int
+        sp(&c->body, "      if (ok) o_ = uint(%s((device atomic_int *)(gmem + ga), int(v_), memory_order_relaxed));\n", ms_op[op]);
+    } else {
+        sp(&c->body, "      if (ok) o_ = %s((device atomic_uint *)(gmem + ga), v_, memory_order_relaxed);\n", ms_op[op]);
+    }
+    set_reg(c, dst, "o_");
+    sp(&c->body, "    }\n");
+}
+
 // ------------------------------------------------------------------ instruction translation
 static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     char t[2048], u[2048];
@@ -920,6 +1000,9 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int n = sz == 5 ? 2 : 1;
         char rb[16];
         const char *dyn = a == RZ ? NULL : reg(c, a, rb);
+        // LDC.64 into its own base register (R6 = c[R6 + 0x28], R7 = c[R6 + 0x2c]): both words from the base as it was -
+        // the second load read the first one's result (skinning matrices from the wrong bones)
+        if (dyn && n == 2) { sp(&c->body, "    { uint ldc_b = %s;\n", dyn); dyn = "ldc_b"; }
         for (int i = 0; i < n; i++) {
             char cb[256];
             cbuf_ref(c, idx, off + 4 * i, dyn, cb);
@@ -927,6 +1010,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             if (dyn) c->info->cbuf_size[idx] = 0x10000;
             set_reg(c, d + i, cb);
         }
+        if (dyn && n == 2) sp(&c->body, "    }\n");
     } else if (OPM(0xd000000000000000ull, 0xf600000000000000ull)) {  // TEXS
         emit_texs(c, w, false);
     } else if (OPM(0xd200000000000000ull, 0xf600000000000000ull)) {  // TLDS
@@ -1344,7 +1428,20 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         case 0x25: set_reg(c, d, "ctaid.x"); break;
         case 0x26: set_reg(c, d, "ctaid.y"); break;
         case 0x27: set_reg(c, d, "ctaid.z"); break;
-        case 0x00: set_reg(c, d, "0u"); break;
+        case 0x00:  // LANEID, and the lane masks EQ / LT / LE / GT / GE (0x38-0x3c) over the 32-lane warp. Warp-aggregated
+        case 0x38:  // appends (one ATOM per warp for the ballot's popcount, each lane at base + popcount(ballot & LTMASK),
+        case 0x39:  // compute 12a4711000) need them: as 0 every lane of a warp wrote the same slot. Vertex functions have
+        case 0x3a:  // no subgroup operations (their ballots are the lane's own, see VOTE): lane 0 there.
+        case 0x3b:
+        case 0x3c: {
+            const char *ln = "0u";
+            if (c->stage != STAGE_VERTEX) { c->uses_lane = true; ln = "lane"; }
+            static const char *const fm[] = {"%s", "(1u << %s)", "((1u << %s) - 1u)", "((2u << %s) - 1u)", "(~((2u << %s) - 1u))",
+                                             "(~((1u << %s) - 1u))"};
+            sprintf(t, fm[sr == 0 ? 0 : sr - 0x37], ln);
+            set_reg(c, d, t);
+            break;
+        }
         default: sprintf(t, "0u /* sr %#x */", sr); set_reg(c, d, t);
         }
     } else if (OPM(0x5c30000000000000ull, 0xfff8000000000000ull) || OPM(0x4c30000000000000ull, 0xfff8000000000000ull) ||
@@ -1444,7 +1541,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                     if (d != RZ) {
                         char fast[160], slow[160];
                         snprintf(fast, sizeof fast, gl_small[size], "gfast_.w[fw]");
-                        snprintf(slow, sizeof slow, gl_small[size], "gmem_.w[uint(ga >> 2)]");
+                        snprintf(slow, sizeof slow, gl_small[size], "gmw(uint(ga >> 2))");
                         c->reg_used[d] = 1;
                         sp(&c->body, "      r%d = fw != 0xFFFFFFFFu ? %s : ok ? %s : 0u;\n", d, fast, slow);
                     }
@@ -1452,7 +1549,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                     for (int k = 0; k < nw; k++)
                         if (d != RZ && d + k < RZ) {
                             c->reg_used[d + k] = 1;
-                            sp(&c->body, "      r%d = fw != 0xFFFFFFFFu ? gfast_.w[fw + %du] : ok ? gmem_.w[uint(ga >> 2) + %du] : 0u;\n",
+                            sp(&c->body, "      r%d = fw != 0xFFFFFFFFu ? gfast_.w[fw + %du] : ok ? gmw(uint(ga >> 2) + %du) : 0u;\n",
                                d + k, k, k);
                         }
                 }
@@ -1464,19 +1561,19 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                     const char *bm = size < 2 ? "3ul" : "2ul";
                     sp(&c->body, "      if (ok) { uint sh = uint(ga & %s) * 8u; uint v = (%s & 0x%xu) << sh;\n", bm, R(d), m);
                     sp(&c->body, "        if (fw != 0xFFFFFFFFu) { atomicAnd(gfast_.w[fw], ~(0x%xu << sh)); atomicOr(gfast_.w[fw], v); }\n", m);
-                    sp(&c->body, "        else { atomicAnd(gmem_.w[uint(ga >> 2)], ~(0x%xu << sh)); atomicOr(gmem_.w[uint(ga >> 2)], v); } }\n", m);
+                    sp(&c->body, "        else { atomicAnd(gmw(uint(ga >> 2)), ~(0x%xu << sh)); atomicOr(gmw(uint(ga >> 2)), v); } }\n", m);
                 } else {
                     for (int k = 0; k < nw; k++)
-                        sp(&c->body, "      if (fw != 0xFFFFFFFFu) gfast_.w[fw + %du] = %s; else if (ok) gmem_.w[uint(ga >> 2) + %du] = %s;\n", k,
+                        sp(&c->body, "      if (fw != 0xFFFFFFFFu) gfast_.w[fw + %du] = %s; else if (ok) gmw(uint(ga >> 2) + %du) = %s;\n", k,
                            R(d == RZ ? RZ : d + k), k, R(d == RZ ? RZ : d + k));
                 }
             }
-        } else if (c->glsl) {  // gmem_.w[]: 32-bit words; sub-word accesses within the containing word
+        } else if (c->glsl) {  // gmw(word): 32-bit words; sub-word accesses within the containing word
             static const char *const gl_small[] = {
-                "(gmem_.w[uint(ga >> 2)] >> (uint(ga & 3ul) * 8u)) & 0xFFu",
-                "uint(sx8(gmem_.w[uint(ga >> 2)] >> (uint(ga & 3ul) * 8u)))",
-                "(gmem_.w[uint(ga >> 2)] >> (uint(ga & 2ul) * 8u)) & 0xFFFFu",
-                "uint(sx16(gmem_.w[uint(ga >> 2)] >> (uint(ga & 2ul) * 8u)))"};
+                "(gmw(uint(ga >> 2)) >> (uint(ga & 3ul) * 8u)) & 0xFFu",
+                "uint(sx8(gmw(uint(ga >> 2)) >> (uint(ga & 3ul) * 8u)))",
+                "(gmw(uint(ga >> 2)) >> (uint(ga & 2ul) * 8u)) & 0xFFFFu",
+                "uint(sx16(gmw(uint(ga >> 2)) >> (uint(ga & 2ul) * 8u)))"};
             if (!store) {
                 if (size < 4) {
                     if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      if (ok) r%d = %s; else r%d = 0u;\n", d, gl_small[size], d); }
@@ -1484,18 +1581,18 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                     for (int k = 0; k < nw; k++)
                         if (d != RZ && d + k < RZ) {
                             c->reg_used[d + k] = 1;
-                            sp(&c->body, "      if (ok) r%d = gmem_.w[uint(ga >> 2) + %du]; else r%d = 0u;\n", d + k, k, d + k);
+                            sp(&c->body, "      if (ok) r%d = gmw(uint(ga >> 2) + %du); else r%d = 0u;\n", d + k, k, d + k);
                         }
                 }
             } else {
                 c->uses_gmem_store = true;
                 if (size < 4)
-                    sp(&c->body, "      if (ok) { uint wi = uint(ga >> 2); uint sh = uint(ga & %s) * 8u; atomicAnd(gmem_.w[wi], ~(0x%xu << sh)); "
-                       "atomicOr(gmem_.w[wi], (%s & 0x%xu) << sh); }\n", size < 2 ? "3ul" : "2ul", size < 2 ? 0xFFu : 0xFFFFu, R(d),
+                    sp(&c->body, "      if (ok) { uint wi = uint(ga >> 2); uint sh = uint(ga & %s) * 8u; atomicAnd(gmw(wi), ~(0x%xu << sh)); "
+                       "atomicOr(gmw(wi), (%s & 0x%xu) << sh); }\n", size < 2 ? "3ul" : "2ul", size < 2 ? 0xFFu : 0xFFFFu, R(d),
                        size < 2 ? 0xFFu : 0xFFFFu);
                 else
                     for (int k = 0; k < nw; k++)
-                        sp(&c->body, "      if (ok) gmem_.w[uint(ga >> 2) + %du] = %s;\n", k, R(d == RZ ? RZ : d + k));
+                        sp(&c->body, "      if (ok) gmw(uint(ga >> 2) + %du) = %s;\n", k, R(d == RZ ? RZ : d + k));
             }
         } else if (!store) {
             if (size < 4) {
@@ -1575,8 +1672,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int pd = (int)bits(w, 48, 3);
         if (c->stage == STAGE_VERTEX) {
             set_reg(c, d, R(a));  // no SIMD-group functions in vertex functions: lane-local value
-        } else if (c->glsl) {  // a quad xor (lane mask < 4) is the subgroup xor within the quad
-            static const char *const fn[] = {"subgroupShuffle", "subgroupShuffleUp", "subgroupShuffleDown", "subgroupShuffleXor"};
+        } else if (c->glsl) {  // 32-lane warps inside the subgroup (glsl_warp32); a quad xor (lane mask < 4) stays in its quad
+            static const char *const fn[] = {"wshfl", "wshfl_up", "wshfl_down", "wshfl_xor"};
             sprintf(t, "%s(%s, uint(%s))", fn[mode], R(a), bv);
             set_reg(c, d, t);
         } else if (mode == 3) {
@@ -1603,13 +1700,14 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         // Echoes of Wisdom's 50d9e3800007000e: VOTE.ANY R14, PT, PT (R14 = the active lanes).
         int mode = (int)bits(w, 48, 2), vp = (int)bits(w, 45, 3);
         if (mode > 2) fail(c, "vote mode %d", mode);
-        static const char *const gl[] = {"subgroupAll(vp_)", "subgroupAny(vp_)", "subgroupAllEqual(vp_)"};
+        static const char *const gl[] = {"(wballot(vp_) == wballot(true))", "(wballot(vp_) != 0u)",
+                                         "(wballot(vp_) == wballot(true) || wballot(vp_) == 0u)"};
         static const char *const ms[] = {"simd_all(vp_)", "simd_any(vp_)", "(simd_all(vp_) || !simd_any(vp_))"};
         bool lane = c->stage == STAGE_VERTEX;  // (no subgroup operations in vertex functions: this lane's own vote)
         sp(&c->body, "    { bool vp_ = %s;\n", P((int)bits(w, 39, 3), bits(w, 42, 1)));
         if (d != RZ) {
             c->reg_used[d] = 1;
-            sp(&c->body, "      r%d = %s;\n", d, lane ? "(vp_ ? 1u : 0u)" : c->glsl ? "subgroupBallot(vp_).x" : "uint(uint64_t(simd_ballot(vp_)))");
+            sp(&c->body, "      r%d = %s;\n", d, lane ? "(vp_ ? 1u : 0u)" : c->glsl ? "wballot(vp_)" : "uint(uint64_t(simd_ballot(vp_)))");
         }
         if (vp != PT) {
             c->pred_used[vp] = 1;
@@ -1619,53 +1717,12 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0xebf8000000000000ull, 0xfff8000000000000ull)) {  // RED: atomic reduction to global memory, no result
         // fields per Ryujinx's InstRed: value 0-7, address 8-15 (64-bit pair with .E, bit 48), size 20-22, op 23-25,
         // offset 28-47 (signed). Checked on Echoes of Wisdom's ebf9000003070002: RED.E.OR [R0], R2.
-        int size = (int)bits(w, 20, 3), op = (int)bits(w, 23, 3), vr = d;
-        bool wide = bits(w, 48, 1);
-        int64_t off = sbits(w, 28, 20);
-        if (size > 1) fail(c, "red size %d", size);
-        bool cas = (op == 1 || op == 2) && size == 1;  // S32 min/max: the uint words' atomicMin/Max would compare unsigned
-        if (op == 3 || op == 4) cas = true;                // INC / DEC (wrapping at the value, as CUDA's atomicInc/Dec)
-        if (cas && !c->glsl && op > 2) fail(c, "red inc/dec");
-        static const char *const gl_op[] = {"atomicAdd", "atomicMin", "atomicMax", "", "", "atomicAnd", "atomicOr", "atomicXor"};
-        static const char *const ms_op[] = {"atomic_fetch_add_explicit", "atomic_fetch_min_explicit", "atomic_fetch_max_explicit", "", "",
-                                            "atomic_fetch_and_explicit", "atomic_fetch_or_explicit", "atomic_fetch_xor_explicit"};
-        // GLSL compare-and-swap loop for the ops the uint atomics lack: the new word from the old one (o_) and the value (v_)
-        static const char *const gl_cas[] = {"", "uint(min(int(o_), int(v_)))", "uint(max(int(o_), int(v_)))",
-                                             "(o_ >= v_ ? 0u : o_ + 1u)", "((o_ == 0u || o_ > v_) ? v_ : o_ - 1u)"};
-        c->info->uses_gmem = true;
-        c->uses_gmem_store = true;
-        c->info->uses_gmem_store = true;
-        char addr[256];
-        if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
-        else if (wide) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
-        else sprintf(addr, "(ulong(%s) + ulong(%lld))", R(a), (long long)off);
-        sp(&c->body, "    { ulong ga = %s - 0x%llxul; bool ok = ga < 0x%llxul;\n", addr,
-           (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size);
-        if (c->glsl && cas) {
-            const char *word = "gmem_.w[uint(ga >> 2)]";
-            if (c->stage == STAGE_COMPUTE) {
-                c->info->uses_gmem_map = true;
-                sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
-                sp(&c->body, "      if (fw != 0xFFFFFFFFu) { uint v_ = %s, o_ = gfast_.w[fw]; for (;;) { uint p_ = atomicCompSwap(gfast_.w[fw], o_, %s); "
-                   "if (p_ == o_) break; o_ = p_; } }\n      else ", R(vr), gl_cas[op]);
-            } else {
-                sp(&c->body, "      ");
-            }
-            sp(&c->body, "if (ok) { uint v_ = %s, o_ = %s; for (;;) { uint p_ = atomicCompSwap(%s, o_, %s); if (p_ == o_) break; o_ = p_; } }\n",
-               R(vr), word, word, gl_cas[op]);
-        } else if (c->glsl && c->stage == STAGE_COMPUTE) {  // (the dispatch's storage buffers have a device-local copy: see LDG / STG)
-            c->info->uses_gmem_map = true;
-            sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
-            sp(&c->body, "      if (fw != 0xFFFFFFFFu) %s(gfast_.w[fw], %s); else if (ok) %s(gmem_.w[uint(ga >> 2)], %s);\n", gl_op[op],
-               R(vr), gl_op[op], R(vr));
-        } else if (c->glsl) {
-            sp(&c->body, "      if (ok) %s(gmem_.w[uint(ga >> 2)], %s);\n", gl_op[op], R(vr));
-        } else if (cas) {  // MSL: signed min/max on the word as an atomic_int
-            sp(&c->body, "      if (ok) %s((device atomic_int *)(gmem + ga), int(%s), memory_order_relaxed);\n", ms_op[op], R(vr));
-        } else {
-            sp(&c->body, "      if (ok) %s((device atomic_uint *)(gmem + ga), %s, memory_order_relaxed);\n", ms_op[op], R(vr));
-        }
-        sp(&c->body, "    }\n");
+        gmem_atomic(c, w, a, d, RZ, (int)bits(w, 20, 3), (int)bits(w, 23, 3));
+    } else if (OPM(0xed00000000000000ull, 0xff00000000000000ull)) {  // ATOM: atomic on global memory, old value to Rd
+        // As RED, but the value in 20-27, size 49-51, op 52-55 (envytools / yuzu's ATOM), and the old word returned.
+        // Seen as ed03000000500005 (ATOM.E.ADD.S32 R5, [R0], R5) in two compute shaders of the game (12a4711000,
+        // 12a4715000): unknown, every dispatch of theirs was skipped.
+        gmem_atomic(c, w, a, (int)bits(w, 20, 8), d, (int)bits(w, 49, 3), (int)bits(w, 52, 4));
     } else if (OPM(0x38f0000000000000ull, 0xfef8000000000000ull) || OPM(0x5cf0000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x4cf0000000000000ull, 0xfff8000000000000ull)) {  // R2P
         if (bits(w, 40, 1)) { fail(c, "r2p cc"); }
@@ -1696,7 +1753,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     p2r_done:;
     } else if (OPM(0xe250000000000000ull, 0xfff0000000000020ull)) {  // BRX reg + imm (relative)
         // computed targets can name a scheduling word; execution continues at the next slot (as for BRA)
-        sp(&c->body, "    { uint t = %uu + %s + 0x%08xu; if (((t >> 3) & 3u) == 0u) t += 8u; pc = t; continue; }\n", pc + 8, R(a),
+        sp(&c->body, c->fwd ? "    { uint t = %uu + %s + 0x%08xu; if (((t >> 3) & 3u) == 0u) t += 8u; pc = t; break; }\n"
+                            : "    { uint t = %uu + %s + 0x%08xu; if (((t >> 3) & 3u) == 0u) t += 8u; pc = t; continue; }\n", pc + 8, R(a),
            (uint32_t)sbits(w, 20, 24));
     } else if (OPM(0x50a0000000000000ull, 0xfff8000000000000ull)) {  // CSETP (zero/sign flags only)
         int test = (int)bits(w, 8, 5);
@@ -1725,6 +1783,44 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (!c->glsl) sp(&c->body, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
         else if (c->stage == STAGE_COMPUTE) sp(&c->body, "    barrier();\n");
         else sp(&c->body, "    /* bar */\n");  // GLSL barrier() is compute / tessellation only
+    } else if (c->glsl && OPM(0xeb20000000000000ull, 0xfff8000000000000ull)) {  // SUST.P.B: formatted image store, handle in a register
+        // fields per Ryujinx's InstSustB: data 0-7, coordinates 8-15, rgba mask 20-23, dimension 33-35, handle 39-46.
+        // Checked on Echoes of Wisdom's eb20138600f70018: SUST.P.B.2D.RGBA [R0], R24, R39 in compute 12a4723000,
+        // which filters cube maps into four 2D maps (handles from c[2][0x120..0x138]: bound images 0-3).
+        int hc = (int)bits(w, 39, 8), dim = (int)bits(w, 33, 3);
+        if (c->stage != STAGE_COMPUTE || dim != 3 || bits(w, 20, 4) != 15) { fail(c, "sust dim %d rgba %d", dim, (int)bits(w, 20, 4)); return; }
+        // the handle register is loaded from the binding table a few instructions back (MOV Rh, c[2][0x120 + 8 * slot])
+        const uint64_t *ins = (const uint64_t *)c->code;
+        uint32_t off = 0;
+        for (size_t k = pc / 8, n = 0; k > 1 && n < 64; n++) {
+            k = prev_insn(k);
+            if (bits(ins[k], 0, 8) != (uint64_t)hc) continue;
+            if ((ins[k] & 0xfff8000000000000ull) == 0x4c98000000000000ull && bits(ins[k], 34, 5) == 2) off = (uint32_t)bits(ins[k], 20, 14) * 4;
+            break;
+        }
+        if (off < 0x120 || off >= 0x160 || off % 8) { fail(c, "sust handle r%d not a bound image", hc); return; }
+        int s = img_slot(c, off);
+        sp(&c->body, "    imageStore(t%d, ivec2(int(%s), int(%s)), vec4(as_f(%s), as_f(%s), as_f(%s), as_f(%s)));\n", s, R(a), R(a + 1),
+           R(d), R(d + 1), R(d + 2), R(d + 3));
+    } else if (OPM(0x3a00000000000000ull, 0xfe00000000000000ull)) {  // VMNMX: d = min/max(min/max(a, b), c)
+        // A three-way signed max (word operands) in two compute shaders of the game (12a4711000, 12a4715000): unknown, they
+        // failed to translate and every dispatch of theirs was skipped. Layout as in envytools / yuzu's VMNMX: operand
+        // widths 37 (a) / 29 (b) with byte/short selectors below them, b an imm16 unless bit 50, the inner min/max (bit
+        // 56 = max) signed by b's sign, the outer op at 51 (5 = MIN, 6 = MAX) signed by bit 54.
+        if (bits(w, 47, 1) || bits(w, 55, 1)) { fail(c, "vmnmx cc/sat"); return; }
+        int op = (int)bits(w, 51, 3);
+        if (op != 5 && op != 6) { fail(c, "vmnmx merge op %d", op); return; }
+        bool breg = bits(w, 50, 1), sa = bits(w, 48, 1), sb = bits(w, 49, 1), so = bits(w, 54, 1);
+        char av[192], bv[192], ib[32], inner[512];
+        video_operand(av, R(a), (int)bits(w, 37, 2), (int)bits(w, 36, 2), sa);
+        if (breg) video_operand(bv, R((int)bits(w, 20, 8)), (int)bits(w, 29, 2), (int)bits(w, 28, 2), sb);
+        else { sprintf(ib, "0x%xu", (uint32_t)bits(w, 20, 16)); video_operand(bv, ib, 2, 0, sb); }
+        const char *f1 = bits(w, 56, 1) ? "max" : "min", *f2 = op == 6 ? "max" : "min";
+        if (sb) sprintf(inner, "uint(%s(int(%s), int(%s)))", f1, av, bv);
+        else sprintf(inner, "%s(%s, %s)", f1, av, bv);
+        if (so) sprintf(t, "uint(%s(int(%s), int(%s)))", f2, inner, R((int)bits(w, 39, 8)));
+        else sprintf(t, "%s(%s, %s)", f2, inner, R((int)bits(w, 39, 8)));
+        set_reg(c, d, t);
     } else {
         fail(c, "unknown instruction %016llx at %#x", (unsigned long long)w, pc);
     }
@@ -1747,7 +1843,7 @@ static void glsl_rewrite(Ctx *c, Str *o, const char *src) {
         {"float2", "vec2"}, {"float3", "vec3"}, {"float4", "vec4"}, {"int2", "ivec2"}, {"int3", "ivec3"},
         {"int4", "ivec4"}, {"uint2", "uvec2"}, {"uint3", "uvec3"}, {"uint4", "uvec4"}, {"bool2", "bvec2"},
         {"ulong", "uint64_t"}, {"rsqrt", "inversesqrt"}, {"rint", "roundEven"}, {"front_facing", "gl_FrontFacing"},
-        {"point_coord", "gl_PointCoord"}, {"lane", "gl_SubgroupInvocationID"}, {"vid", "uint(gl_VertexIndex)"},
+        {"point_coord", "gl_PointCoord"}, {"lane", "(gl_SubgroupInvocationID & 31u)"}, {"vid", "uint(gl_VertexIndex)"},
         {"iid", "uint(gl_InstanceIndex)"},
         // the MSL-named helpers of the GLSL preamble: Metal built-ins of the same names made MoltenVK's MSL
         // (SPIRV-Cross keeps function names) fail with "call to 'popcount' is ambiguous" (tools/test_moltenvk.sh)
@@ -1830,6 +1926,23 @@ static void glsl_rewrite(Ctx *c, Str *o, const char *src) {
     }
 }
 
+// MSL semantics: saturate(NaN) = 0, fmin/fmax return the non-NaN operand (Maxwell's FMNMX and .SAT). Spelled out
+// with isnan tests, or (maxwell_nmin) as GLSL.std.450 NClamp / NMin / NMax through GL_EXT_spirv_intrinsics, which have
+// exactly those NaN rules and become one min/max on Turnip instead of two compares and selects more (PokeZ-Android
+// aa9b699 on the same Thor: Z-A's lighting pass 2.50 -> 2.34 ms; switch-android-kit vulkan/shader-nmin-nmax.md).
+bool maxwell_nmin;
+static const char glsl_minmax_tests[] =
+    "float mw_saturate(float x) { return isnan(x) ? 0.0f : clamp(x, 0.0f, 1.0f); }\n"
+    "vec2 mw_saturate(vec2 x) { return vec2(mw_saturate(x.x), mw_saturate(x.y)); }\n"
+    "float mw_fmin(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : min(a, b)); }\n"
+    "float mw_fmax(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : max(a, b)); }\n";
+static const char glsl_minmax_nmin[] =
+    "spirv_instruction(set = \"GLSL.std.450\", id = 81) float mw_nclamp(float x, float lo, float hi);\n"
+    "float mw_saturate(float x) { return mw_nclamp(x, 0.0f, 1.0f); }\n"
+    "vec2 mw_saturate(vec2 x) { return vec2(mw_saturate(x.x), mw_saturate(x.y)); }\n"
+    "spirv_instruction(set = \"GLSL.std.450\", id = 79) float mw_fmin(float a, float b);\n"
+    "spirv_instruction(set = \"GLSL.std.450\", id = 80) float mw_fmax(float a, float b);\n";
+
 static const char glsl_prelude[] =
     "#version 460\n"
     "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n"
@@ -1852,11 +1965,6 @@ static const char glsl_prelude[] =
     "int sx8(int v) { return bitfieldExtract(v, 0, 8); }\n"
     "int sx16(uint v) { return bitfieldExtract(int(v), 0, 16); }\n"
     "int sx16(int v) { return bitfieldExtract(v, 0, 16); }\n"
-    // MSL semantics: saturate(NaN) = 0, fmin/fmax return the non-NaN operand
-    "float mw_saturate(float x) { return isnan(x) ? 0.0f : clamp(x, 0.0f, 1.0f); }\n"
-    "vec2 mw_saturate(vec2 x) { return vec2(mw_saturate(x.x), mw_saturate(x.y)); }\n"
-    "float mw_fmin(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : min(a, b)); }\n"
-    "float mw_fmax(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : max(a, b)); }\n"
     "uint mw_clz(uint v) { return v == 0u ? 32u : uint(31 - findMSB(v)); }\n"
     "uint mw_popcount(uint v) { return uint(bitCount(v)); }\n"
     "uint mw_mulhi(uint a, uint b) { uint hi, lo; umulExtended(a, b, hi, lo); return hi; }\n"
@@ -1879,6 +1987,17 @@ static const char glsl_prelude[] =
     "vec2 hx(uint v, uint swz) { if (swz == 1u) return vec2(uintBitsToFloat(v)); vec2 h = unpack_h2(v); return swz == 2u ? h.xx : (swz == 3u ? h.yy : h); }\n"
     "uint hpack(vec2 r, uint merge, uint old) { if (merge == 1u) return floatBitsToUint(r.x); uint lo = packHalf2x16(vec2(r.x, 0.0f)), hi = packHalf2x16(vec2(r.y, 0.0f)); if (merge == 2u) return (old & 0xFFFF0000u) | lo; if (merge == 3u) return (old & 0xFFFFu) | (hi << 16); return lo | (hi << 16); }\n"
     "uint prmt(uint a, uint b, uint sel) { uint r = 0u; for (uint i = 0u; i < 4u; i++) { uint s = (sel >> (i * 4u)) & 7u; uint bt = s < 4u ? (a >> (s * 8u)) & 0xFFu : (b >> ((s - 4u) * 8u)) & 0xFFu; r |= bt << (i * 8u); } return r; }\n";
+
+// Maxwell warps have 32 lanes; Vulkan subgroups can be wider (64 / 128 on Adreno): each 32 lanes of the subgroup act
+// as one warp - lane ids, shuffles, ballots and votes stay inside it. Echoes of Wisdom's light loop (fs 12ee66f300)
+// merges its light lists over the warp (ballot + shuffles): with subgroup-wide operations the upper 32 lanes took the
+// lower half's lights - 2x2-pixel sparkles around every light on an Adreno 740. A 32-lane subgroup: as before.
+static const char glsl_warp32[] =
+    "uint wballot(bool p) { return subgroupBallot(p)[gl_SubgroupInvocationID >> 5]; }\n"
+    "uint wshfl(uint v, uint i) { return subgroupShuffle(v, (gl_SubgroupInvocationID & ~31u) | (i & 31u)); }\n"
+    "uint wshfl_xor(uint v, uint m) { return subgroupShuffleXor(v, m & 31u); }\n"
+    "uint wshfl_up(uint v, uint d) { uint l = gl_SubgroupInvocationID & 31u; uint s = subgroupShuffle(v, gl_SubgroupInvocationID - min(d, l)); return d <= l ? s : v; }\n"
+    "uint wshfl_down(uint v, uint d) { uint l = gl_SubgroupInvocationID & 31u; uint s = subgroupShuffle(v, gl_SubgroupInvocationID + min(d, 31u - l)); return l + d < 32u ? s : v; }\n";
 
 static const char *glsl_sampler_type(const ShaderTexture *t) {
     static const char *const names[][2] = {
@@ -1903,7 +2022,13 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (c->fail) { free(body.buf); free(c->body.buf); free(c); return info; }
     int set = stage == STAGE_FRAGMENT ? 1 : 0;
     Str s = {0};
-    sp(&s, "%s", glsl_prelude);
+    // (extensions: before anything else in the source)
+    sp(&s, "#version 460\n%s%s", info->uses_gmem && maxwell_gmem_bda
+                                     ? "#extension GL_EXT_buffer_reference : require\n#extension GL_EXT_buffer_reference_uvec2 : require\n"
+                                     : "",
+       maxwell_nmin ? "#extension GL_EXT_spirv_intrinsics : require\n" : "");
+    sp(&s, "%s%s", glsl_prelude + strlen("#version 460\n"), maxwell_nmin ? glsl_minmax_nmin : glsl_minmax_tests);
+    if (stage != STAGE_VERTEX) sp(&s, "%s", glsl_warp32);
     for (int i = 0; i < 18; i++) {
         if (!(info->cbuf_mask & (1u << i))) continue;
         uint32_t n = info->cbuf_size[i] / 16;
@@ -1912,9 +2037,17 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (!n) n = 1;
         sp(&s, "layout(std140, set = %d, binding = %d) uniform CB%d { uvec4 cb%d[%u]; };\n", set, i, i, i, n);
     }
-    if (info->uses_gmem)
+    if (info->uses_gmem && maxwell_gmem_bda) {  // the heap's pieces through their addresses (shader.h)
+        sp(&s, "layout(std140, set = %d, binding = %d) uniform GMemBase { uvec4 gmem_base[%d]; };\n", set, GMEM_BUFFER_INDEX, GMEM_CHUNKS);
+        sp(&s, "layout(buffer_reference, std430, buffer_reference_align = 4) %sbuffer GMemRef { uint w[]; };\n",
+           c->uses_gmem_store ? "" : "readonly ");
+        sp(&s, "#define gmw(i) GMemRef(gmem_base[(i) >> %du].xy).w[(i) & 0x%xu]\n", GMEM_CHUNK_LOG2 - 2,
+           (unsigned)((GMEM_CHUNK_BYTES >> 2) - 1));
+    } else if (info->uses_gmem) {
         sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GMem { uint w[]; } gmem_;\n", set, GMEM_BUFFER_INDEX,
            c->uses_gmem_store ? "" : "readonly ");
+        sp(&s, "#define gmw(i) gmem_.w[i]\n");
+    }
     if (info->uses_gmem_map) {  // (compute) the dispatch's storage buffers, device-local: gmap[i] = heap offset, size, word
         sp(&s, "layout(std140, set = %d, binding = %d) uniform GMap { uvec4 gmap[%d]; };\n", set, GMAP_BUFFER_INDEX, GMAP_MAX + 1);
         sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GFast { uint w[]; } gfast_;\n", set, GFAST_BUFFER_INDEX,
@@ -1934,7 +2067,13 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     }
     for (int i = 0; i < info->ntex; i++) {
         ShaderTexture *t = &info->tex[i];
-        sp(&s, "layout(set = %d, binding = %d) uniform %s t%d;\n", set, 32 + i, glsl_sampler_type(t), i);
+        if (t->is_image) {  // (written only; no format qualifier: shaderStorageImageWriteWithoutFormat)
+            sp(&s, "layout(set = %d, binding = %d) uniform writeonly image2D t%d;\n", set, 32 + i, i);
+            continue;
+        }
+        // the stencil of a depth-stencil texture: an integer sampler, its value as bits (write_tex_result)
+        bool stencil = key && i < 16 && ((key->stencil_tex >> i) & 1) && !t->shadow;
+        sp(&s, "layout(set = %d, binding = %d) uniform %s%s t%d;\n", set, 32 + i, stencil ? "u" : "", glsl_sampler_type(t), i);
         // size of level l as (width, height, depth or layers)
         switch (t->type) {
         case TEXTYPE_1D: sp(&s, "ivec3 tsize%d(int l) { return ivec3(textureSize(t%d, l), 1, 1); }\n", i, i); break;
@@ -2042,6 +2181,40 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     return info;
 }
 
+// A BRX through a jump table, as the NVN compiler makes it: `IMNMX Ri, Ri, bound` (min, true predicate), `LDC Rd,
+// c[0x1][Ri' + off]` (Ri' = Ri << 2 in between), `BRX Rd + imm`, the table among the compiler's constants (cbuf 1, at
+// the blob's const_offset = max_size). Its bound + 1 targets go into label[] when all lie ahead in the program: the
+// structured form then takes the BRX as one more forward jump. Anything else: false (the dispatch loop as before).
+// Echoes of Wisdom's skinning vertex shader (12ee694000, a switch on the bone count) fell back to the dispatch loop:
+// 48 registers and ~575 spill loads/stores on Turnip, 3.3 ms a draw on an Adreno 740.
+static bool brx_targets(const uint8_t *code, const uint8_t *blob, size_t max_size, size_t i, size_t end, uint8_t *label) {
+    const uint64_t *ins = (const uint64_t *)code;
+    uint64_t brx = ins[i];
+    if (max_size >= 0x10000 || i < 6) return false;  // (no compiler constants known)
+    size_t li = prev_insn(i);
+    uint64_t ldc = ins[li];
+    if ((ldc & 0xfff8000000000000ull) != 0xef90000000000000ull || bits(ldc, 36, 5) != 1 || bits(ldc, 48, 3) == 5 ||
+        bits(ldc, 0, 8) != bits(brx, 8, 8))
+        return false;
+    int64_t bound = -1;
+    for (size_t k = li, n = 0; k > 4 && n < 8 && bound < 0; n++) {  // the clamp of the index, a few instructions back
+        k = prev_insn(k);
+        uint64_t w = ins[k];
+        if ((w & 0xfef8000000000000ull) == 0x3820000000000000ull && bits(w, 39, 3) == 7 && !bits(w, 42, 1) && !bits(w, 56, 1))
+            bound = (int64_t)bits(w, 20, 19);
+    }
+    uint32_t off = (uint32_t)bits(ldc, 20, 16);
+    if (bound < 0 || bound > 63) return false;
+    const uint32_t *table = (const uint32_t *)(blob + max_size + off);
+    uint32_t pc = (uint32_t)(i * 8);
+    for (int64_t k = 0; k <= bound; k++) {
+        int64_t t = norm_target((int64_t)pc + 8 + (int32_t)table[k] + sbits(brx, 20, 24));
+        if (t <= (int64_t)pc || (size_t)(t / 8) >= end || t % 8) return false;
+    }
+    for (int64_t k = 0; k <= bound; k++) label[norm_target((int64_t)pc + 8 + (int32_t)table[k] + sbits(brx, 20, 24)) / 8] = 1;
+    return true;
+}
+
 ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
     ShaderInfo *info = calloc(1, sizeof *info);
     info->stage = stage;
@@ -2056,6 +2229,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     // compute programs have no SPH. Older NVN (Link's Awakening): no header either, code starts at the blob. Newer NVN
     // (Echoes of Wisdom, SDK 16.2): a 0x100-byte header starting with the magic 0x12345679 (graphics: 0x12345678).
     if (stage == STAGE_COMPUTE) code = *(const uint32_t *)blob == 0x12345679u ? blob + 0x100 : blob;
+    c->code = code;
     if (stage == STAGE_FRAGMENT) {
         c->omap_target = *(const uint32_t *)(sph + 0x48);
         c->omap_depth = (*(const uint32_t *)(sph + 0x4C) >> 1) & 1;
@@ -2111,10 +2285,12 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
                 }
             }
         }
-        if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) {  // BRX: any instruction may be a target
+        if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) {  // BRX: a known jump table, else any instruction a target
             any_branch = true;
-            forward = false;
-            memset(label, 1, end);
+            if (!brx_targets(code, blob, max_size, i, end, label)) {
+                forward = false;
+                memset(label, 1, end);
+            }
         }
         if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull || (w & 0xfff0000000000000ull) == 0xe340000000000000ull ||
             (w & 0xfff0000000000000ull) == 0xe350000000000000ull)
@@ -2287,8 +2463,8 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         sp(&s, "fragment FOut main0(FIn in [[stage_in]], bool front_facing [[front_facing]]%s%s) {\n",
            c->uses_lane ? ", uint lane [[thread_index_in_simdgroup]]" : "", args.buf ? args.buf : "");
     } else {
-        sp(&s, "kernel void main0(uint3 tid [[thread_position_in_threadgroup]], uint3 ctaid [[threadgroup_position_in_grid]]%s) {\n",
-           args.buf ? args.buf : "");
+        sp(&s, "kernel void main0(uint3 tid [[thread_position_in_threadgroup]], uint3 ctaid [[threadgroup_position_in_grid]]%s%s) {\n",
+           c->uses_lane ? ", uint lane [[thread_index_in_simdgroup]]" : "", args.buf ? args.buf : "");
     }
     free(args.buf);
     for (int i = 0; i < 256; i++)

@@ -17,7 +17,8 @@ typedef struct __attribute__((aligned(16))) Cpu {
     uint64_t fpcr;           // 320: guest FPCR/FPSR (portable FP/SIMD lowering only; the asm path uses the host's)
     uint64_t fpsr;           // 328
     uint64_t excl_hi;        // 336: upper half of an exclusive pair (LDXP)
-    uint8_t _pad[512 - 344];
+    void *dcache;            // 344: this thread's indirect-call cache (runtime/dispatch.c), allocated on first use
+    uint8_t _pad[512 - 352];
     __uint128_t v[32];       // 512
 } Cpu;
 

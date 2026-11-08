@@ -70,6 +70,9 @@ target_compile_options(main PRIVATE -fsigned-char -fno-strict-aliasing
 # the crash backtraces use them)
 target_link_options(main PRIVATE "-Wl,-z,max-page-size=16384" "-Wl,-Bsymbolic" "-Wl,--exclude-libs,ALL"
                                  "-Wl,-z,nostart-stop-gc")  # (the HLE / service / reset tables: sections kept whole)
-target_link_libraries(main PRIVATE SDL3::SDL3-shared
+# libadrenotools (tools/android/build_deps.sh): Vulkan through a custom driver (Turnip, runtime/nvn/vulkan/device.c);
+# its hooks main_hook / hook_impl are libraries of their own in the APK (build.gradle targets)
+add_subdirectory(${ROOT}/build/android/adrenotools ${CMAKE_BINARY_DIR}/adrenotools)
+target_link_libraries(main PRIVATE SDL3::SDL3-shared adrenotools
                       ${DEPS}/lib/libavformat.a ${DEPS}/lib/libavcodec.a ${DEPS}/lib/libswscale.a ${DEPS}/lib/libavutil.a
                       ${DEPS}/lib/libshaderc_combined.a android log m dl)

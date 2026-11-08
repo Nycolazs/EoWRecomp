@@ -45,6 +45,8 @@ typedef struct {
                             // after flip_y: keys without it hash as before - shader caches stay valid.)
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
+    uint16_t stencil_tex;   // (GLSL) texture slots bound to the stencil of a depth-stencil texture: integer samplers,
+                            // the stencil value returned as raw bits (in the padding: other keys hash as before)
 } ShaderKey;
 
 typedef struct {
@@ -87,6 +89,15 @@ typedef struct {
 #define GMAP_MAX 16  // ranges in the table (GMap { uvec4 gmap[GMAP_MAX + 1]; }: [i] = addr lo, addr hi, size, word offset;
                      // [GMAP_MAX].x = count)
 extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
+// (GLSL) global memory through buffer addresses instead of a storage buffer: binding GMEM_BUFFER_INDEX is then
+// `uniform GMemBase { uvec4 gmem_base[GMEM_CHUNKS]; }`, [i].xy the address of the heap's i-th GMEM_CHUNK_BYTES (the
+// heap's memory comes in pieces of that size, maxwell_gmem_size in all), read with GL_EXT_buffer_reference(_uvec2).
+// For drivers that can't import guest memory as a host pointer (Android / Adreno). Either way the shaders reach a
+// 32-bit word of global memory as gmw(word index).
+extern bool maxwell_gmem_bda;
+#define GMEM_CHUNK_LOG2 29  // 512 MB
+#define GMEM_CHUNK_BYTES (1ull << GMEM_CHUNK_LOG2)
+#define GMEM_CHUNKS 8       // (HEAP_MAX, 3.25 GB, in 512 MB pieces: 7)
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;
@@ -103,3 +114,4 @@ void maxwell_free(ShaderInfo *s);
 void maxwell_disassemble(const uint8_t *code, size_t max_size, int stage, void *file);
 
 extern uint32_t maxwell_loop_guard;  // translate.c
+extern bool maxwell_nmin;  // translate.c: (GLSL) fmin / fmax / saturate as GLSL.std.450 NMin / NMax / NClamp

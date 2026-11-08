@@ -37,6 +37,7 @@ uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
 #define PROF_T0() uint64_t prof_t0_ = prof ? SDL_GetTicksNS() : 0
 #define PROF_ADD(v) do { if (prof) v += SDL_GetTicksNS() - prof_t0_; } while (0)
 static _Atomic int stat_compiles;
+_Atomic unsigned vk_pipelines_made;  // (never reset: device.c saves the pipeline cache when it grew)
 static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
 static char stats_text[2048];
@@ -59,10 +60,28 @@ static uint64_t submit_seq;  // last submitted
 static pthread_mutex_t seq_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool in_pass;
 
+// The last submission known done, without asking the driver. vkGetSemaphoreCounterValue - and a zero-timeout
+// vkWaitSemaphores just the same - on Turnip (kgsl) block until the submission just made has finished: ~11 ms after
+// each frame's main submission, measured on an AYN Thor, and the render thread asks at every submission
+// (vk_collect_dead) and in the upload / vertex cache recycling. So the game and the GPU ran in turns: the rift chase at
+// the end of the prologue ran at 24 fps with both idle half the time. Instead each submission ends by writing its
+// number into a small host-coherent buffer, which the CPU reads. vk_wait_seq still waits through the timeline.
+static VkBuffer seq_buf;
+static VmaAllocation seq_mem;
+static volatile uint64_t *seq_ptr;
+static _Atomic uint64_t g_done_seq;
 uint64_t vk_completed_seq(void) {
     uint64_t v = 0;
-    vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v);
-    return v;
+    if (seq_ptr) v = *seq_ptr;
+    else vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v);
+    if (v > submit_seq) v = submit_seq;  // (never ahead of what was submitted)
+    uint64_t prev = atomic_load(&g_done_seq);
+    while (prev < v && !atomic_compare_exchange_weak(&g_done_seq, &prev, v)) {}
+    return v > prev ? v : prev;
+}
+static void seq_note_done(uint64_t seq) {  // (a wait on the timeline succeeded)
+    uint64_t prev = atomic_load(&g_done_seq);
+    while (prev < seq && !atomic_compare_exchange_weak(&g_done_seq, &prev, seq)) {}
 }
 
 // (EOWRECOMP_VK_PROF) waits on the GPU by cause: the caller names it in wait_why just before waiting
@@ -80,22 +99,54 @@ static void wait_account(uint64_t ns) {
 
 static void cq_resolve_done(uint64_t done);
 
+// The timeline semaphore (g_vk.timeline) signalled by every submission, or only the completion marker (seq_buf):
+// Turnip on kgsl emulates timelines, and each vkQueueSubmit signalling one first waited on the CPU for the earlier
+// points (vk_sync_timeline_gc_locked -> kgsl_syncobj_wait): the game's main thread sat a third of every frame there
+// (simpleperf --trace-offcpu, AYN Thor). Android: the marker only (EOWRECOMP_VK_TIMELINE=1: the timeline too).
+static bool use_timeline(void) {
+    static int v = -1;
+    if (v < 0) {
+#ifdef __ANDROID__
+        v = getenv("EOWRECOMP_VK_TIMELINE") && *getenv("EOWRECOMP_VK_TIMELINE") == '1';
+#else
+        v = 1;
+#endif
+    }
+    return v || !seq_ptr;
+}
+
 void vk_wait_seq(uint64_t seq) {
     if (!seq) { wait_why = NULL; return; }
-    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
-                              .pValues = &seq};
     uint64_t t0 = SDL_GetTicksNS();
-    VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
+    VkResult r = VK_SUCCESS;
+    if (use_timeline()) {
+        VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
+                                  .pValues = &seq};
+        r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
+    } else {  // the marker, polled: sleeps from 20 us up to 1 ms; a lost device shows in vkDeviceWaitIdle after 10 s
+        uint64_t sleep_ns = 20000, waited = 0;
+        while (*seq_ptr < seq) {
+            struct timespec ts = {0, (long)sleep_ns};
+            nanosleep(&ts, NULL);
+            waited += sleep_ns;
+            if (sleep_ns < 1000000) sleep_ns *= 2;
+            if (waited > 10ull * 1000000000ull) {
+                r = vkDeviceWaitIdle(g_vk.dev);
+                if (r == VK_SUCCESS && *seq_ptr < seq) r = VK_TIMEOUT;
+                break;
+            }
+        }
+    }
     stat_wait_ns += SDL_GetTicksNS() - t0;
     cum_wait += SDL_GetTicksNS() - t0;
     wait_account(SDL_GetTicksNS() - t0);
     if (r == VK_TIMEOUT) LOG("[vk] GPU did not finish submission %llu within 10 s (device lost?)\n", (unsigned long long)seq);
-    else if (r == VK_SUCCESS) cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
+    else if (r == VK_SUCCESS) seq_note_done(seq), cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
     else {
         extern void vk_devlost_dump(void);
         vk_devlost_dump();
         vk_device_fault_report();
-        FATAL("vkWaitSemaphores: %d (device lost)\n", r);
+        FATAL("GPU wait: %d (device lost)\n", r);
     }
 }
 
@@ -270,7 +321,7 @@ VkCommandBuffer vk_cmd(void) {
             if (q->pool) vkCmdResetQueryPool(s->main, q->pool, 0, CQ_MAX);
         }
         gp_mark(s->main, "(submission start; includes GPU idle before it)");
-        if (prof && prof_qp) {
+        if (prof_qp) {  // (always: two timestamps a submission, so the fps log has the GPU's time without a debug build)
             vkCmdResetQueryPool(s->main, prof_qp, (uint32_t)cur_sub * 2, 2);
             vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_NONE, prof_qp, (uint32_t)cur_sub * 2);
             s->ts = true;
@@ -375,16 +426,29 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     }
     vk_cmd();  // (an empty main buffer still carries the semaphores)
     if (s->ts) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
+    if (seq_buf) {  // the completion marker (vk_completed_seq): after all of this submission's work
+        vk_full_barrier(s->main);
+        uint64_t v = submit_seq + 1;
+        vkCmdUpdateBuffer(s->main, seq_buf, 0, sizeof v, &v);
+        VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                               .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                               .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+        vkCmdPipelineBarrier2(s->main, &di);
+    }
     VK_CHECK(vkEndCommandBuffer(s->main));
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
-    VkSemaphoreSubmitInfo sig[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
-                                     .value = submit_seq + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
-                                    {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = signal,
-                                     .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}};
-    VkSemaphoreSubmitInfo wt = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = wait,
-                                .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
+    VkSemaphoreSubmitInfo sig[2], wt = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = wait,
+                                        .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
+    uint32_t nsig = 0;
+    if (use_timeline())
+        sig[nsig++] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
+                                              .value = submit_seq + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    if (signal)
+        sig[nsig++] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = signal,
+                                              .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = (uint32_t)n, .pCommandBufferInfos = cbs,
-                        .signalSemaphoreInfoCount = signal ? 2 : 1, .pSignalSemaphoreInfos = sig,
+                        .signalSemaphoreInfoCount = nsig, .pSignalSemaphoreInfos = sig,
                         .waitSemaphoreInfoCount = wait ? 1 : 0, .pWaitSemaphoreInfos = &wt};
     {
         PROF_T0();
@@ -443,9 +507,10 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
             if (s->npools == 16) FATAL("descriptor pools exhausted\n");
             VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
                                             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
-                                            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024}};
+                                            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},
+                                            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}};
             VkDescriptorPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 8192,
-                                             .poolSizeCount = 5, .pPoolSizes = sizes};
+                                             .poolSizeCount = 6, .pPoolSizes = sizes};
             VK_CHECK(vkCreateDescriptorPool(g_vk.dev, &ci, NULL, &s->pools[s->npools++]));
         }
         VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -473,7 +538,8 @@ static int new_chunk(uint64_t size) {
                              .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO,
+    // (coherent: nothing here flushes its writes - Turnip's first host-visible type isn't, and everything drew black)
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO, .requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
     if (getenv("EOWRECOMP_VK_RING_SYSMEM")) ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;  // (test: a GPU without resizable BAR)
     VmaAllocationInfo info;
@@ -483,8 +549,9 @@ static int new_chunk(uint64_t size) {
     if (!nchunks) {  // where the ring lives: device-local (resizable BAR) or system memory read across PCIe
         VkMemoryPropertyFlags f;
         vmaGetMemoryTypeProperties(g_vk.vma, info.memoryType, &f);
-        LOG("[vk] transient ring: memory type %u (%s%s%s)\n", info.memoryType, f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? "device-local " : "system memory ",
-            f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ? "host-visible " : "", f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? "cached" : "");
+        LOG("[vk] transient ring: memory type %u (%s%s%s%s)\n", info.memoryType, f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? "device-local " : "system memory ",
+            f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ? "host-visible " : "", f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ? "coherent " : "",
+            f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? "cached" : "");
     }
     return nchunks++;
 }
@@ -528,7 +595,7 @@ VkSpan vk_readback(uint64_t size) {
         if (buf) { vk_wait_seq(submit_seq); vmaDestroyBuffer(g_vk.vma, buf, mem); }
         cap = (size + (16 << 20) - 1) & ~((16ull << 20) - 1);
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = cap, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST, .requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                       .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
         VmaAllocationInfo info;
         VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &buf, &mem, &info));
@@ -578,8 +645,12 @@ static Job *jobs_head, *jobs_tail;
 static pthread_mutex_t jobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
+// Helper threads (pipeline compiles, shader translation) are created by the render thread and would inherit its
+// affinity: the fastest core alone (objects.c). Sharing it preempted the render thread (PokeZ-Android on the same
+// Thor: 21k context switches/s, a third of the render thread's time runnable but not running): they go elsewhere.
 static void *worker(void *a) {
     (void)a;
+    plat_thread_core(PLAT_CORE_OTHER);
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
@@ -607,6 +678,7 @@ static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
     (void)a;
+    plat_thread_core(PLAT_CORE_OTHER);
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
         while (!tjobs_head) pthread_cond_wait(&tjobs_cond, &tjobs_lock);
@@ -735,6 +807,18 @@ const char *renderer_stats(void) {
         extern void vk_alias_stats(void);
         vk_alias_stats();
     }
+    {   // always: the GPU's busy time and this thread's CPU time over the interval, ms - which side holds a slow frame
+        // rate back on a player's device (the game's main thread runs the game and the NVN translation)
+        static uint64_t cpu_prev;
+        struct timespec ts;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        uint64_t cpu = (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+        size_t n = strlen(stats_text);
+        if (cpu_prev && !prof)
+            snprintf(stats_text + n, sizeof stats_text - n, " | gpu %.0f ms, main thread cpu %.0f ms", prof_gpu / 1e6, (cpu - cpu_prev) / 1e6);
+        cpu_prev = cpu;
+        if (!prof) prof_gpu = 0;
+    }
     if (prof) {
         prof_up = prof_up_ns;
         prof_up_ns = 0;
@@ -801,10 +885,29 @@ static void st_defaults(void) {
 
 void vk_exec_init(void) {
     prof = getenv("EOWRECOMP_VK_PROF") != NULL;
-    if (prof) {
-        prof_up_ns = 0;
-        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = SUBS * 2};
-        if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &prof_qp) != VK_SUCCESS) prof_qp = VK_NULL_HANDLE;
+    prof_up_ns = 0;
+    VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = SUBS * 2};
+    if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &prof_qp) != VK_SUCCESS) prof_qp = VK_NULL_HANDLE;
+    {   // the completion marker (vk_completed_seq)
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 64, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST, .requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+        VmaAllocationInfo info;
+        if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &seq_buf, &seq_mem, &info) == VK_SUCCESS) {
+            seq_ptr = info.pMappedData;
+            *seq_ptr = submit_seq;
+        } else {
+            seq_buf = VK_NULL_HANDLE;
+            LOG("[vk] no completion marker buffer: completion queried through the timeline\n");
+        }
+    }
+    {   // fmin / fmax / saturate as NMin / NMax / NClamp (translate.c): on by default on Android, EOWRECOMP_SHADER_NMIN=0/1
+        const char *e = getenv("EOWRECOMP_SHADER_NMIN");
+#ifdef __ANDROID__
+        maxwell_nmin = !e || atoi(e) != 0;
+#else
+        maxwell_nmin = e && atoi(e) != 0;
+#endif
     }
     st_defaults();
 }
@@ -1189,11 +1292,32 @@ static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, V
 
 static void save_glsl(const char *src, uint64_t addr, const char *suffix) {
     if (!getenv("EOWRECOMP_SAVE_MSL")) return;
+    mkdir("build", 0755);  // (a fresh Android data directory has no build/)
     mkdir("build/glsl", 0755);
     char path[256];
     snprintf(path, sizeof path, "build/glsl/%llx_%s.glsl", (unsigned long long)addr, suffix);
     FILE *f = fopen(path, "w");
     if (f) { fputs(src, f); fclose(f); }
+}
+
+// EOWRECOMP_GLSL_OVERRIDE=<folder>: <code address>_vs.glsl / _fs.glsl there replaces that translation (experiments
+// on one shader without a rebuild: what a driver makes slow)
+static void override_glsl(ShaderInfo *si, uint64_t addr, const char *suffix) {
+    const char *dir = getenv("EOWRECOMP_GLSL_OVERRIDE");
+    if (!dir || !si->msl) return;
+    char path[1100];
+    snprintf(path, sizeof path, "%s/%llx_%s.glsl", dir, (unsigned long long)addr, suffix);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *s = malloc((size_t)n + 1);
+    s[fread(s, 1, (size_t)n, f)] = 0;
+    fclose(f);
+    free(si->msl);
+    si->msl = s;
+    LOG("[shader] %s replaced by %s\n", suffix, path);
 }
 
 static void compile_program(void *arg) {
@@ -1209,15 +1333,16 @@ static void compile_program(void *arg) {
     free(sv);
     free(sf);
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
-    atomic_fetch_add(&stat_compiles, 1);
+    atomic_fetch_add(&stat_compiles, 1), atomic_fetch_add(&vk_pipelines_made, 1);
     atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
 }
+
+static void gmem_translate_params(void);
 
 static void translate_program(void *arg) {
     Prog *p = arg;
     { static int g = -1; if (g < 0) { const char *e = getenv("EOWRECOMP_SHADER_GUARD"); g = e ? atoi(e) : 0; if (g > 0) maxwell_loop_guard = (uint32_t)g; } }
-    maxwell_gmem_base = HEAP_BASE;
-    maxwell_gmem_size = HEAP_MAX;
+    gmem_translate_params();
     pthread_mutex_lock(&translate_lock);
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
@@ -1236,6 +1361,8 @@ static void translate_program(void *arg) {
         return;
     }
     p->vs_uses_vid = strstr(p->vi->msl, "gl_VertexIndex") != NULL;
+    override_glsl(p->vi, p->code[0], "vs");
+    override_glsl(p->fi, p->code[1], "fs");
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
     run_job(compile_program, p);
@@ -1251,6 +1378,7 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     const uint8_t *vb = (const uint8_t *)vkey;
     for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
+    if (fkey->stencil_tex) { h ^= fkey->stencil_tex; h *= 0x100000001B3ull; }  // (keys without it hash as before)
     if (!h) h = 1;
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
@@ -1532,12 +1660,33 @@ static void build_pipeline(void *arg) {
                                        .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = k->prog->layout};
+    if (g_vk.exec_stats) pi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
     if (r != VK_SUCCESS) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
+    } else if (g_vk.exec_stats) {  // the driver's view of each stage: one line per executable
+        VkPipelineExecutablePropertiesKHR ep[4];
+        uint32_t ne = 4;
+        for (int i = 0; i < 4; i++) ep[i] = (VkPipelineExecutablePropertiesKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR};
+        VkPipelineInfoKHR pinfo = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, .pipeline = pp->pipe};
+        vkGetPipelineExecutablePropertiesKHR(g_vk.dev, &pinfo, &ne, ep);
+        for (uint32_t e = 0; e < ne; e++) {
+            VkPipelineExecutableStatisticKHR s[32];
+            uint32_t ns = 32;
+            for (int i = 0; i < 32; i++) s[i] = (VkPipelineExecutableStatisticKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR};
+            VkPipelineExecutableInfoKHR xi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, .pipeline = pp->pipe, .executableIndex = e};
+            vkGetPipelineExecutableStatisticsKHR(g_vk.dev, &xi, &ns, s);
+            char line[1024];
+            int l = snprintf(line, sizeof line, "[vkstats] vs %llx fs %llx %s:", (unsigned long long)k->prog->code[0],
+                             (unsigned long long)k->prog->code[1], ep[e].name);
+            for (uint32_t i = 0; i < ns && l < (int)sizeof line - 40; i++)
+                l += snprintf(line + l, sizeof line - l, " %s=%llu", s[i].name, s[i].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR
+                              ? (unsigned long long)s[i].value.f64 : (unsigned long long)s[i].value.u64);
+            LOG("%s\n", line);
+        }
     }
-    atomic_fetch_add(&stat_compiles, 1);
+    atomic_fetch_add(&stat_compiles, 1), atomic_fetch_add(&vk_pipelines_made, 1);
     atomic_store(&pp->state, r == VK_SUCCESS ? 1 : 2);
 }
 
@@ -1564,6 +1713,28 @@ static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_) {
     uint32_t tic = h & 0xFFFFF;
     if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
     return ((NvnTexEntry *)st.tpool->entries)[tic].tex;
+}
+
+// Texture slots of a translated stage bound to the stencil of a depth-stencil texture (NVN depth-stencil mode
+// STENCIL on the view or the texture, or a stencil-only format): ShaderKey.stencil_tex for the GLSL integer samplers.
+// The rifts' cut-out draw (fs 12a46f5000: pulls the scene's depth in front of itself where two stencil bits are clear,
+// so the EQUAL pass leaves a hole) reads the stencil that way; sampled as depth, the float's bits decided: in Hyrule
+// Castle Town the houses' roofs and walls came out striped and doorsteps black.
+static uint16_t stencil_slots(int stage, const ShaderInfo *si) {
+    uint16_t m = 0;
+    for (int i = 0; i < si->ntex && i < 16; i++) {
+        const ShaderTexture *t_ = &si->tex[i];
+        if (t_->is_image || t_->shadow || t_->bindless) continue;
+        int slot = ((int)t_->handle_offset - 0x20) / 8;
+        uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
+        uint32_t tic = h & 0xFFFFF;
+        if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) continue;
+        const NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
+        if (!e->tex || !renderer_format_has_stencil(e->tex->format)) continue;
+        uint32_t mode = e->has_view && (e->view.setmask & 16) ? e->view.ds_mode : e->tex->ds_mode;
+        if (mode == 1 || e->tex->format == 0x31) m |= (uint16_t)(1u << i);
+    }
+    return m;
 }
 
 static bool is_attachment(NvnTexture *t) {
@@ -1916,10 +2087,25 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
 // Global memory (shader LDG/STG, maxwell_gmem_base = HEAP_BASE): the guest heap imported as a GPU buffer
 // (VK_EXT_external_memory_host), zero-copy like metal.m's g_guest_buffer, so compute results land in guest
 // memory. The import pins its pages, so it covers only the heap the game set up (SetHeapSize), made on first use.
+// Android (Adreno: no host pointer import): the heap is an AHardwareBuffer (platform/android.c), imported as is; the
+// shaders reach it through its buffer address (maxwell_gmem_bda), a storage buffer being limited to 128 MB there.
 // EOWRECOMP_VK_NO_GMEM=1: no import, reads return zero.
 static VkBuffer gmem_buf;
 static VkDeviceMemory gmem_mem;
 static uint64_t gmem_size;
+static int gmem_gen = -1;  // (AHardwareBuffer import) the heap memory's generation it was made for (plat_heap_gpu_handle)
+static pthread_mutex_t gmem_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void gmem_replace(VkBuffer buf, VkDeviceMemory mem, uint64_t size) {
+    if (gmem_buf) {  // the heap grew: the old import may still be in use by submitted work
+        vk_wait_seq(submit_seq);
+        vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
+        vkFreeMemory(g_vk.dev, gmem_mem, NULL);
+    }
+    gmem_buf = buf;
+    gmem_mem = mem;
+    gmem_size = size;
+}
 
 static bool gmem_import(uint64_t size) {
     PFN_vkGetMemoryHostPointerPropertiesEXT props =
@@ -1943,33 +2129,116 @@ static bool gmem_import(uint64_t size) {
     VkBuffer buf;
     if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) { vkFreeMemory(g_vk.dev, mem, NULL); return false; }
     vkBindBufferMemory(g_vk.dev, buf, mem, 0);
-    if (gmem_buf) {  // the heap grew: the old import may still be in use by submitted work
-        vk_wait_seq(submit_seq);
-        vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
-        vkFreeMemory(g_vk.dev, gmem_mem, NULL);
-    }
-    gmem_buf = buf;
-    gmem_mem = mem;
-    gmem_size = size;
+    gmem_replace(buf, mem, size);
     LOG("[vk] guest heap imported for shader global memory: %llu MB\n", (unsigned long long)(size >> 20));
     return true;
+}
+
+// (gmem_lock held) The heap's AHardwareBuffers imported, again whenever the heap got new memory: their buffer
+// addresses in gmem_addrs (binding GMEM_BUFFER_INDEX, buffer address mode). false: none / failed.
+static VkBuffer gmem_ahb_buf[GMEM_CHUNKS];
+static VkDeviceMemory gmem_ahb_mem[GMEM_CHUNKS];
+static VkDeviceAddress gmem_addrs[GMEM_CHUNKS];
+static uint64_t gmem_ahb_size;
+static bool gmem_import_ahb(void) {
+#ifdef __ANDROID__
+    uint64_t size;
+    int gen;
+    if (!plat_heap_gpu_handle(0, &size, &gen)) return false;
+    if (gmem_ahb_size && gen == gmem_gen) return true;
+    static int failed_gen = -1;
+    if (gen == failed_gen) return false;
+    failed_gen = gen;
+    if (gmem_ahb_size) {  // (the heap got new memory: the old imports may still be in use by submitted work)
+        vk_wait_seq(submit_seq);
+        for (int i = 0; i < GMEM_CHUNKS; i++)
+            if (gmem_ahb_buf[i]) vkDestroyBuffer(g_vk.dev, gmem_ahb_buf[i], NULL), vkFreeMemory(g_vk.dev, gmem_ahb_mem[i], NULL);
+        memset(gmem_ahb_buf, 0, sizeof gmem_ahb_buf), memset(gmem_addrs, 0, sizeof gmem_addrs);
+        gmem_ahb_size = 0;
+    }
+    PFN_vkGetAndroidHardwareBufferPropertiesANDROID get =
+        (PFN_vkGetAndroidHardwareBufferPropertiesANDROID)vkGetDeviceProcAddr(g_vk.dev, "vkGetAndroidHardwareBufferPropertiesANDROID");
+    for (int i = 0; i < GMEM_CHUNKS; i++) {
+        struct AHardwareBuffer *ahb = plat_heap_gpu_handle(i, &size, &gen);
+        if (!ahb) break;
+        uint64_t len = size - (uint64_t)i * GMEM_CHUNK_BYTES < GMEM_CHUNK_BYTES ? size - (uint64_t)i * GMEM_CHUNK_BYTES : GMEM_CHUNK_BYTES;
+        VkAndroidHardwareBufferPropertiesANDROID pr = {.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
+        VkResult r = get ? get(g_vk.dev, ahb, &pr) : VK_ERROR_EXTENSION_NOT_PRESENT;
+        if (r != VK_SUCCESS || !pr.memoryTypeBits) { LOG("[vk] heap AHardwareBuffer properties: %d\n", r); return false; }
+        VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                               .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = len,
+                                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
+        if ((r = vkCreateBuffer(g_vk.dev, &bi, NULL, &gmem_ahb_buf[i])) != VK_SUCCESS) { LOG("[vk] heap buffer: %d\n", r); return false; }
+        VkImportAndroidHardwareBufferInfoANDROID imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, .buffer = ahb};
+        VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = &imp, .buffer = gmem_ahb_buf[i]};
+        VkMemoryAllocateFlagsInfo fl = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .pNext = &ded,
+                                        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &fl, .allocationSize = pr.allocationSize,
+                                   .memoryTypeIndex = (uint32_t)__builtin_ctz(pr.memoryTypeBits)};
+        if ((r = vkAllocateMemory(g_vk.dev, &ai, NULL, &gmem_ahb_mem[i])) != VK_SUCCESS) {
+            LOG("[vk] heap AHardwareBuffer import: %d\n", r);  // (the pieces made so far stay until the next generation)
+            return false;
+        }
+        vkBindBufferMemory(g_vk.dev, gmem_ahb_buf[i], gmem_ahb_mem[i], 0);
+        VkBufferDeviceAddressInfo da = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = gmem_ahb_buf[i]};
+        gmem_addrs[i] = vkGetBufferDeviceAddress(g_vk.dev, &da);
+        if (!i) LOG("[vk] guest heap imported from its AHardwareBuffers: %llu MB (memory type %d)\n", (unsigned long long)(size >> 20),
+                    __builtin_ctz(pr.memoryTypeBits));
+    }
+    gmem_ahb_size = size;
+    gmem_gen = gen;
+    return true;
+#else
+    return false;
+#endif
+}
+
+// How the translator addresses global memory: the heap window, or (the heap's AHardwareBuffer imported) through its
+// buffer address, bounded by the imported size - past it the GPU would fault rather than read zero.
+static void gmem_translate_params(void) {
+    maxwell_gmem_base = HEAP_BASE;
+    maxwell_gmem_size = HEAP_MAX;
+    maxwell_gmem_bda = false;
+    if (!g_vk.ahb_import || getenv("EOWRECOMP_VK_NO_GMEM")) return;
+    pthread_mutex_lock(&gmem_lock);
+    if (gmem_import_ahb()) maxwell_gmem_bda = true, maxwell_gmem_size = gmem_ahb_size;
+    pthread_mutex_unlock(&gmem_lock);
 }
 
 static uint64_t gmem_tried;  // heap size the import was last attempted for (gmem_info imports / re-imports)
 
 static VkDescriptorBufferInfo gmem_info(void) {
     static int off = -1;
-    if (off < 0) off = getenv("EOWRECOMP_VK_NO_GMEM") != NULL || !g_vk.host_import;
-    uint64_t want = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
-    if (want > HEAP_MAX) want = HEAP_MAX;
-    if (!off && want > gmem_size && !gmem_import(want)) {
-        LOG("[vk] guest heap import failed (%llu MB): shader global memory reads return zero\n", (unsigned long long)(want >> 20));
-        off = 1;
+    if (off < 0) off = getenv("EOWRECOMP_VK_NO_GMEM") != NULL || (!g_vk.host_import && !g_vk.ahb_import);
+    if (!off && g_vk.ahb_import) {
+        pthread_mutex_lock(&gmem_lock);
+        gmem_import_ahb();
+        pthread_mutex_unlock(&gmem_lock);
+    } else {
+        uint64_t want = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
+        if (want > HEAP_MAX) want = HEAP_MAX;
+        if (!off && want > gmem_size && !gmem_import(want)) {
+            LOG("[vk] guest heap import failed (%llu MB): shader global memory reads return zero\n", (unsigned long long)(want >> 20));
+            off = 1;
+        }
     }
-    if (gmem_buf) return (VkDescriptorBufferInfo){gmem_buf, 0, gmem_size};
+    if (gmem_buf) {  // (a storage buffer can't be larger than the device allows: 128 MB on Adreno)
+        uint64_t range = gmem_size < g_vk.props.limits.maxStorageBufferRange ? gmem_size : g_vk.props.limits.maxStorageBufferRange;
+        return (VkDescriptorBufferInfo){gmem_buf, 0, range};
+    }
     static uint32_t zero[1024];
     VkSpan s = vk_transient_copy(zero, sizeof zero, 256);
     return (VkDescriptorBufferInfo){s.buf, s.off, sizeof zero};
+}
+
+// (buffer address mode) binding GMEM_BUFFER_INDEX: the heap pieces' buffer addresses, uvec2 each (translate.c)
+static VkDescriptorBufferInfo gmem_base_info(void) {
+    gmem_info();
+    uint32_t v[GMEM_CHUNKS][4] = {{0}};
+    for (int i = 0; i < GMEM_CHUNKS; i++) v[i][0] = (uint32_t)gmem_addrs[i], v[i][1] = (uint32_t)(gmem_addrs[i] >> 32);
+    VkSpan s = vk_transient_copy(v, sizeof v, 256);
+    return (VkDescriptorBufferInfo){s.buf, s.off, sizeof v};
 }
 
 // Compute dispatches that use global memory: the imported heap is host memory across PCIe on a discrete GPU, and a
@@ -2363,6 +2632,25 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     *out = (VkDescriptorImageInfo){smp, view, VK_IMAGE_LAYOUT_GENERAL};
 }
 
+// Bound image (SUST): driver binding table offset 0x120 + 8 * slot = st.img[stage][slot], the texture pool ID
+// (nvnDeviceGetImageHandle), registered with nvnTexturePoolRegisterImage
+static VkImageView image_view(int stage, ShaderInfo *si, int i) {
+    int slot = i < si->ntex ? ((int)si->tex[i].handle_offset - 0x120) / 8 : -1;
+    uint64_t h = slot >= 0 && slot < 8 ? st.img[stage][slot] : 0;
+    uint32_t id = h & 0xFFFFF;
+    VkImageView v = VK_NULL_HANDLE;
+    if (h && st.tpool && id < (uint32_t)st.tpool->count) {
+        NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[id];
+        if (e->tex) v = vk_storage_view(e->tex, &e->view, e->has_view);
+    }
+    if (!v && h) {
+        static int nlog;
+        NvnTexture *t = st.tpool && id < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[id].tex : NULL;
+        if (nlog++ < 10) LOG("[vk] image slot %d (id %u) not storable: nvn fmt %#x flags %#x\n", slot, id, t ? t->format : 0, t ? t->flags : 0);
+    }
+    return v ? v : vk_dummy_storage_view();
+}
+
 // Writes the descriptor set of one stage. gx..gz: compute group counts (driver constants).
 // pre_ii: texture descriptors already resolved by the caller (draw: fragment textures, needed earlier for the
 // viewport decision), or NULL.
@@ -2392,6 +2680,12 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 tex_wh[sg][ti][0] = wh[0]; tex_wh[sg][ti][1] = wh[1];
             }
             w[n].pImageInfo = &ii[n];
+        } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && b->binding >= 32) {
+            ii[n] = (VkDescriptorImageInfo){VK_NULL_HANDLE, image_view(stage, si, (int)b->binding - 32), VK_IMAGE_LAYOUT_GENERAL};
+            w[n].pImageInfo = &ii[n];
+        } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding == GMEM_BUFFER_INDEX) {
+            bi[n] = gmem_base_info();  // (buffer address mode: the heap's address)
+            w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding < 17) {
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
             w[n].pBufferInfo = &bi[n];
@@ -2445,7 +2739,7 @@ static void build_compute(void *arg) {
                                                 .pSpecializationInfo = &spec},
                                       .layout = cp->p.layout};
     VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
-    atomic_fetch_add(&stat_compiles, 1);
+    atomic_fetch_add(&stat_compiles, 1), atomic_fetch_add(&vk_pipelines_made, 1);
     atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
     if (r != VK_SUCCESS) LOG("[compute] pipeline failed: %d\n", r);
 }
@@ -2460,8 +2754,7 @@ static CsProg *compute_program(NvnProgram *np) {
     for (int i = 0; i < n; i++) if (tab[i].addr == ss->code_addr) return tab[i].cp;
     CsProg *cp = calloc(1, sizeof *cp);
     if (n < 256) { tab[n].addr = ss->code_addr; tab[n].cp = cp; g_cs_n = n + 1; }
-    maxwell_gmem_base = HEAP_BASE;
-    maxwell_gmem_size = HEAP_MAX;
+    gmem_translate_params();
     ShaderKey k = {0};
     k.glsl = 1;
     pthread_mutex_lock(&translate_lock);
@@ -2589,6 +2882,10 @@ static void draw_(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
     Prog *pr = get_program(st.program, &vkey, &fkey);
     if (!pr || atomic_load(&pr->state) != 1) { SKIP(pr && atomic_load(&pr->state) == 0 ? SKIP_PROG_PENDING : SKIP_PROG_FAILED); return; }
+    if ((fkey.stencil_tex = stencil_slots(1, pr->fi))) {  // a stencil view bound: the variant with integer samplers
+        pr = get_program(st.program, &vkey, &fkey);
+        if (!pr || atomic_load(&pr->state) != 1) { SKIP(pr && atomic_load(&pr->state) == 0 ? SKIP_PROG_PENDING : SKIP_PROG_FAILED); return; }
+    }
     {   // fragment-shader hash: skip lists (EOWRECOMP_SKIP_FSHASH), debug logging
         static uint64_t last_fs, last_hash;
         uint64_t fs = st.program->stages[1].code_addr;
@@ -2932,6 +3229,13 @@ static void draw_(CmdRec *r, bool indexed) {
     bool run_gold[MAX_RUNS];
     int nruns = 0;
     if (!nruns) { run_at[0] = 0; run_n[0] = inst; nruns = 1; run_gold[0] = false; }
+    {   // EOWRECOMP_GPUPROF_DRAWS=1 (with EOWRECOMP_GPUPROF_AT): a row per draw, not per pass
+        static int per_draw = -1;
+        if (per_draw < 0) per_draw = getenv("EOWRECOMP_GPUPROF_DRAWS") != NULL;
+        if (per_draw && g_gpuprof_frame)
+            gp_mark(cb, "draw vs %llx fs %llx, %u %s", (unsigned long long)st.program->stages[0].code_addr,
+                    (unsigned long long)st.program->stages[1].code_addr, use_index ? icount : count, use_index ? "indices" : "vertices");
+    }
     for (int ri = 0; ri < nruns; ri++) {
         if (nruns > 1 || run_gold[0]) {  // this run's tint: a fragment set of its own
             float rtint[8] = {0};
@@ -2959,9 +3263,9 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         pr->vi->cbuf_mask, pr->fi->cbuf_mask, st.rt.ncolor);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format);
     if (st.rt.depth) LOG(" d%#x %p", st.rt.depth->format, (void *)st.rt.depth);
-    LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n", st.viewport[0][0], st.viewport[0][1],
-        st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
-        st.channel_mask);
+    LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x | gmem vs %d fs %d\n", st.viewport[0][0],
+        st.viewport[0][1], st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2],
+        st.poly[0], st.poly[1], st.channel_mask, pr->vi->uses_gmem, pr->fi->uses_gmem);
     if (getenv("EOWRECOMP_DEBUG_DATA")) {  // vertex streams 0-1 and fragment cbufs: the first floats
         for (int s = 0; s < 2; s++) {
             if (!st.vbuf[s].addr) continue;
@@ -3048,7 +3352,7 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
 
 static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     NvnTexture *t = (NvnTexture *)(uintptr_t)src->tex;
-    if (!t || !dst || dst < HEAP_BASE) return;
+    if (!t || !dst || dst < HEAP_BASE) { LOG("[copytex] to buffer skipped: destination %llx outside the heap\n", (unsigned long long)dst); return; }
     t = alias_read(t);
     vk_end_pass();
     const FormatInfo *fi;
@@ -3056,7 +3360,7 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     int level;
     uint64_t row, img;
     copy_region_dims(t, src, &fi, rg, &level, &row, &img);
-    if (!fi || !fi->bpb || fi->bpb == 3 || row % fi->bpb) return;
+    if (!fi || !fi->bpb || fi->bpb == 3 || row % fi->bpb) { LOG("[copytex] to buffer skipped: format %#x\n", t->format); return; }
     TexBackend *b = vk_tex(t, false);
     float tsx, tsy;
     renderer_texture_scale(t, &tsx, &tsy);
@@ -3724,6 +4028,20 @@ static void exec_list(uint64_t handle, int depth) {
             renderer_flush();
             memmove((void *)(uintptr_t)r->x[1], (void *)(uintptr_t)r->x[0], r->x[2]);
             break;
+        case CMD_CLEAR_BUFFER: {
+            // ClearBuffer(cmd, address, size, value): recorded but never executed until now (PokeZ-Android found the
+            // same gap). In command order like the buffer copy above: the GPU's earlier work done, then the 32-bit
+            // fill in guest memory.
+            static int logged;
+            if (!logged++) LOG("[nvn] ClearBuffer %llx +%llu = %#x (first use)\n", (unsigned long long)r->x[0],
+                               (unsigned long long)r->x[1], (unsigned)r->x[2]);
+            if (!r->x[0] || !r->x[1]) break;
+            wait_why = "buffer clear";
+            renderer_flush();
+            uint32_t *d = (uint32_t *)(uintptr_t)r->x[0], v = (uint32_t)r->x[2];
+            for (uint64_t i = 0; i < r->x[1] / 4; i++) d[i] = v;
+            break;
+        }
         default: break;
         }
         p += r->size;

@@ -35,6 +35,9 @@ bool plat_reset_guest(uint64_t lo, uint64_t hi) {
 }
 
 void plat_commit(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
+// (the GPU imports the heap with VK_EXT_external_memory_host / no-copy Metal buffers here)
+bool plat_heap_gpu_backing(uint64_t addr, uint64_t size, uint64_t old_size) { (void)addr, (void)size, (void)old_size; return false; }
+void *plat_heap_gpu_handle(int i, uint64_t *size, int *gen) { (void)i, *size = 0, *gen = 0; return NULL; }
 
 int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page) {  // (no write tracking)
     (void)addr; (void)size; (void)pages; (void)max; (void)page;
@@ -168,5 +171,6 @@ bool plat_remove_tree(const char *dir) { return nftw(dir, rm_entry, 16, FTW_DEPT
 
 // (phones only: runtime/platform/android.c)
 void plat_thread_core(int role) { (void)role; }
+void plat_children_elsewhere(bool begin) { (void)begin; }
 void plat_frame_work(uint64_t busy_ns, uint64_t target_ns) { (void)busy_ns, (void)target_ns; }
 void plat_thread_name(const char *name) { pthread_setname_np(name); }

@@ -30,8 +30,50 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
     return VK_FALSE;
 }
 
+#ifdef __ANDROID__
+#include <adrenotools/driver.h>
+#include <dlfcn.h>
+#include <libgen.h>
+// Vulkan through a custom driver: Turnip (Mesa; the APK's res/vulkan.ad07xx.so, tools/android/build_deps.sh) by
+// default - phones' own Qualcomm drivers are often old (an AYN Thor's, 1.3.128 of 2023: no shaderInt64, no host memory
+// import). libadrenotools opens the system loader onto it (it does the presentation: a driver alone can't).
+// EOWRECOMP_DRIVER=system: the phone's own; =<file in res/>: another driver.
+static void *custom_vulkan;  // the loader opened by libadrenotools (NULL: the system one, through volk / SDL)
+static PFN_vkGetInstanceProcAddr custom_driver(void) {
+    const char *want = getenv("EOWRECOMP_DRIVER");
+    char drv[1100], dir[1100], hooks[1100];
+    Dl_info di;
+    if ((want && !strcmp(want, "system")) || !rt_resource(want ? want : "vulkan.ad07xx.so", NULL, drv, sizeof drv) ||
+        !dladdr((void *)custom_driver, &di) || !di.dli_fname)
+        return NULL;
+    snprintf(dir, sizeof dir, "%s/", dirname(strdup(drv)));
+    snprintf(hooks, sizeof hooks, "%s/", dirname(strdup(di.dli_fname)));  // (the native library folder: libmain.so's)
+    custom_vulkan = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, NULL, hooks, dir, basename(drv), NULL, NULL);
+    PFN_vkGetInstanceProcAddr gipa = custom_vulkan ? (PFN_vkGetInstanceProcAddr)dlsym(custom_vulkan, "vkGetInstanceProcAddr") : NULL;
+    LOG("[vk] driver %s: %s\n", drv, gipa ? "loaded" : "failed, the system's instead");
+    return gipa;
+}
+#endif
+
+// The window's surface: made with the loader in use (SDL's would be another copy of it with a custom driver)
+static bool create_surface(void) {
+#ifdef __ANDROID__
+    if (custom_vulkan) {
+        VkAndroidSurfaceCreateInfoKHR ci = {.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+            .window = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL)};
+        return ci.window && vkCreateAndroidSurfaceKHR(g_vk.inst, &ci, NULL, &g_vk.surface) == VK_SUCCESS;
+    }
+#endif
+    return SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface);
+}
+
 // EOWRECOMP_VK_VALIDATION=1: Khronos validation layer (MSYS2 package vulkan-validation-layers)
 static void create_instance(void) {
+#ifdef __ANDROID__
+    PFN_vkGetInstanceProcAddr gipa = custom_driver();
+    if (gipa) volkInitializeCustom(gipa);
+    else
+#endif
 #ifdef VK_NO_PROTOTYPES
     if (volkInitialize() != VK_SUCCESS) FATAL("no Vulkan driver\n");
 #endif
@@ -161,16 +203,48 @@ static void create_device(void) {
     if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     g_vk.host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);  // guest heap as a GPU buffer (exec.c)
     if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+#ifdef __ANDROID__
+    // without it (Adreno): the heap is an AHardwareBuffer (platform/android.c), imported and read through buffer
+    // device addresses - a storage buffer can't span it (maxStorageBufferRange 128 MB there) (exec.c gmem_import)
+    g_vk.ahb_import = !g_vk.host_import && has_ext(ep, ne, "VK_ANDROID_external_memory_android_hardware_buffer") &&
+                      has_ext(ep, ne, "VK_EXT_queue_family_foreign");
+    if (g_vk.ahb_import) {
+        ext[n_ext++] = "VK_ANDROID_external_memory_android_hardware_buffer";
+        ext[n_ext++] = "VK_EXT_queue_family_foreign";
+    }
+#endif
     // a portability implementation (MoltenVK) must have its subset extension enabled when it lists it
     if (has_ext(ep, ne, "VK_KHR_portability_subset")) ext[n_ext++] = "VK_KHR_portability_subset";
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;
+    // EOWRECOMP_VK_STATS=1: the driver's own compile statistics of every pipeline (exec.c: instructions, registers, spills)
+    g_vk.exec_stats = getenv("EOWRECOMP_VK_STATS") && has_ext(ep, ne, "VK_KHR_pipeline_executable_properties");
+    if (g_vk.exec_stats) ext[n_ext++] = "VK_KHR_pipeline_executable_properties";
     free(ep);
 
-    // features the backend relies on (all present on current desktop drivers)
-    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    // Features the backend uses, each requested only when the driver has it: vkCreateDevice fails outright
+    // (VK_ERROR_FEATURE_NOT_PRESENT) on any unsupported one. Adreno 740 (AYN Thor, driver 1.3.128) has no
+    // uniformAndStorageBuffer8BitAccess, which the shaders don't need (no 8-bit types in uniform blocks).
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT hdiv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT hcbc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT,
+                                                         .pNext = g_vk.divisor ? &hdiv : NULL};
+    VkPhysicalDeviceVulkan13Features h13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+                                            .pNext = g_vk.custom_border ? (void *)&hcbc : g_vk.divisor ? (void *)&hdiv : NULL};
+    VkPhysicalDeviceVulkan12Features h12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &h13};
+    VkPhysicalDeviceVulkan11Features h11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &h12};
+    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &h11};
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+#define WANT(dst, src, field) do { dst.field = src.field; if (!src.field) LOG("[vk] warning: no " #field "\n"); } while (0)
+    // sampler border colours are created without a format (textures.c vk_sampler): the extension is useless without it
+    if (g_vk.custom_border && !hcbc.customBorderColorWithoutFormat) {
+        LOG("[vk] warning: no customBorderColorWithoutFormat: custom border colours off\n");
+        g_vk.custom_border = false;
+    }
+    if (g_vk.divisor && !hdiv.vertexAttributeInstanceRateDivisor) {
+        LOG("[vk] warning: no vertexAttributeInstanceRateDivisor\n");
+        g_vk.divisor = false;
+    }
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
         .vertexAttributeInstanceRateDivisor = VK_TRUE, .vertexAttributeInstanceRateZeroDivisor = VK_FALSE};
@@ -178,19 +252,33 @@ static void create_device(void) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, .customBorderColors = VK_TRUE,
         .customBorderColorWithoutFormat = VK_TRUE, .pNext = g_vk.divisor ? &div : NULL};
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-                                            .dynamicRendering = VK_TRUE, .synchronization2 = VK_TRUE,
-                                            .shaderDemoteToHelperInvocation = VK_TRUE, .shaderTerminateInvocation = VK_TRUE,
-                                            .maintenance4 = VK_TRUE,
                                             .pNext = g_vk.custom_border ? (void *)&cbc : g_vk.divisor ? (void *)&div : NULL};
-    VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-                                            .timelineSemaphore = VK_TRUE, .shaderInt8 = VK_TRUE, .samplerMirrorClampToEdge = VK_TRUE,
-                                            .uniformAndStorageBuffer8BitAccess = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,
-                                            .scalarBlockLayout = VK_TRUE, .pNext = &f13};
-    VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
-                                            .storageBuffer16BitAccess = VK_TRUE, .pNext = &f12};
+    WANT(f13, h13, dynamicRendering);
+    WANT(f13, h13, synchronization2);
+    WANT(f13, h13, shaderDemoteToHelperInvocation);
+    WANT(f13, h13, shaderTerminateInvocation);
+    WANT(f13, h13, maintenance4);
+    VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13};
+    WANT(f12, h12, timelineSemaphore);
+    WANT(f12, h12, shaderInt8);
+    WANT(f12, h12, samplerMirrorClampToEdge);
+    WANT(f12, h12, uniformAndStorageBuffer8BitAccess);
+    WANT(f12, h12, storageBuffer8BitAccess);
+    WANT(f12, h12, scalarBlockLayout);
+    if (g_vk.ahb_import) {
+        WANT(f12, h12, bufferDeviceAddress);
+        g_vk.ahb_import = h12.bufferDeviceAddress;
+    }
+    VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &f12};
+    WANT(f11, h11, storageBuffer16BitAccess);
+#undef WANT
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
                                            .pNext = &f11};
     VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : (void *)&f11};
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pe = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, .pipelineExecutableInfo = VK_TRUE,
+        .pNext = f.pNext};
+    if (g_vk.exec_stats) f.pNext = &pe;
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
     b->independentBlend = h->independentBlend;
     b->dualSrcBlend = h->dualSrcBlend;
@@ -208,6 +296,7 @@ static void create_device(void) {
     b->vertexPipelineStoresAndAtomics = h->vertexPipelineStoresAndAtomics;
     b->robustBufferAccess = h->robustBufferAccess;  // guest shaders index cbufs freely: keep OOB reads harmless
     b->shaderClipDistance = h->shaderClipDistance;
+    b->shaderStorageImageWriteWithoutFormat = h->shaderStorageImageWriteWithoutFormat;  // (SUST: image format from the texture)
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
@@ -288,6 +377,12 @@ static VkPresentModeKHR present_mode(void) {
     VkPresentModeKHR m[16];
     if (n > 16) n = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, m);
+    static int logged;
+    if (!logged++) {
+        char modes[64] = "";
+        for (uint32_t i = 0; i < n; i++) snprintf(modes + strlen(modes), sizeof modes - strlen(modes), " %d", (int)m[i]);
+        LOG("[vk] present modes:%s (want %d)\n", modes, (int)want);
+    }
     for (uint32_t i = 0; i < n; i++) if (m[i] == want) return want;
     return VK_PRESENT_MODE_FIFO_KHR;
 }
@@ -404,7 +499,7 @@ static void new_surface(void) {
     g_vk.swapchain = VK_NULL_HANDLE;
     if (g_vk.surface) vkDestroySurfaceKHR(g_vk.inst, g_vk.surface, NULL);
     g_vk.surface = VK_NULL_HANDLE;
-    if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) {
+    if (!create_surface()) {
         LOG("[vk] new surface: %s\n", SDL_GetError());
         atomic_store(&g_surface_stale, true);  // (the window isn't back yet: next frame)
         return;
@@ -564,6 +659,10 @@ void vk_frame_end(const char *shot_path) {
 }
 
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
+    // absolute: on Android SDL resolves relative paths against the app's internal storage / its assets, not the
+    // working directory (the data folder)
+    char full[1200], cwd[1024];
+    if (path[0] != '/' && getcwd(cwd, sizeof cwd)) snprintf(full, sizeof full, "%s/%s", cwd, path), path = full;
     SDL_Surface *s = SDL_CreateSurfaceFrom((int)w, (int)h, SDL_PIXELFORMAT_ABGR8888, (void *)rgba, (int)w * 4);
     if (!s || !SDL_SavePNG(s, path)) LOG("[vk] saving %s failed: %s\n", path, SDL_GetError());
     else LOG("[vk] saved %s (%ux%u)\n", path, w, h);
@@ -598,6 +697,15 @@ void backend_present(NvnTexture *t) {
     TexBackend *b = vk_tex(t, true);
     b->presented = true;
     vk_end_pass();
+    {   // the pipeline cache to disk every 30 s while new pipelines appear: phones end apps without exit() or a
+        // background event (killed, crashed), and Turnip takes seconds per new pipeline on an Adreno 740
+        extern _Atomic unsigned vk_pipelines_made;
+        static unsigned saved;
+        static uint64_t at;
+        uint64_t now = SDL_GetTicksNS();
+        unsigned m = atomic_load(&vk_pipelines_made);
+        if (m != saved && now - at > 30000000000ull) saved = m, at = now, vk_pipeline_cache_save();
+    }
     static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = SDL_GetTicksNS();
     bool have = vk_frame_begin(black);
@@ -685,7 +793,8 @@ void backend_present(NvnTexture *t) {
     {   // EOWRECOMP_SHOT_AT=<frame>,<frame>,... (ascending): the game image at those frames -> build/frames/frame_N.png
         static const char *next;
         static int init;
-        if (!init) { init = 1; next = getenv("EOWRECOMP_SHOT_AT"); if (next) mkdir("build/frames", 0755); }
+        // (build/ first: the Android data folder has none)
+        if (!init) { init = 1; next = getenv("EOWRECOMP_SHOT_AT"); if (next) mkdir("build", 0755), mkdir("build/frames", 0755); }
         while (next && *next) {
             long at = strtol(next, (char **)&next, 10);
             if ((long)total_frames < at) { while (next > getenv("EOWRECOMP_SHOT_AT") && next[-1] != ',') next--; break; }
@@ -701,6 +810,7 @@ void backend_present(NvnTexture *t) {
     if (shot_from < 0) { const char *e = getenv("EOWRECOMP_SCREENSHOT_FROM"); shot_from = e ? atol(e) : 0; }
     if (shot_every && total_frames % shot_every == 0 && (long)total_frames >= shot_from) {
         char path[256];
+        mkdir("build", 0755);
         if (shot_from) mkdir("build/frames", 0755);
         snprintf(path, sizeof path, shot_from ? "build/frames/frame_%05llu.png" : "build/frame_%05llu.png",
                  (unsigned long long)total_frames);
@@ -791,7 +901,7 @@ void ui_window_init(void) {
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
     if (g_settings.fullscreen && !getenv("EOWRECOMP_WINDOW") && !getenv("EOWRECOMP_HIDDEN")) SDL_SetWindowFullscreen(window, true);
     create_instance();
-    if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
+    if (!create_surface()) FATAL("creating the window surface: %s\n", SDL_GetError());
     pick_device();
     create_device();
     create_swapchain();
@@ -822,13 +932,27 @@ void backend_clear_window(void) {
     if (g_vk.dev && vk_frame_begin(black)) vk_frame_end(NULL);
 }
 
+// The next host event, waiting up to 16 ms. Android: SDL_WaitEventTimeout never sleeps there (each pump queues a poll
+// sentinel, whose wakeup makes Android_PumpEvents return at once): with a controller attached the UI thread spun on
+// a big core, 77% of the app's CPU cycles in clock_gettime / joystick polling (simpleperf on an AYN Thor). Poll, then
+// sleep 4 ms (input latency within a 33 ms frame).
+static bool next_event(SDL_Event *e) {
+#ifdef __ANDROID__
+    if (SDL_PollEvent(e)) return true;
+    SDL_DelayNS(4000000);
+    return false;
+#else
+    return SDL_WaitEventTimeout(e, 16);
+#endif
+}
+
 int ui_run(void) {
     ui_window_init();
     atomic_store(&ui_ready, true);
     for (;;) {
         if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
         SDL_Event e;
-        while (SDL_WaitEventTimeout(&e, 16)) {
+        while (next_event(&e)) {
             if (e.type == SDL_EVENT_QUIT) {
                 LOG("window closed\n");
                 exit(0);

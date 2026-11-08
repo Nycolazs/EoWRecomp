@@ -483,19 +483,27 @@ class Module:
 from patches import PATCHES
 
 
-def adr_feeds_br(m, i, rd, window=6):
+def adr_feeds_br(m, i, rd, window=64):
     """ADR whose register reaches a `br` within a few instructions: the base of a compact jump table's cases
     (LLVM: adr xB, cases ; ldrb/ldrh wO, [table, idx] ; add xB, xB, xO, lsl #2 ; br xB), code inside the same
     function - not a callback. Treating it as a function start split the function at its cases, so its table
-    couldn't be resolved (main: 71 tables resolved, 1832 left to the all-instruction fallback)."""
+    couldn't be resolved (main: 71 tables resolved, 1832 left to the all-instruction fallback).
+    The compiler schedules unrelated work before the br: main's f_7001a657e0 (br 7 instructions after the adr) was
+    split at its first case and the game died as Zelda is freed; f_70018100d0 (br 17 instructions after, the gap
+    filled with float math) died the same way later on ("no function at 1001810220"). The scan covers the
+    straight-line block (stops at b / bl / blr / ret), and FP/SIMD instructions don't count as overwriting the
+    tracked register: their register fields name v registers (v10 is not x10)."""
     regs = {rd}
     for k in range(i + 1, min(i + 1 + window, len(m.words))):
         w = m.words[k]
         if (w & 0xFFFFFC1F) == 0xD61F0000:  # br xN
             return ((w >> 5) & 31) in regs
+        if (w & 0x7C000000) == 0x14000000 or (w & 0xFE1FFC1F) == 0xD61F0000 or (w & 0xFFFFFC1F) == 0xD65F0000:
+            return False  # b / bl / blr / ret: the block ends
+        simd = (w >> 25) & 7 == 7 or ((w >> 25) & 5 == 4 and (w >> 26) & 1)  # FP/SIMD data processing, SIMD load/store
         if (w & 0x7F200000) == 0x0B000000 and ((w >> 5) & 31) in regs:  # add (shifted register) from a tracked reg
             regs.add(w & 31)
-        elif (w & 31) in regs and (w & 0x7F200000) != 0x0B000000:
+        elif (w & 31) in regs and not simd:
             regs.discard(w & 31)  # (overwritten by something else)
     return False
 
