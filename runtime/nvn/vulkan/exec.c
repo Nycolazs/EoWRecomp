@@ -901,6 +901,14 @@ void vk_exec_init(void) {
             LOG("[vk] no completion marker buffer: completion queried through the timeline\n");
         }
     }
+    {   // fmin / fmax / saturate as NMin / NMax / NClamp (translate.c): on by default on Android, EOWRECOMP_SHADER_NMIN=0/1
+        const char *e = getenv("EOWRECOMP_SHADER_NMIN");
+#ifdef __ANDROID__
+        maxwell_nmin = !e || atoi(e) != 0;
+#else
+        maxwell_nmin = e && atoi(e) != 0;
+#endif
+    }
     st_defaults();
 }
 

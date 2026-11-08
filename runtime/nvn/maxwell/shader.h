@@ -114,3 +114,4 @@ void maxwell_free(ShaderInfo *s);
 void maxwell_disassemble(const uint8_t *code, size_t max_size, int stage, void *file);
 
 extern uint32_t maxwell_loop_guard;  // translate.c
+extern bool maxwell_nmin;  // translate.c: (GLSL) fmin / fmax / saturate as GLSL.std.450 NMin / NMax / NClamp

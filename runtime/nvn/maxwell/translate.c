@@ -1926,6 +1926,23 @@ static void glsl_rewrite(Ctx *c, Str *o, const char *src) {
     }
 }
 
+// MSL semantics: saturate(NaN) = 0, fmin/fmax return the non-NaN operand (Maxwell's FMNMX and .SAT). Spelled out
+// with isnan tests, or (maxwell_nmin) as GLSL.std.450 NClamp / NMin / NMax through GL_EXT_spirv_intrinsics, which have
+// exactly those NaN rules and become one min/max on Turnip instead of two compares and selects more (PokeZ-Android
+// aa9b699 on the same Thor: Z-A's lighting pass 2.50 -> 2.34 ms; switch-android-kit vulkan/shader-nmin-nmax.md).
+bool maxwell_nmin;
+static const char glsl_minmax_tests[] =
+    "float mw_saturate(float x) { return isnan(x) ? 0.0f : clamp(x, 0.0f, 1.0f); }\n"
+    "vec2 mw_saturate(vec2 x) { return vec2(mw_saturate(x.x), mw_saturate(x.y)); }\n"
+    "float mw_fmin(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : min(a, b)); }\n"
+    "float mw_fmax(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : max(a, b)); }\n";
+static const char glsl_minmax_nmin[] =
+    "spirv_instruction(set = \"GLSL.std.450\", id = 81) float mw_nclamp(float x, float lo, float hi);\n"
+    "float mw_saturate(float x) { return mw_nclamp(x, 0.0f, 1.0f); }\n"
+    "vec2 mw_saturate(vec2 x) { return vec2(mw_saturate(x.x), mw_saturate(x.y)); }\n"
+    "spirv_instruction(set = \"GLSL.std.450\", id = 79) float mw_fmin(float a, float b);\n"
+    "spirv_instruction(set = \"GLSL.std.450\", id = 80) float mw_fmax(float a, float b);\n";
+
 static const char glsl_prelude[] =
     "#version 460\n"
     "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n"
@@ -1948,11 +1965,6 @@ static const char glsl_prelude[] =
     "int sx8(int v) { return bitfieldExtract(v, 0, 8); }\n"
     "int sx16(uint v) { return bitfieldExtract(int(v), 0, 16); }\n"
     "int sx16(int v) { return bitfieldExtract(v, 0, 16); }\n"
-    // MSL semantics: saturate(NaN) = 0, fmin/fmax return the non-NaN operand
-    "float mw_saturate(float x) { return isnan(x) ? 0.0f : clamp(x, 0.0f, 1.0f); }\n"
-    "vec2 mw_saturate(vec2 x) { return vec2(mw_saturate(x.x), mw_saturate(x.y)); }\n"
-    "float mw_fmin(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : min(a, b)); }\n"
-    "float mw_fmax(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : max(a, b)); }\n"
     "uint mw_clz(uint v) { return v == 0u ? 32u : uint(31 - findMSB(v)); }\n"
     "uint mw_popcount(uint v) { return uint(bitCount(v)); }\n"
     "uint mw_mulhi(uint a, uint b) { uint hi, lo; umulExtended(a, b, hi, lo); return hi; }\n"
@@ -2010,11 +2022,12 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (c->fail) { free(body.buf); free(c->body.buf); free(c); return info; }
     int set = stage == STAGE_FRAGMENT ? 1 : 0;
     Str s = {0};
-    if (info->uses_gmem && maxwell_gmem_bda)  // (extensions: before anything else in the source)
-        sp(&s, "#version 460\n#extension GL_EXT_buffer_reference : require\n#extension GL_EXT_buffer_reference_uvec2 : require\n%s",
-           glsl_prelude + strlen("#version 460\n"));
-    else
-        sp(&s, "%s", glsl_prelude);
+    // (extensions: before anything else in the source)
+    sp(&s, "#version 460\n%s%s", info->uses_gmem && maxwell_gmem_bda
+                                     ? "#extension GL_EXT_buffer_reference : require\n#extension GL_EXT_buffer_reference_uvec2 : require\n"
+                                     : "",
+       maxwell_nmin ? "#extension GL_EXT_spirv_intrinsics : require\n" : "");
+    sp(&s, "%s%s", glsl_prelude + strlen("#version 460\n"), maxwell_nmin ? glsl_minmax_nmin : glsl_minmax_tests);
     if (stage != STAGE_VERTEX) sp(&s, "%s", glsl_warp32);
     for (int i = 0; i < 18; i++) {
         if (!(info->cbuf_mask & (1u << i))) continue;
