@@ -45,6 +45,8 @@ typedef struct {
                             // after flip_y: keys without it hash as before - shader caches stay valid.)
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
+    uint16_t stencil_tex;   // (GLSL) texture slots bound to the stencil of a depth-stencil texture: integer samplers,
+                            // the stencil value returned as raw bits (in the padding: other keys hash as before)
 } ShaderKey;
 
 typedef struct {

@@ -534,8 +534,9 @@ static const char *tex_type_name(int t) {
 
 // Write texture results: component mask selects which of r,g,b,a go to consecutive registers.
 static void write_tex_result(Ctx *c, int slot, const char *call, uint32_t mask, int d0, int d1, bool texs, bool f16) {
-    sp(&c->body, "    { float4 t = %s;\n", call);
-    (void)slot;
+    // a stencil view (ShaderKey.stencil_tex): Maxwell returns the stencil value as the register's bits
+    bool stencil = c->glsl && c->key && slot >= 0 && slot < 16 && ((c->key->stencil_tex >> slot) & 1);
+    sp(&c->body, stencil ? "    { float4 t = uintBitsToFloat(%s);\n" : "    { float4 t = %s;\n", call);
     if (f16) {
         // TEXS/TLDS .F16: components (in mask order) packed as half pairs into d0 (lo, hi) and d1 (lo, hi)
         int comps[4], n = 0;
@@ -2057,7 +2058,9 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             sp(&s, "layout(set = %d, binding = %d) uniform writeonly image2D t%d;\n", set, 32 + i, i);
             continue;
         }
-        sp(&s, "layout(set = %d, binding = %d) uniform %s t%d;\n", set, 32 + i, glsl_sampler_type(t), i);
+        // the stencil of a depth-stencil texture: an integer sampler, its value as bits (write_tex_result)
+        bool stencil = key && i < 16 && ((key->stencil_tex >> i) & 1) && !t->shadow;
+        sp(&s, "layout(set = %d, binding = %d) uniform %s%s t%d;\n", set, 32 + i, stencil ? "u" : "", glsl_sampler_type(t), i);
         // size of level l as (width, height, depth or layers)
         switch (t->type) {
         case TEXTYPE_1D: sp(&s, "ivec3 tsize%d(int l) { return ivec3(textureSize(t%d, l), 1, 1); }\n", i, i); break;

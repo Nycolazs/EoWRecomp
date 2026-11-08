@@ -720,6 +720,10 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
         return vk_image_view(b, type, fmt, lv0, 1, ly0, 1, IDENTITY, b->aspect);
     }
     VkImageAspectFlags aspect = b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : b->aspect;
+    // NVN depth-stencil mode STENCIL (texture or view): sample the stencil (the shader's slot is an integer sampler,
+    // ShaderKey.stencil_tex)
+    if ((b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) && (v && (v->setmask & 16) ? v->ds_mode : t->ds_mode) == 1)
+        aspect = VK_IMAGE_ASPECT_STENCIL_BIT;
     VkComponentMapping sw = IDENTITY;
     if (!(b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) && b->samples == 1) {
         const uint8_t *s = v && (v->setmask & 8) ? v->swizzle : t->swizzle;

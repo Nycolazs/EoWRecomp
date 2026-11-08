@@ -1370,6 +1370,7 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     const uint8_t *vb = (const uint8_t *)vkey;
     for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
+    if (fkey->stencil_tex) { h ^= fkey->stencil_tex; h *= 0x100000001B3ull; }  // (keys without it hash as before)
     if (!h) h = 1;
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
@@ -1704,6 +1705,28 @@ static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_) {
     uint32_t tic = h & 0xFFFFF;
     if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
     return ((NvnTexEntry *)st.tpool->entries)[tic].tex;
+}
+
+// Texture slots of a translated stage bound to the stencil of a depth-stencil texture (NVN depth-stencil mode
+// STENCIL on the view or the texture, or a stencil-only format): ShaderKey.stencil_tex for the GLSL integer samplers.
+// The rifts' cut-out draw (fs 12a46f5000: pulls the scene's depth in front of itself where two stencil bits are clear,
+// so the EQUAL pass leaves a hole) reads the stencil that way; sampled as depth, the float's bits decided: in Hyrule
+// Castle Town the houses' roofs and walls came out striped and doorsteps black.
+static uint16_t stencil_slots(int stage, const ShaderInfo *si) {
+    uint16_t m = 0;
+    for (int i = 0; i < si->ntex && i < 16; i++) {
+        const ShaderTexture *t_ = &si->tex[i];
+        if (t_->is_image || t_->shadow || t_->bindless) continue;
+        int slot = ((int)t_->handle_offset - 0x20) / 8;
+        uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
+        uint32_t tic = h & 0xFFFFF;
+        if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) continue;
+        const NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
+        if (!e->tex || !renderer_format_has_stencil(e->tex->format)) continue;
+        uint32_t mode = e->has_view && (e->view.setmask & 16) ? e->view.ds_mode : e->tex->ds_mode;
+        if (mode == 1 || e->tex->format == 0x31) m |= (uint16_t)(1u << i);
+    }
+    return m;
 }
 
 static bool is_attachment(NvnTexture *t) {
@@ -2851,6 +2874,10 @@ static void draw_(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
     Prog *pr = get_program(st.program, &vkey, &fkey);
     if (!pr || atomic_load(&pr->state) != 1) { SKIP(pr && atomic_load(&pr->state) == 0 ? SKIP_PROG_PENDING : SKIP_PROG_FAILED); return; }
+    if ((fkey.stencil_tex = stencil_slots(1, pr->fi))) {  // a stencil view bound: the variant with integer samplers
+        pr = get_program(st.program, &vkey, &fkey);
+        if (!pr || atomic_load(&pr->state) != 1) { SKIP(pr && atomic_load(&pr->state) == 0 ? SKIP_PROG_PENDING : SKIP_PROG_FAILED); return; }
+    }
     {   // fragment-shader hash: skip lists (EOWRECOMP_SKIP_FSHASH), debug logging
         static uint64_t last_fs, last_hash;
         uint64_t fs = st.program->stages[1].code_addr;
