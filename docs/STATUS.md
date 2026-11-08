@@ -163,3 +163,14 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
 ### Pendências conhecidas
 - `docs/linux.md` / `docs/BUILD-windows.md` ainda são do LAS.
 - Widescreen, ícones de botão, menu sem abas específicas do EoW: M7.
+
+### Sessão 4, continuação (2026-11-08): travamento de pipelines no Windows / Radeon RX 580
+- Log com `[vk] jobs`: tradutor ocioso, 16 workers presos por minutos, sempre no mesmo job: `p fs code 72a5c12e00, glsl 50007 bytes`
+  (criação de pipeline, `build_pipeline`). >186 s sem terminar, memória privada até 38 GB; draws pulados (pipeline compiling).
+  Causa ainda não provada (driver AMD Windows vs. forma do GLSL).
+- `EOWRECOMP_MAX_FS_GLSL=<bytes>` falha os pipelines de fragment shaders maiores que isso (experimento). `EOWRECOMP_SAVE_MSL=1`
+  grava `build/glsl/<code>_fs.glsl` para inspeção.
+- Pista do LASRecomp (branch `beta_6`, não a `main`): modo de shaders estruturados (`LARECOMP_VK_STRUCTURE`, `static_stacks_resolve`,
+  `struct_blocks`, port do StructuredIr do Ryujinx, MIT): if/else/do-while em vez do laço `switch (pc)`; padrão no Mali/Adreno.
+  Candidato a port se o `.glsl` travado for dominado pelo laço `switch (pc)`.
+- Próximo passo: o usuário roda com `EOWRECOMP_MAX_FS_GLSL=30000` e `EOWRECOMP_SAVE_MSL=1`, manda `eowrecomp.log` e o `.glsl`.
