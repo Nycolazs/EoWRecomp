@@ -1541,6 +1541,18 @@ static void build_pipeline(void *arg) {
     Pipe *pp = arg;
     PipeKey *k = &pp->k;
     wk_label(2, k->prog->code[1], strlen(k->prog->fi->msl));
+    {   // Windows log (Radeon RX 580, 2026-11-08): pipelines for a ~50 KB fragment shader (code 72a5c12e00) never finished -
+        // 186 s and counting, private memory up to 38 GB, every worker eventually stuck. EOWRECOMP_MAX_FS_GLSL=<bytes>
+        // fails those pipelines at once (their draws are skipped) so the rest can render.
+        static size_t lim = (size_t)-1;
+        if (lim == (size_t)-1) { const char *e = getenv("EOWRECOMP_MAX_FS_GLSL"); lim = e && atoi(e) > 0 ? (size_t)atoi(e) : 0; }
+        if (lim && strlen(k->prog->fi->msl) > lim) {
+            LOG("[vk] pipeline skipped: fs code %llx has %zu bytes of GLSL (EOWRECOMP_MAX_FS_GLSL=%zu)\n",
+                (unsigned long long)k->prog->code[1], strlen(k->prog->fi->msl), lim);
+            atomic_store(&pp->state, 2);
+            return;
+        }
+    }
     VkPipelineShaderStageCreateInfo stages[2] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = k->prog->vs, .pName = "main"},
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = k->prog->fs, .pName = "main"}};
