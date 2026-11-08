@@ -584,12 +584,15 @@ static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t g_tr_start, g_wk_start[MAX_WORKERS];
 static _Atomic int g_nworkers, g_tq_len, g_jq_len;
 // ...and which job: kind (c compile_program, p build_pipeline, k build_compute), fragment code address, fragment GLSL size.
-static _Atomic uint64_t g_wk_code[MAX_WORKERS], g_wk_size[MAX_WORKERS];
+static _Atomic uint64_t g_wk_code[MAX_WORKERS], g_wk_size[MAX_WORKERS], g_wk_vcode[MAX_WORKERS], g_wk_vsize[MAX_WORKERS];
 static _Atomic int g_wk_kind[MAX_WORKERS];
 static _Thread_local int tl_wk = -1;
-static void wk_label(int kind, uint64_t code, uint64_t size) {
+// (the vertex shader too: the 2026-11-08 log had a 4.8 KB fragment shader's pipeline running for 179 s, so the stuck part
+// may be the vertex shader or the pair)
+static void wk_label(int kind, uint64_t code, uint64_t size, uint64_t vcode, uint64_t vsize) {
     if (tl_wk < 0) return;  // (blocking mode: no worker)
     atomic_store(&g_wk_kind[tl_wk], kind); atomic_store(&g_wk_code[tl_wk], code); atomic_store(&g_wk_size[tl_wk], size);
+    atomic_store(&g_wk_vcode[tl_wk], vcode); atomic_store(&g_wk_vsize[tl_wk], vsize);
 }
 
 static void *worker(void *a) {
@@ -608,7 +611,10 @@ static void *worker(void *a) {
         j->fn(j->arg);
         atomic_store(&g_wk_start[id], 0);
         // (a driver that takes seconds per pipeline leaves the draws that need it skipped for just as long)
-        if (SDL_GetTicks() - t0 >= 1500) LOG("[vk] slow shader/pipeline build: %llu ms (worker)\n", (unsigned long long)(SDL_GetTicks() - t0));
+        if (SDL_GetTicks() - t0 >= 1500)
+            LOG("[vk] slow shader/pipeline build: %llu ms (worker) %c fs code %llx glsl %llu, vs code %llx glsl %llu\n",
+                (unsigned long long)(SDL_GetTicks() - t0), "?cpk"[atomic_load(&g_wk_kind[id]) & 3], (unsigned long long)atomic_load(&g_wk_code[id]),
+                (unsigned long long)atomic_load(&g_wk_size[id]), (unsigned long long)atomic_load(&g_wk_vcode[id]), (unsigned long long)atomic_load(&g_wk_vsize[id]));
         free(j);
     }
     return NULL;
@@ -628,8 +634,10 @@ void vk_jobs_status(char *buf, size_t size) {
              ts ? "busy for" : "idle", (unsigned long long)(ts ? now - ts : 0), atomic_load(&g_tq_len), busy, n,
              (unsigned long long)longest, atomic_load(&g_jq_len));
     if (lw >= 0 && l > 0 && (size_t)l < size)
-        snprintf(buf + l, size - l, "; longest job: %c fs code %llx, glsl %llu bytes", "?cpk"[atomic_load(&g_wk_kind[lw]) & 3],
-                 (unsigned long long)atomic_load(&g_wk_code[lw]), (unsigned long long)atomic_load(&g_wk_size[lw]));
+        snprintf(buf + l, size - l, "; longest job: %c fs code %llx, glsl %llu bytes; vs code %llx, glsl %llu bytes",
+                 "?cpk"[atomic_load(&g_wk_kind[lw]) & 3], (unsigned long long)atomic_load(&g_wk_code[lw]),
+                 (unsigned long long)atomic_load(&g_wk_size[lw]), (unsigned long long)atomic_load(&g_wk_vcode[lw]),
+                 (unsigned long long)atomic_load(&g_wk_vsize[lw]));
 }
 
 static bool sync_shaders(void) {
@@ -1260,7 +1268,7 @@ static void save_glsl(const char *src, uint64_t addr, const char *suffix) {
 static void compile_program(void *arg) {
     Prog *p = arg;
     size_t nv = 0, nf = 0;
-    wk_label(1, p->code[1], strlen(p->fi->msl));
+    wk_label(1, p->code[1], strlen(p->fi->msl), p->code[0], strlen(p->vi->msl));
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
     uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
     if (!sv || !sf) { free(sv); free(sf); atomic_store(&p->state, 2); return; }
@@ -1541,7 +1549,7 @@ static VkPrimitiveTopology topo_class_base(uint8_t c) {
 static void build_pipeline(void *arg) {
     Pipe *pp = arg;
     PipeKey *k = &pp->k;
-    wk_label(2, k->prog->code[1], strlen(k->prog->fi->msl));
+    wk_label(2, k->prog->code[1], strlen(k->prog->fi->msl), k->prog->code[0], strlen(k->prog->vi->msl));
     {   // Windows log (Radeon RX 580, 2026-11-08): pipelines for a ~50 KB fragment shader (code 72a5c12e00) never finished -
         // 186 s and counting, private memory up to 38 GB, every worker eventually stuck. EOWRECOMP_MAX_FS_GLSL=<bytes>
         // fails those pipelines at once (their draws are skipped) so the rest can render.
@@ -2506,7 +2514,7 @@ typedef struct { Prog p; ShaderInfo *si; VkPipeline pipe; uint32_t local[3]; } C
 static void build_compute(void *arg) {
     CsProg *cp = arg;
     size_t n = 0;
-    wk_label(3, 0, strlen(cp->si->msl));
+    wk_label(3, 0, strlen(cp->si->msl), 0, 0);
     uint32_t *spv = vk_glsl_to_spirv(cp->si->msl, STAGE_COMPUTE, "cs", &n);
     if (!spv) { atomic_store(&cp->p.state, 2); return; }
     cp->p.nbinds = vk_reflect(spv, n, cp->p.binds, MAX_BIND);

@@ -240,7 +240,8 @@ static void create_device(void) {
     // pipeline cache: cache/vk_pipelines.bin (written by vk_pipeline_cache_save)
     size_t sz = 0;
     void *data = NULL;
-    FILE *fp = fopen("cache/vk_pipelines.bin", "rb");
+    // EOWRECOMP_NO_PIPELINE_CACHE=1: neither load nor save the cache (rules it out when pipeline builds take minutes)
+    FILE *fp = getenv("EOWRECOMP_NO_PIPELINE_CACHE") ? NULL : fopen("cache/vk_pipelines.bin", "rb");
     if (fp) {
         fseek(fp, 0, SEEK_END);
         sz = (size_t)ftell(fp);
@@ -259,6 +260,7 @@ static void create_device(void) {
 }
 
 void vk_pipeline_cache_save(void) {
+    if (getenv("EOWRECOMP_NO_PIPELINE_CACHE")) return;
     size_t sz = 0;
     if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz) return;
     void *data = malloc(sz);
