@@ -62,6 +62,11 @@ seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p*
   `NVN_TEXTURE_FLAGS_IMAGE` ganham uso storage). 0 dispatches pulados; no dungeon do prólogo a imagem não muda.
 - **Thread de UI girando um core grande**: o `SDL_WaitEventTimeout` do Android nunca dorme (cada pump enfileira um
   sentinel que acorda o loop). Agora `SDL_PollEvent` + 4 ms: CPU do app 3,1 -> 1,2 G ciclos/s (simpleperf), mesmo fps.
+- **Crash quando a Zelda é libertada** (fim do prólogo): `FATAL: no function at 1001a65870`. `f_7001a657e0` (switch
+  0-8, tabela `ldrh`) tinha 4 `mov` entre o `add` e o `br`: o `adr` da base ficou fora da janela de 6 instruções de
+  `adr_feeds_br`, foi tomado por callback e a função partida no primeiro caso (casos 1-8 sem função). Janela 16
+  (para em b/bl/blr/ret): +46 tabelas nos quatro módulos. Visto no C gerado (os 9 casos no switch); no aparelho, a
+  confirmar repetindo o fim do prólogo (o usuário).
 
 ### Ainda errado / medido no Thor
 - A lista "Which data would you like to load?" vazia por alguns segundos e objetos que aparecem um pouco depois na
