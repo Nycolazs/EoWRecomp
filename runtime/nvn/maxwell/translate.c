@@ -163,6 +163,13 @@ static const char *operand_b(Ctx *c, uint64_t w, bool float_imm, char *buf) {
 }
 #define B(fi) operand_b(c, w, (fi), alloca(128))
 
+// A video-instruction (VMNMX...) source: width 0/1 = byte, 2 = short (picked by the selector), 3 = the whole word.
+static void video_operand(char *buf, const char *v, int width, int sel, bool sgn) {
+    if (width == 3) { sprintf(buf, "%s", v); return; }
+    int len = width == 2 ? 16 : 8;
+    sprintf(buf, "%s(%s, 0x%xu)", sgn ? "bfe_s" : "bfe_u", v, (unsigned)((len << 8) | (sel * len)));
+}
+
 // The "C" operand of three-source ops: REG_39, or the cbuf/reg swap form (0x51/0x53/... classes).
 static const char *operand_c_for_ffma(Ctx *c, uint64_t w, char *buf, const char **b_out, char *bbuf) {
     uint64_t op8 = w >> 56;
@@ -854,6 +861,60 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     else
         sprintf(call, "t%d.sample(s%d, %s(%s)%s%s%s%s)", slot, slot, vec, coords, array ? ", " : "", layer, lod, off);
     write_tex_result(c, slot, call, mask, d, RZ, false, false);
+}
+
+// RED / ATOM on global memory: value register vr, address register a (a 64-bit pair with .E, bit 48) + signed offset
+// 28-47, size 0 = U32 / 1 = S32, op ADD MIN MAX INC DEC AND OR XOR EXCH; the old word goes to dst (RZ: dropped).
+static void gmem_atomic(Ctx *c, uint64_t w, int a, int vr, int dst, int size, int op) {
+    bool wide = bits(w, 48, 1);
+    int64_t off = sbits(w, 28, 20);
+    if (size > 1 || op > 8) { fail(c, "atomic size %d op %d", size, op); return; }
+    bool cas = (op == 1 || op == 2) && size == 1;  // S32 min/max: the uint words' atomicMin/Max would compare unsigned
+    if (op == 3 || op == 4) cas = true;                // INC / DEC (wrapping at the value, as CUDA's atomicInc/Dec)
+    if (cas && !c->glsl && op > 2) { fail(c, "atomic inc/dec"); return; }
+    static const char *const gl_op[] = {"atomicAdd", "atomicMin", "atomicMax", "", "", "atomicAnd", "atomicOr", "atomicXor",
+                                        "atomicExchange"};
+    static const char *const ms_op[] = {"atomic_fetch_add_explicit", "atomic_fetch_min_explicit", "atomic_fetch_max_explicit", "", "",
+                                        "atomic_fetch_and_explicit", "atomic_fetch_or_explicit", "atomic_fetch_xor_explicit",
+                                        "atomic_exchange_explicit"};
+    // GLSL compare-and-swap loop for the ops the uint atomics lack: the new word from the old one (o_) and the value (v_)
+    static const char *const gl_cas[] = {"", "uint(min(int(o_), int(v_)))", "uint(max(int(o_), int(v_)))",
+                                         "(o_ >= v_ ? 0u : o_ + 1u)", "((o_ == 0u || o_ > v_) ? v_ : o_ - 1u)"};
+    c->info->uses_gmem = true;
+    c->uses_gmem_store = true;
+    c->info->uses_gmem_store = true;
+    char addr[256];
+    if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
+    else if (wide) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
+    else sprintf(addr, "(ulong(%s) + ulong(%lld))", R(a), (long long)off);
+    sp(&c->body, "    { ulong ga = %s - 0x%llxul; bool ok = ga < 0x%llxul; uint v_ = %s, o_ = 0u;\n", addr,
+       (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size, R(vr));
+    if (c->glsl && cas) {
+        const char *word = "gmw(uint(ga >> 2))";
+        if (c->stage == STAGE_COMPUTE) {
+            c->info->uses_gmem_map = true;
+            sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
+            sp(&c->body, "      if (fw != 0xFFFFFFFFu) { o_ = gfast_.w[fw]; for (;;) { uint p_ = atomicCompSwap(gfast_.w[fw], o_, %s); "
+               "if (p_ == o_) break; o_ = p_; } }\n      else ", gl_cas[op]);
+        } else {
+            sp(&c->body, "      ");
+        }
+        sp(&c->body, "if (ok) { o_ = %s; for (;;) { uint p_ = atomicCompSwap(%s, o_, %s); if (p_ == o_) break; o_ = p_; } }\n",
+           word, word, gl_cas[op]);
+    } else if (c->glsl && c->stage == STAGE_COMPUTE) {  // (the dispatch's storage buffers have a device-local copy: see LDG / STG)
+        c->info->uses_gmem_map = true;
+        sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
+        sp(&c->body, "      if (fw != 0xFFFFFFFFu) o_ = %s(gfast_.w[fw], v_); else if (ok) o_ = %s(gmw(uint(ga >> 2)), v_);\n",
+           gl_op[op], gl_op[op]);
+    } else if (c->glsl) {
+        sp(&c->body, "      if (ok) o_ = %s(gmw(uint(ga >> 2)), v_);\n", gl_op[op]);
+    } else if (cas) {  // MSL: signed min/max on the word as an atomic_int
+        sp(&c->body, "      if (ok) o_ = uint(%s((device atomic_int *)(gmem + ga), int(v_), memory_order_relaxed));\n", ms_op[op]);
+    } else {
+        sp(&c->body, "      if (ok) o_ = %s((device atomic_uint *)(gmem + ga), v_, memory_order_relaxed);\n", ms_op[op]);
+    }
+    set_reg(c, dst, "o_");
+    sp(&c->body, "    }\n");
 }
 
 // ------------------------------------------------------------------ instruction translation
@@ -1642,53 +1703,12 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0xebf8000000000000ull, 0xfff8000000000000ull)) {  // RED: atomic reduction to global memory, no result
         // fields per Ryujinx's InstRed: value 0-7, address 8-15 (64-bit pair with .E, bit 48), size 20-22, op 23-25,
         // offset 28-47 (signed). Checked on Echoes of Wisdom's ebf9000003070002: RED.E.OR [R0], R2.
-        int size = (int)bits(w, 20, 3), op = (int)bits(w, 23, 3), vr = d;
-        bool wide = bits(w, 48, 1);
-        int64_t off = sbits(w, 28, 20);
-        if (size > 1) fail(c, "red size %d", size);
-        bool cas = (op == 1 || op == 2) && size == 1;  // S32 min/max: the uint words' atomicMin/Max would compare unsigned
-        if (op == 3 || op == 4) cas = true;                // INC / DEC (wrapping at the value, as CUDA's atomicInc/Dec)
-        if (cas && !c->glsl && op > 2) fail(c, "red inc/dec");
-        static const char *const gl_op[] = {"atomicAdd", "atomicMin", "atomicMax", "", "", "atomicAnd", "atomicOr", "atomicXor"};
-        static const char *const ms_op[] = {"atomic_fetch_add_explicit", "atomic_fetch_min_explicit", "atomic_fetch_max_explicit", "", "",
-                                            "atomic_fetch_and_explicit", "atomic_fetch_or_explicit", "atomic_fetch_xor_explicit"};
-        // GLSL compare-and-swap loop for the ops the uint atomics lack: the new word from the old one (o_) and the value (v_)
-        static const char *const gl_cas[] = {"", "uint(min(int(o_), int(v_)))", "uint(max(int(o_), int(v_)))",
-                                             "(o_ >= v_ ? 0u : o_ + 1u)", "((o_ == 0u || o_ > v_) ? v_ : o_ - 1u)"};
-        c->info->uses_gmem = true;
-        c->uses_gmem_store = true;
-        c->info->uses_gmem_store = true;
-        char addr[256];
-        if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
-        else if (wide) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
-        else sprintf(addr, "(ulong(%s) + ulong(%lld))", R(a), (long long)off);
-        sp(&c->body, "    { ulong ga = %s - 0x%llxul; bool ok = ga < 0x%llxul;\n", addr,
-           (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size);
-        if (c->glsl && cas) {
-            const char *word = "gmw(uint(ga >> 2))";
-            if (c->stage == STAGE_COMPUTE) {
-                c->info->uses_gmem_map = true;
-                sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
-                sp(&c->body, "      if (fw != 0xFFFFFFFFu) { uint v_ = %s, o_ = gfast_.w[fw]; for (;;) { uint p_ = atomicCompSwap(gfast_.w[fw], o_, %s); "
-                   "if (p_ == o_) break; o_ = p_; } }\n      else ", R(vr), gl_cas[op]);
-            } else {
-                sp(&c->body, "      ");
-            }
-            sp(&c->body, "if (ok) { uint v_ = %s, o_ = %s; for (;;) { uint p_ = atomicCompSwap(%s, o_, %s); if (p_ == o_) break; o_ = p_; } }\n",
-               R(vr), word, word, gl_cas[op]);
-        } else if (c->glsl && c->stage == STAGE_COMPUTE) {  // (the dispatch's storage buffers have a device-local copy: see LDG / STG)
-            c->info->uses_gmem_map = true;
-            sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
-            sp(&c->body, "      if (fw != 0xFFFFFFFFu) %s(gfast_.w[fw], %s); else if (ok) %s(gmw(uint(ga >> 2)), %s);\n", gl_op[op],
-               R(vr), gl_op[op], R(vr));
-        } else if (c->glsl) {
-            sp(&c->body, "      if (ok) %s(gmw(uint(ga >> 2)), %s);\n", gl_op[op], R(vr));
-        } else if (cas) {  // MSL: signed min/max on the word as an atomic_int
-            sp(&c->body, "      if (ok) %s((device atomic_int *)(gmem + ga), int(%s), memory_order_relaxed);\n", ms_op[op], R(vr));
-        } else {
-            sp(&c->body, "      if (ok) %s((device atomic_uint *)(gmem + ga), %s, memory_order_relaxed);\n", ms_op[op], R(vr));
-        }
-        sp(&c->body, "    }\n");
+        gmem_atomic(c, w, a, d, RZ, (int)bits(w, 20, 3), (int)bits(w, 23, 3));
+    } else if (OPM(0xed00000000000000ull, 0xff00000000000000ull)) {  // ATOM: atomic on global memory, old value to Rd
+        // As RED, but the value in 20-27, size 49-51, op 52-55 (envytools / yuzu's ATOM), and the old word returned.
+        // Seen as ed03000000500005 (ATOM.E.ADD.S32 R5, [R0], R5) in two compute shaders of the game (12a4711000,
+        // 12a4715000): unknown, every dispatch of theirs was skipped.
+        gmem_atomic(c, w, a, (int)bits(w, 20, 8), d, (int)bits(w, 49, 3), (int)bits(w, 52, 4));
     } else if (OPM(0x38f0000000000000ull, 0xfef8000000000000ull) || OPM(0x5cf0000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x4cf0000000000000ull, 0xfff8000000000000ull)) {  // R2P
         if (bits(w, 40, 1)) { fail(c, "r2p cc"); }
@@ -1768,6 +1788,25 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int s = img_slot(c, off);
         sp(&c->body, "    imageStore(t%d, ivec2(int(%s), int(%s)), vec4(as_f(%s), as_f(%s), as_f(%s), as_f(%s)));\n", s, R(a), R(a + 1),
            R(d), R(d + 1), R(d + 2), R(d + 3));
+    } else if (OPM(0x3a00000000000000ull, 0xfe00000000000000ull)) {  // VMNMX: d = min/max(min/max(a, b), c)
+        // A three-way signed max (word operands) in two compute shaders of the game (12a4711000, 12a4715000): unknown, they
+        // failed to translate and every dispatch of theirs was skipped. Layout as in envytools / yuzu's VMNMX: operand
+        // widths 37 (a) / 29 (b) with byte/short selectors below them, b an imm16 unless bit 50, the inner min/max (bit
+        // 56 = max) signed by b's sign, the outer op at 51 (5 = MIN, 6 = MAX) signed by bit 54.
+        if (bits(w, 47, 1) || bits(w, 55, 1)) { fail(c, "vmnmx cc/sat"); return; }
+        int op = (int)bits(w, 51, 3);
+        if (op != 5 && op != 6) { fail(c, "vmnmx merge op %d", op); return; }
+        bool breg = bits(w, 50, 1), sa = bits(w, 48, 1), sb = bits(w, 49, 1), so = bits(w, 54, 1);
+        char av[192], bv[192], ib[32], inner[512];
+        video_operand(av, R(a), (int)bits(w, 37, 2), (int)bits(w, 36, 2), sa);
+        if (breg) video_operand(bv, R((int)bits(w, 20, 8)), (int)bits(w, 29, 2), (int)bits(w, 28, 2), sb);
+        else { sprintf(ib, "0x%xu", (uint32_t)bits(w, 20, 16)); video_operand(bv, ib, 2, 0, sb); }
+        const char *f1 = bits(w, 56, 1) ? "max" : "min", *f2 = op == 6 ? "max" : "min";
+        if (sb) sprintf(inner, "uint(%s(int(%s), int(%s)))", f1, av, bv);
+        else sprintf(inner, "%s(%s, %s)", f1, av, bv);
+        if (so) sprintf(t, "uint(%s(int(%s), int(%s)))", f2, inner, R((int)bits(w, 39, 8)));
+        else sprintf(t, "%s(%s, %s)", f2, inner, R((int)bits(w, 39, 8)));
+        set_reg(c, d, t);
     } else {
         fail(c, "unknown instruction %016llx at %#x", (unsigned long long)w, pc);
     }
