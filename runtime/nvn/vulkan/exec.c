@@ -583,9 +583,18 @@ static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 #define MAX_WORKERS 32
 static _Atomic uint64_t g_tr_start, g_wk_start[MAX_WORKERS];
 static _Atomic int g_nworkers, g_tq_len, g_jq_len;
+// ...and which job: kind (c compile_program, p build_pipeline, k build_compute), fragment code address, fragment GLSL size.
+static _Atomic uint64_t g_wk_code[MAX_WORKERS], g_wk_size[MAX_WORKERS];
+static _Atomic int g_wk_kind[MAX_WORKERS];
+static _Thread_local int tl_wk = -1;
+static void wk_label(int kind, uint64_t code, uint64_t size) {
+    if (tl_wk < 0) return;  // (blocking mode: no worker)
+    atomic_store(&g_wk_kind[tl_wk], kind); atomic_store(&g_wk_code[tl_wk], code); atomic_store(&g_wk_size[tl_wk], size);
+}
 
 static void *worker(void *a) {
     int id = (int)(intptr_t)a;
+    tl_wk = id;
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
@@ -610,13 +619,17 @@ void vk_jobs_status(char *buf, size_t size) {
     uint64_t ts = atomic_load(&g_tr_start);
     int n = atomic_load(&g_nworkers), busy = 0;
     uint64_t longest = 0;
+    int lw = -1;
     for (int i = 0; i < n; i++) {
         uint64_t st = atomic_load(&g_wk_start[i]);
-        if (st) { busy++; if (now - st > longest) longest = now - st; }
+        if (st) { busy++; if (now - st > longest) { longest = now - st; lw = i; } }
     }
-    snprintf(buf, size, "translator %s %llu ms, %d queued; compile workers busy %d of %d (longest %llu ms), %d queued",
+    int l = snprintf(buf, size, "translator %s %llu ms, %d queued; compile workers busy %d of %d (longest %llu ms), %d queued",
              ts ? "busy for" : "idle", (unsigned long long)(ts ? now - ts : 0), atomic_load(&g_tq_len), busy, n,
              (unsigned long long)longest, atomic_load(&g_jq_len));
+    if (lw >= 0 && l > 0 && (size_t)l < size)
+        snprintf(buf + l, size - l, "; longest job: %c fs code %llx, glsl %llu bytes", "?cpk"[atomic_load(&g_wk_kind[lw]) & 3],
+                 (unsigned long long)atomic_load(&g_wk_code[lw]), (unsigned long long)atomic_load(&g_wk_size[lw]));
 }
 
 static bool sync_shaders(void) {
@@ -1246,6 +1259,7 @@ static void save_glsl(const char *src, uint64_t addr, const char *suffix) {
 static void compile_program(void *arg) {
     Prog *p = arg;
     size_t nv = 0, nf = 0;
+    wk_label(1, p->code[1], strlen(p->fi->msl));
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
     uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
     if (!sv || !sf) { free(sv); free(sf); atomic_store(&p->state, 2); return; }
@@ -1526,6 +1540,7 @@ static VkPrimitiveTopology topo_class_base(uint8_t c) {
 static void build_pipeline(void *arg) {
     Pipe *pp = arg;
     PipeKey *k = &pp->k;
+    wk_label(2, k->prog->code[1], strlen(k->prog->fi->msl));
     VkPipelineShaderStageCreateInfo stages[2] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = k->prog->vs, .pName = "main"},
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = k->prog->fs, .pName = "main"}};
@@ -2478,6 +2493,7 @@ typedef struct { Prog p; ShaderInfo *si; VkPipeline pipe; uint32_t local[3]; } C
 static void build_compute(void *arg) {
     CsProg *cp = arg;
     size_t n = 0;
+    wk_label(3, 0, strlen(cp->si->msl));
     uint32_t *spv = vk_glsl_to_spirv(cp->si->msl, STAGE_COMPUTE, "cs", &n);
     if (!spv) { atomic_store(&cp->p.state, 2); return; }
     cp->p.nbinds = vk_reflect(spv, n, cp->p.binds, MAX_BIND);
