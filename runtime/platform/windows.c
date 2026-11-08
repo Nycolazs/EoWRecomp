@@ -1,5 +1,7 @@
 // Windows host layer (runtime/platform.h).
+#define PSAPI_VERSION 2  // (K32GetProcessMemoryInfo from kernel32.dll: no psapi.lib to link)
 #include <windows.h>
+#include <psapi.h>
 #include "cpu_check.h"
 #include <fcntl.h>
 #include <stdio.h>
@@ -196,6 +198,15 @@ void plat_init(void) {
         .StateMask = 0,
     };
     SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof pt);
+}
+
+bool plat_mem_mb(size_t *working, size_t *priv, size_t *peak) {
+    PROCESS_MEMORY_COUNTERS_EX pmc = {sizeof pmc};
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof pmc)) return false;
+    *working = pmc.WorkingSetSize >> 20;
+    *priv = pmc.PrivateUsage >> 20;
+    *peak = pmc.PeakWorkingSetSize >> 20;
+    return true;
 }
 
 bool plat_exe_path(char *buf, size_t size) {

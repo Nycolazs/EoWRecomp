@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "../../paths.h"
+#include "../../platform.h"
 #include "../../settings.h"
 #include "../../ui/menu.h"
 #include "../../ui/touch.h"
@@ -718,6 +719,13 @@ void backend_present(NvnTexture *t) {
         if (last_fps_time > 0)
             LOG("[vk] t=%.1f frame %llu %.1f fps max %.0fms level %s (%s)\n", now, (unsigned long long)total_frames,
                 frames / (now - last_fps_time), max_gap * 1000.0, game_level_name(), renderer_stats());
+#ifdef _WIN32
+        // (every ~10 s: whether the RAM use grows, and how much of it is committed but not resident)
+        static int mem_n;
+        size_t ws, pv, pk;
+        if (mem_n++ % 5 == 0 && plat_mem_mb(&ws, &pv, &pk))
+            LOG("[mem] working set %zu MB, private %zu MB, peak working set %zu MB\n", ws, pv, pk);
+#endif
         max_gap = 0;
         frames = 0;
         last_fps_time = now;

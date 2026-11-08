@@ -642,6 +642,9 @@ static void run_job(void (*fn)(void *), void *arg) {
         int n = SDL_GetNumLogicalCPUCores() - 4;
         if (n < 4) n = 4;
         if (n > 16) n = 16;
+        const char *e = getenv("EOWRECOMP_SHADER_THREADS");  // fewer: less CPU and RAM (each worker has its own compiler)
+        if (e && atoi(e) > 0) n = atoi(e) > 32 ? 32 : atoi(e);
+        LOG("[vk] %d shader/pipeline worker threads\n", n);
         for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, NULL); }
     }
     Job *j = malloc(sizeof *j);
