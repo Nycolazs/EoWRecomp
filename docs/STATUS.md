@@ -95,7 +95,9 @@ seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p*
 
 ### Próximo passo (Android)
 1. Passar da fuga do Rift (o percurso automático morre nela) e medir o overworld.
-2. Shader de fundo do pass `12a46f5000` (263 instruções, 1 draw) custa 4,3 ms de GPU na fuga: ver por quê.
+2. GPU na fuga (agora ~15 ms por frame): o mais caro é o fragment shader `12a5c12e00` (2727 instruções, piso e
+   paredes), ~1,2 ms por draw em 3-4 draws grandes; o pass de `12a46f5000` que parecia custar 4,3 ms custa 0,45 ms
+   (a medida antiga somava a espera do timeline).
 3. CPU do thread do jogo: a sincronização entre threads do guest (tempo no kernel).
 4. Áudio e save em jogo mais longo.
 
