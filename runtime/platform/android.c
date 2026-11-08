@@ -527,6 +527,24 @@ void plat_thread_core(int role) {
         fprintf(stderr, "[cpu] affinity: %s\n", strerror(errno));
 }
 
+// Threads inherit their creator's affinity: SDL's audio threads (SDLAudioP*, Java's AudioTrack), opened from a thread on
+// the render core, sat on the fastest core with the render thread. Around such a creation the caller moves to the
+// other cores and back.
+void plat_children_elsewhere(bool begin) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    static __thread cpu_set_t saved;
+    static __thread bool have;
+    pthread_once(&once, core_scan);
+    if (!g_core_on) return;
+    if (begin) {
+        have = sched_getaffinity(0, sizeof saved, &saved) == 0;
+        if (have) sched_setaffinity(0, sizeof g_core_sets[PLAT_CORE_OTHER], &g_core_sets[PLAT_CORE_OTHER]);
+    } else if (have) {
+        sched_setaffinity(0, sizeof saved, &saved);
+        have = false;
+    }
+}
+
 void plat_frame_work(uint64_t busy_ns, uint64_t target_ns) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     static int64_t target;

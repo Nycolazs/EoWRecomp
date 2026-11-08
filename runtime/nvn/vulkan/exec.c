@@ -581,8 +581,12 @@ static Job *jobs_head, *jobs_tail;
 static pthread_mutex_t jobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
+// Helper threads (pipeline compiles, shader translation) are created by the render thread and would inherit its
+// affinity: the fastest core alone (objects.c). Sharing it preempted the render thread (PokeZ-Android on the same
+// Thor: 21k context switches/s, a third of the render thread's time runnable but not running): they go elsewhere.
 static void *worker(void *a) {
     (void)a;
+    plat_thread_core(PLAT_CORE_OTHER);
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
@@ -610,6 +614,7 @@ static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
     (void)a;
+    plat_thread_core(PLAT_CORE_OTHER);
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
         while (!tjobs_head) pthread_cond_wait(&tjobs_cond, &tjobs_lock);

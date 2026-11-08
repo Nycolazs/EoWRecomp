@@ -46,6 +46,9 @@ void plat_thread_name(const char *name);       // the calling thread's name in p
 // no-op elsewhere
 enum { PLAT_CORE_MAIN, PLAT_CORE_RENDER, PLAT_CORE_OTHER };
 void plat_thread_core(int role);
+// Threads created between begin (true) and end (false) start on the "other" cores, not the caller's (they inherit
+// its affinity); a no-op elsewhere
+void plat_children_elsewhere(bool begin);
 // Frame work report (phones: Android's performance hints, so the fast cores and clocks come when the game needs
 // them): the game thread's busy time of the frame against the frame's target; a no-op elsewhere
 void plat_frame_work(uint64_t busy_ns, uint64_t target_ns);

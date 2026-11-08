@@ -399,5 +399,6 @@ void plat_terminate(void) { TerminateProcess(GetCurrentProcess(), 0); }
 
 // (phones only: runtime/platform/android.c)
 void plat_thread_core(int role) { (void)role; }
+void plat_children_elsewhere(bool begin) { (void)begin; }
 void plat_frame_work(uint64_t busy_ns, uint64_t target_ns) { (void)busy_ns, (void)target_ns; }
 void plat_thread_name(const char *name) { (void)name; }
