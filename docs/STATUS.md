@@ -1,6 +1,6 @@
 # Status
 
-Atualizado: 2026-11-07 (sessão 4: o jogo roda num celular Android).
+Atualizado: 2026-11-08 (sessão 5: gráficos no Android - fendas, Hyrule Castle Town).
 
 ## Jogo fixado (único build suportado)
 
@@ -81,6 +81,23 @@ seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p*
   (`EOWRECOMP_VK_TIMELINE=1` volta). Mesma fuga, mesmo percurso: 30 fps fixos; cutscenes chegam a 52-60.
   A linha de fps do log agora sempre traz `gpu X ms, main thread cpu Y ms` (por 2 s).
 - `rt_dispatch`: o cache de chamadas indiretas saiu do TLS (TLSDESC no Android) para o `Cpu` do thread.
+- **Sessão 5 (2026-11-08, Thor, Turnip; build 524c797..c15346d)**, a partir do save do usuário em Hyrule Castle
+  Town / castelo:
+  - **Telhados e paredes listrados, soleiras e caminhos pretos** nas casas de Hyrule Castle Town (mudavam com a
+    câmera: as "texturas tremendo" e "sobreposições" do usuário). Causa: o modo depth-stencil STENCIL do NVN (view ou
+    textura) era ignorado - a view era sempre a de profundidade. O draw que recorta a fenda (fs 12a46f5000) lê dois
+    bits do stencil (R2P) e puxa a profundidade da cena para a frente onde eles estão zerados, e o pass com EQUAL
+    depois deixa um buraco; lendo a profundidade, os bits do float decidiam. Agora a view é o aspecto stencil e o slot
+    um sampler inteiro (ShaderKey.stencil_tex). Achado pulando draws num debug frame (`EOWRECOMP_DEBUG_FRAME` +
+    `EOWRECOMP_SKIP_FSHASH`): sem esse draw a casa saía limpa. Visto no Thor (Vulkan): casa, soleira e pedras certas.
+    O backend Metal (`renderer.m`) ainda lê a profundidade nesse caso.
+  - Compute 12a4711000 / 12a4715000 não traduziam (`VMNMX`, depois `ATOM.E.ADD.S32`): todos os dispatches e
+    ~120-850 draws a cada 2 s pulados ("compute program") na sala do trono, na cutscene da fenda e na cidade. Agora
+    0 pulados. `S2R` LANEID e as máscaras de lane (LTMASK etc.) também (o append por warp do mesmo shader).
+  - `fmin`/`fmax`/`saturate` como NMin/NMax/NClamp (do PokeZ-Android): laço de luzes 4,00 -> 3,78 ms, frame
+    21,5 -> 21,3 ms na cidade.
+  - Medido na cidade (GPU por frame, `EOWRECOMP_GPUPROF_AT`): ~21 ms a 30 fps; os mais caros: fs 12a5c12e00
+    (estático) 4,2 ms, laço de luzes 12ee66f300 3,8 ms, pre-pass com skinning 12ee695200 3,6 ms.
 
 ### Ainda errado / medido no Thor
 - A lista "Which data would you like to load?" vazia por alguns segundos e objetos que aparecem um pouco depois na
@@ -92,14 +109,27 @@ seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p*
   disputado), chamados de f_700c4f82b0 / f_700c4fa1f0 do SDK pelos workers do jogo (~17 000 trocas/s no processo).
 - Testado nesta sessão sem defeitos novos: cutscene de abertura do novo jogo (profundidade de campo), combate,
   bombas e explosões, tochas, escadas, menus de pausa (Key Items / System), lista de saves.
+- **Fenda sem o vazio preto?** Em Hyrule Castle Town há uma fenda sobre uma casa: ao vivo aparece só o contorno roxo
+  e a casa inteira dentro dele; num debug frame (passes salvos) o mesmo frame sai com o vazio preto de bordas roxas
+  (o recorte do fs 12a46f5000 aplicado). O mesmo na cutscene da fenda no campo (interior roxo translúcido, árvores
+  visíveis). Não muda com `EOWRECOMP_SYNC_SUBMIT`, `EOWRECOMP_VK_STATE_FILTER=0`, `EOWRECOMP_VK_COPY_OPT=0`,
+  `EOWRECOMP_VK_NO_TEX_MEMO`, `TU_DEBUG=sysmem`/`nolrz`; com o debug frame sem salvar os passes, some. Falta comparar
+  com o jogo no Switch e achar o que salvar os passes muda (barreira / pass extra).
+- Pre-pass e EQUAL: as listras não eram falta de precisão entre os dois vertex shaders (as contas de posição são as
+  mesmas a menos de comutação; um bias de 256 unidades D24 escondia as listras, 128 não - era o recorte da fenda).
 
 ### Próximo passo (Android)
-1. Passar da fuga do Rift (o percurso automático morre nela) e medir o overworld.
-2. GPU na fuga (agora ~15 ms por frame): o mais caro é o fragment shader `12a5c12e00` (2727 instruções, piso e
-   paredes), ~1,2 ms por draw em 3-4 draws grandes; o pass de `12a46f5000` que parecia custar 4,3 ms custa 0,45 ms
-   (a medida antiga somava a espera do timeline).
-3. CPU do thread do jogo: a sincronização entre threads do guest (tempo no kernel).
-4. Áudio e save em jogo mais longo.
+1. Fenda: o vazio que só aparece no debug frame (acima). Comparar com vídeo do Switch na cidade e na cutscene.
+2. Passar da fuga do Rift (o percurso automático morre nela) e medir o overworld.
+3. GPU (cidade ~21 ms por frame): fs `12a5c12e00` (2727 instruções, ~4,2 ms) e o laço de luzes `12ee66f300`
+   (3,8 ms; ballot + shuffles em warps de 32 dentro dos subgroups de 64/128 do Adreno).
+4. CPU do thread do jogo: a sincronização entre threads do guest (tempo no kernel).
+5. Áudio e save em jogo mais longo.
+
+**Para o usuário testar (sessão 5):** Hyrule Castle Town (casas, caminhos, a fenda roxa sobre a casa perto da
+fonte), a sala do trono e a cutscene da fenda no campo: dizer se as fendas no Switch têm o interior preto ali, e se
+ainda há listras, texturas tremendo ou objetos sobrepostos em algum lugar. Na primeira entrada em cada área os
+shaders recompilam (o GLSL mudou): objetos surgindo por alguns segundos é esperado.
 
 Percurso até a fuga a partir do save do usuário (sala do trono): stick esquerda ×2, esquerda-baixo, esquerda-cima,
 baixo, cima (começa a cutscene), A ×10, baixo-esquerda até a escada, A ×4, segurar baixo = fuga.
