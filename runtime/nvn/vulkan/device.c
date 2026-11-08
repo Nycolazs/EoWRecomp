@@ -369,6 +369,12 @@ static VkPresentModeKHR present_mode(void) {
     VkPresentModeKHR m[16];
     if (n > 16) n = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, m);
+    static int logged;
+    if (!logged++) {
+        char modes[64] = "";
+        for (uint32_t i = 0; i < n; i++) snprintf(modes + strlen(modes), sizeof modes - strlen(modes), " %d", (int)m[i]);
+        LOG("[vk] present modes:%s (want %d)\n", modes, (int)want);
+    }
     for (uint32_t i = 0; i < n; i++) if (m[i] == want) return want;
     return VK_PRESENT_MODE_FIFO_KHR;
 }
