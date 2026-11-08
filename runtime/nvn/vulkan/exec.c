@@ -1963,6 +1963,7 @@ static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
     return (VkDescriptorBufferInfo){s.buf, s.off, size > max ? max : size};
 }
 
+static bool gw_cbuf(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out);
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
@@ -2004,7 +2005,9 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     if (size < 16) size = 16;
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
-    // and drops the shared copies).
+    // and drops the shared copies). A range a storing shader of an unfinished submission wrote is read in place.
+    VkDescriptorBufferInfo direct;
+    if (gw_cbuf(r.addr, size, &direct)) return direct;
     return ubo_span(guest_copy(r.addr, size), size);
 }
 
@@ -2092,7 +2095,8 @@ static bool gmem_import_ahb(void) {
         VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
                                                .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = len,
-                                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
+                                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};  // (constant buffers the GPU wrote: gw_cbuf)
         if ((r = vkCreateBuffer(g_vk.dev, &bi, NULL, &gmem_ahb_buf[i])) != VK_SUCCESS) { LOG("[vk] heap buffer: %d\n", r); return false; }
         VkImportAndroidHardwareBufferInfoANDROID imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, .buffer = ahb};
         VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = &imp, .buffer = gmem_ahb_buf[i]};
@@ -2351,12 +2355,93 @@ static void vc_mark_gpu(uint64_t lo, uint64_t hi) {
     vc_epoch++;
 }
 
+// Guest memory written by storing shaders (their storage buffers) in a submission the GPU hasn't finished: constant
+// buffers are snapshotted on the CPU when a draw is recorded (guest_copy), so one the GPU writes first in the same
+// submission would be copied stale.
+#define GW_MAX 32
+static struct { uint64_t lo, hi, seq; } gw[GW_MAX];
+static int ngw;
+static void gw_note(uint64_t lo, uint64_t hi) {
+    uint64_t seq = vk_pending_seq();
+    for (int i = 0; i < ngw; i++)
+        if (gw[i].lo == lo && gw[i].hi == hi) { gw[i].seq = seq; return; }
+    if (ngw == GW_MAX) {  // full: drop the finished ones, else the oldest
+        uint64_t done = vk_completed_seq();
+        int j = 0;
+        for (int i = 0; i < ngw; i++) if (gw[i].seq > done) gw[j++] = gw[i];
+        ngw = j;
+        if (ngw == GW_MAX) { memmove(gw, gw + 1, sizeof gw[0] * (GW_MAX - 1)); ngw--; }
+    }
+    gw[ngw].lo = lo; gw[ngw].hi = hi; gw[ngw].seq = seq;
+    ngw++;
+}
+// the newest unfinished submission that wrote [addr, addr + size), 0: none
+static uint64_t gw_hit(uint64_t addr, uint64_t size) {
+    if (!ngw) return 0;
+    uint64_t done = vk_completed_seq(), hit = 0;
+    bool pending = false;
+    for (int i = 0; i < ngw; i++) {
+        if (gw[i].seq <= done) continue;
+        pending = true;
+        if (addr < gw[i].hi && gw[i].lo < addr + size && gw[i].seq > hit) hit = gw[i].seq;
+    }
+    if (!pending) ngw = 0;
+    return hit;
+}
+
 // A storing shader (stage 0 / 1 / 5) may write any of its bound storage buffers.
 static void vc_mark_sbufs(int stage) {
     for (int i = 0; i < 16; i++) {
         uint64_t a = st.sbuf[stage][i].addr, sz = st.sbuf[stage][i].size;
         if (a >= HEAP_BASE && sz && a - HEAP_BASE < HEAP_MAX) vc_mark_gpu(a - HEAP_BASE, a - HEAP_BASE + sz);
+        if (a && sz) gw_note(a, a + sz);
     }
+}
+
+// Constant buffers a storing shader of an unfinished submission wrote: constant buffers are snapshotted on the CPU
+// when a draw is recorded, which would copy them stale. The rifts: compute shaders write parameters that a later draw
+// of the same submission reads as a constant buffer (Hyrule Castle Town, the field rift cutscene); copied stale, the
+// cut-out draw (fs 12a46f5000) kept nothing and the rift's black interior was missing - it showed only when passes
+// happened to be flushed, as in a debug frame. On Android the heap's own buffer is bound instead (read in GPU order).
+static bool gw_cbuf(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
+    if (!ngw || !gmem_ahb_size || addr < HEAP_BASE || !gw_hit(addr, size)) return false;
+    uint64_t o = addr - HEAP_BASE, c = o >> GMEM_CHUNK_LOG2, in = o & (GMEM_CHUNK_BYTES - 1);
+    if (c >= GMEM_CHUNKS || !gmem_ahb_buf[c] || in + size > GMEM_CHUNK_BYTES || o + size > gmem_ahb_size) return false;
+    if (in % g_vk.props.limits.minUniformBufferOffsetAlignment || size > g_vk.props.limits.maxUniformBufferRange) return false;
+    *out = (VkDescriptorBufferInfo){gmem_ahb_buf[c], in, size};
+    static int nlog;
+    if (!nlog++) LOG("[vk] constant buffer %llx (%llu B) written by a storing shader: bound in place\n", (unsigned long long)addr,
+                     (unsigned long long)size);
+    return true;
+}
+
+// Elsewhere (no heap buffer to bind, an unaligned range): wait for the submission that wrote it (the current one:
+// flushed first) before the draw's constant buffers are copied.
+static void gw_before_cbufs(Prog *pr) {
+    if (!ngw) return;
+    uint64_t need = 0;
+    ShaderInfo *si[2] = {pr->vi, pr->fi};
+    for (int sg = 0; sg < 2; sg++)
+        for (int k = 3; k < 18; k++) {
+            if (!((si[sg]->cbuf_mask >> k) & 1)) continue;
+            Range r = st.ubuf[sg][k - 3];
+            if (!r.addr) continue;
+            uint64_t size = si[sg]->cbuf_size[k] ? si[sg]->cbuf_size[k] : 256;
+            if ((si[sg]->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
+            if (size > r.size && r.size) size = r.size;
+            if (size < 16) size = 16;
+            VkDescriptorBufferInfo direct;
+            uint64_t s = gw_hit(r.addr, size);
+            if (s > need && !gw_cbuf(r.addr, size, &direct)) {
+                need = s;
+                static int nlog;
+                if (nlog++ < 4) LOG("[vk] constant buffer %llx (%llu B, stage %d c%d) written by a storing shader: waited for\n",
+                                    (unsigned long long)r.addr, (unsigned long long)size, sg, k);
+            }
+        }
+    if (!need) return;
+    if (need >= vk_pending_seq()) { vk_end_pass(); renderer_flush(); st.rt_dirty = true; }
+    else vk_wait_seq(need);
 }
 
 static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
@@ -2806,6 +2891,7 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     if (g_debug_frame) debug_draw(pr, r, indexed);
     if (ct_on()) ct_draw(pr, "draw");
+    gw_before_cbufs(pr);
     alias_draw_check();
     resolve_feedback(pr);
     snap_reason = "draw-depthwrite";
