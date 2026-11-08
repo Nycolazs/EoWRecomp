@@ -587,7 +587,10 @@ static void *worker(void *a) {
         jobs_head = j->next;
         if (!jobs_head) jobs_tail = NULL;
         pthread_mutex_unlock(&jobs_lock);
+        Uint64 t0 = SDL_GetTicks();
         j->fn(j->arg);
+        // (a driver that takes seconds per pipeline leaves the draws that need it skipped for just as long)
+        if (SDL_GetTicks() - t0 >= 1500) LOG("[vk] slow shader/pipeline build: %llu ms (worker)\n", (unsigned long long)(SDL_GetTicks() - t0));
         free(j);
     }
     return NULL;
@@ -621,7 +624,12 @@ static void *translator(void *a) {
 }
 static bool sync_shaders(void);
 static void run_translate(void (*fn)(void *), void *arg) {
-    if (sync_shaders()) { fn(arg); return; }
+    if (sync_shaders()) {
+        Uint64 t0 = SDL_GetTicks();
+        fn(arg);
+        if (SDL_GetTicks() - t0 >= 1500) LOG("[vk] slow shader/pipeline build: %llu ms (blocking)\n", (unsigned long long)(SDL_GetTicks() - t0));
+        return;
+    }
     static bool started;
     if (!started) { started = true; pthread_t t; pthread_create(&t, NULL, translator, NULL); }
     Job *j = malloc(sizeof *j);
