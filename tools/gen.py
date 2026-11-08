@@ -483,16 +483,22 @@ class Module:
 from patches import PATCHES
 
 
-def adr_feeds_br(m, i, rd, window=6):
+def adr_feeds_br(m, i, rd, window=16):
     """ADR whose register reaches a `br` within a few instructions: the base of a compact jump table's cases
     (LLVM: adr xB, cases ; ldrb/ldrh wO, [table, idx] ; add xB, xB, xO, lsl #2 ; br xB), code inside the same
     function - not a callback. Treating it as a function start split the function at its cases, so its table
-    couldn't be resolved (main: 71 tables resolved, 1832 left to the all-instruction fallback)."""
+    couldn't be resolved (main: 71 tables resolved, 1832 left to the all-instruction fallback).
+    The compiler schedules unrelated moves before the br: main's f_7001a657e0 (ldrh table, br 7 instructions after
+    the adr) was split at its first case, cases 1-8 jumped to no function and the game died as Zelda is freed
+    (end of the prologue). 6 instructions missed 46 such tables over the four modules; the scan stops at
+    unconditional control flow (the straight-line block only)."""
     regs = {rd}
     for k in range(i + 1, min(i + 1 + window, len(m.words))):
         w = m.words[k]
         if (w & 0xFFFFFC1F) == 0xD61F0000:  # br xN
             return ((w >> 5) & 31) in regs
+        if (w & 0x7C000000) == 0x14000000 or (w & 0xFE1FFC1F) == 0xD61F0000 or (w & 0xFFFFFC1F) == 0xD65F0000:
+            return False  # b / bl / blr / ret: the block ends
         if (w & 0x7F200000) == 0x0B000000 and ((w >> 5) & 31) in regs:  # add (shifted register) from a tracked reg
             regs.add(w & 31)
         elif (w & 31) in regs and (w & 0x7F200000) != 0x0B000000:
