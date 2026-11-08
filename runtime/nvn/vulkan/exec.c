@@ -578,8 +578,14 @@ static Job *jobs_head, *jobs_tail;
 static pthread_mutex_t jobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
+// What the build threads are doing now (vk_jobs_status, logged every ~10 s): when the translator / each worker began its
+// current job (0 = idle) and how many jobs wait. A build that never finishes shows up here, not in the slow-build line.
+#define MAX_WORKERS 32
+static _Atomic uint64_t g_tr_start, g_wk_start[MAX_WORKERS];
+static _Atomic int g_nworkers, g_tq_len, g_jq_len;
+
 static void *worker(void *a) {
-    (void)a;
+    int id = (int)(intptr_t)a;
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
@@ -587,13 +593,30 @@ static void *worker(void *a) {
         jobs_head = j->next;
         if (!jobs_head) jobs_tail = NULL;
         pthread_mutex_unlock(&jobs_lock);
+        atomic_fetch_sub(&g_jq_len, 1);
         Uint64 t0 = SDL_GetTicks();
+        atomic_store(&g_wk_start[id], t0 ? t0 : 1);
         j->fn(j->arg);
+        atomic_store(&g_wk_start[id], 0);
         // (a driver that takes seconds per pipeline leaves the draws that need it skipped for just as long)
         if (SDL_GetTicks() - t0 >= 1500) LOG("[vk] slow shader/pipeline build: %llu ms (worker)\n", (unsigned long long)(SDL_GetTicks() - t0));
         free(j);
     }
     return NULL;
+}
+
+void vk_jobs_status(char *buf, size_t size) {
+    Uint64 now = SDL_GetTicks();
+    uint64_t ts = atomic_load(&g_tr_start);
+    int n = atomic_load(&g_nworkers), busy = 0;
+    uint64_t longest = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t st = atomic_load(&g_wk_start[i]);
+        if (st) { busy++; if (now - st > longest) longest = now - st; }
+    }
+    snprintf(buf, size, "translator %s %llu ms, %d queued; compile workers busy %d of %d (longest %llu ms), %d queued",
+             ts ? "busy for" : "idle", (unsigned long long)(ts ? now - ts : 0), atomic_load(&g_tq_len), busy, n,
+             (unsigned long long)longest, atomic_load(&g_jq_len));
 }
 
 static bool sync_shaders(void) {
@@ -617,7 +640,12 @@ static void *translator(void *a) {
         tjobs_head = j->next;
         if (!tjobs_head) tjobs_tail = NULL;
         pthread_mutex_unlock(&tjobs_lock);
+        atomic_fetch_sub(&g_tq_len, 1);
+        Uint64 t0 = SDL_GetTicks();
+        atomic_store(&g_tr_start, t0 ? t0 : 1);
         j->fn(j->arg);
+        atomic_store(&g_tr_start, 0);
+        if (SDL_GetTicks() - t0 >= 1500) LOG("[vk] slow shader translation: %llu ms\n", (unsigned long long)(SDL_GetTicks() - t0));
         free(j);
     }
     return NULL;
@@ -634,6 +662,7 @@ static void run_translate(void (*fn)(void *), void *arg) {
     if (!started) { started = true; pthread_t t; pthread_create(&t, NULL, translator, NULL); }
     Job *j = malloc(sizeof *j);
     j->fn = fn; j->arg = arg; j->next = NULL;
+    atomic_fetch_add(&g_tq_len, 1);
     pthread_mutex_lock(&tjobs_lock);
     if (tjobs_tail) tjobs_tail->next = j; else tjobs_head = j;
     tjobs_tail = j;
@@ -642,7 +671,12 @@ static void run_translate(void (*fn)(void *), void *arg) {
 }
 
 static void run_job(void (*fn)(void *), void *arg) {
-    if (sync_shaders()) { fn(arg); return; }
+    if (sync_shaders()) {
+        Uint64 t0 = SDL_GetTicks();
+        fn(arg);
+        if (SDL_GetTicks() - t0 >= 1500) LOG("[vk] slow shader/pipeline build: %llu ms (blocking)\n", (unsigned long long)(SDL_GetTicks() - t0));
+        return;
+    }
     static bool started;
     if (!started) {
         started = true;
@@ -651,12 +685,14 @@ static void run_job(void (*fn)(void *), void *arg) {
         if (n < 4) n = 4;
         if (n > 16) n = 16;
         const char *e = getenv("EOWRECOMP_SHADER_THREADS");  // fewer: less CPU and RAM (each worker has its own compiler)
-        if (e && atoi(e) > 0) n = atoi(e) > 32 ? 32 : atoi(e);
+        if (e && atoi(e) > 0) n = atoi(e) > MAX_WORKERS ? MAX_WORKERS : atoi(e);
         LOG("[vk] %d shader/pipeline worker threads\n", n);
-        for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, NULL); }
+        atomic_store(&g_nworkers, n);
+        for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, (void *)(intptr_t)i); }
     }
     Job *j = malloc(sizeof *j);
     j->fn = fn; j->arg = arg; j->next = NULL;
+    atomic_fetch_add(&g_jq_len, 1);
     pthread_mutex_lock(&jobs_lock);
     if (jobs_tail) jobs_tail->next = j; else jobs_head = j;
     jobs_tail = j;

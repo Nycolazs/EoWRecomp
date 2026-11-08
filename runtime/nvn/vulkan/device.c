@@ -719,6 +719,12 @@ void backend_present(NvnTexture *t) {
         if (last_fps_time > 0)
             LOG("[vk] t=%.1f frame %llu %.1f fps max %.0fms level %s (%s)\n", now, (unsigned long long)total_frames,
                 frames / (now - last_fps_time), max_gap * 1000.0, game_level_name(), renderer_stats());
+        {   // (every ~10 s: what the shader translator and the compile workers are doing: a stuck one shows its busy time)
+            extern void vk_jobs_status(char *buf, size_t size);
+            static int jobs_n;
+            char js[256];
+            if (jobs_n++ % 5 == 0) { vk_jobs_status(js, sizeof js); LOG("[vk] jobs: %s\n", js); }
+        }
 #ifdef _WIN32
         // (every ~10 s: whether the RAM use grows, and how much of it is committed but not resident)
         static int mem_n;
