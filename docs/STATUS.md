@@ -1,6 +1,32 @@
 # Status
 
-Atualizado: 2026-10-20 (sessão 3: macOS / Android).
+Atualizado: 2026-11-07 (sessão 4: Windows pelo GitHub Actions).
+
+## Sessão 4 (2026-11-07): pacote do Windows pelo GitHub Actions
+
+### Feito
+- `.github/workflows/build-windows.yml` (push em `runtime/`, `tools/`, etc., ou "Run workflow"): três jobs.
+  `exe` (cross-build com zig, `tools/windows/build.sh RELEASE=1`, sem console, log em `eowrecomp.log`), `helper`
+  (`eowgen.exe` por PyInstaller no windows-latest) e `package` (zig para Windows de `tools/fetch_zig.sh`,
+  `gamelib-src/`, `eowrecomp.dll.a`). Artefato `EoWRecomp-windows-x64`: ~164 MB (528 MB descompactado), sem arquivos
+  do jogo. O zig é o completo (sem `tools/zig_slim.sh`).
+- `runtime/nxpkg.c` inclui `platform.h` (pread/mkdir no Windows). `Makefile`: `all` só inclui o `eowgame.dll`
+  quando há código gerado (`$(strip $(GEN_SRC))`). Manifest `activeCodePage` UTF-8
+  (`runtime/platform/eowrecomp.manifest`): caminhos com acento (`C:\Users\José\...`) falhavam no `stat()` e a tela
+  inicial dizia "No game files found". A busca do pacote agora registra no log o que achou e descartou.
+
+### Primeiro teste no Windows (usuário: Windows 10, Xeon E5-2650 v4, RX 580, Vulkan 1.3.260)
+- Funciona: XCI + `prod.keys` achados; código do jogo gerado e compilado na máquina (1917 s, uma vez; 4 módulos,
+  296 677 funções, `extracted/eowgame.dll`); os 4 módulos carregam; boot do SDK; RomFS lido direto do XCI
+  (8 033 071 180 bytes, 10 963 arquivos); swapchain Vulkan 1280x720; áudio (audren) abre; XInput detectado.
+- **Problema**: tela preta com os botões Y / X / A e o contador de fps por cima (screenshot do usuário). Execução de
+  ~95 s até fechar a janela. No log, milhares de desenhos pulados por "program compiling" / "pipeline compiling" a
+  cada 2 s até o fim (ex.: 4 797 desenhos x 11 700 pulados). Ainda não se sabe se é só a compilação assíncrona
+  atrasada (primeira execução, 95 s) ou um defeito neste driver; no Linux (Iris Xe) a abertura aparecia.
+- Mesmo `SUST eb20138600f70018` sem tradução do problema aberto 3 (um compute shader).
+- Próximo teste (usuário): deixar rodar vários minutos; e `set EOWRECOMP_SYNC_SHADERS=1` antes de abrir o `.exe`
+  (compila cada shader na primeira vez, bloqueando: sem desenhos pulados) e olhar se a cena aparece.
+
 
 ## Jogo fixado (único build suportado)
 
