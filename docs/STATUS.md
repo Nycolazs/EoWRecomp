@@ -109,17 +109,23 @@ seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p*
   disputado), chamados de f_700c4f82b0 / f_700c4fa1f0 do SDK pelos workers do jogo (~17 000 trocas/s no processo).
 - Testado nesta sessão sem defeitos novos: cutscene de abertura do novo jogo (profundidade de campo), combate,
   bombas e explosões, tochas, escadas, menus de pausa (Key Items / System), lista de saves.
-- **Fenda sem o vazio preto?** Em Hyrule Castle Town há uma fenda sobre uma casa: ao vivo aparece só o contorno roxo
-  e a casa inteira dentro dele; num debug frame (passes salvos) o mesmo frame sai com o vazio preto de bordas roxas
-  (o recorte do fs 12a46f5000 aplicado). O mesmo na cutscene da fenda no campo (interior roxo translúcido, árvores
-  visíveis). Não muda com `EOWRECOMP_SYNC_SUBMIT`, `EOWRECOMP_VK_STATE_FILTER=0`, `EOWRECOMP_VK_COPY_OPT=0`,
-  `EOWRECOMP_VK_NO_TEX_MEMO`, `TU_DEBUG=sysmem`/`nolrz`; com o debug frame sem salvar os passes, some. Falta comparar
-  com o jogo no Switch e achar o que salvar os passes muda (barreira / pass extra).
+- **Fenda sem o vazio preto - causa achada, correção num branch (`wip/gpu-written-cbufs`, 0f54c3b)**: em Hyrule
+  Castle Town há uma fenda sobre uma casa; ao vivo aparece só o contorno roxo, a casa inteira dentro (na cutscene da
+  fenda no campo, interior roxo translúcido). Os constant buffers são copiados na CPU quando o draw é gravado
+  (`guest_copy`), e a compute 12a4705000 (1x1x1, sbuf 127e80a300+0x470) escreve parâmetros que draws da mesma
+  submissão leem como constant buffer: a cópia sai velha. Achado com flush depois de cada pass (o vazio aparece) e
+  bissecção até o pass logo depois das computes 12a46fe000 / 12a4705000 / 12a470d000, mais `EOWRECOMP_COPY_TRACE`.
+  No branch, esses constant buffers são lidos no lugar (o buffer do heap AHardwareBuffer como uniform buffer): a
+  fenda vira vazio preto de bordas roxas, a Zelda na frente, 30 fps. **Mas** na entrada do castelo aparece então uma
+  luz forte na Zelda (amarela) com sombras em grade, serrilhadas, por todo o piso (persistente, não só ao carregar);
+  com o snapshot velho essa luz não existia. Não sei qual é o certo (a Tri? os valores da compute errados?): por
+  isso fora do main. Comparar com o Switch na entrada do castelo e na cidade.
 - Pre-pass e EQUAL: as listras não eram falta de precisão entre os dois vertex shaders (as contas de posição são as
   mesmas a menos de comutação; um bias de 256 unidades D24 escondia as listras, 128 não - era o recorte da fenda).
 
 ### Próximo passo (Android)
-1. Fenda: o vazio que só aparece no debug frame (acima). Comparar com vídeo do Switch na cidade e na cutscene.
+1. Constant buffers escritos pela GPU (`wip/gpu-written-cbufs`): decidir com o Switch se a luz com grade na entrada do
+   castelo é do jogo (então só a filtragem das sombras dela está errada) ou um valor errado da compute 12a4705000.
 2. Passar da fuga do Rift (o percurso automático morre nela) e medir o overworld.
 3. GPU (cidade ~21 ms por frame): fs `12a5c12e00` (2727 instruções, ~4,2 ms) e o laço de luzes `12ee66f300`
    (3,8 ms; ballot + shuffles em warps de 32 dentro dos subgroups de 64/128 do Adreno).
@@ -130,6 +136,8 @@ seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p*
 fonte), a sala do trono e a cutscene da fenda no campo: dizer se as fendas no Switch têm o interior preto ali, e se
 ainda há listras, texturas tremendo ou objetos sobrepostos em algum lugar. Na primeira entrada em cada área os
 shaders recompilam (o GLSL mudou): objetos surgindo por alguns segundos é esperado.
+E uma pergunta: no Switch, na entrada do castelo (save "Hyrule Castle"), a Zelda tem uma luz amarela forte em
+volta dela com sombras no piso? (decide o branch `wip/gpu-written-cbufs`, acima).
 
 Percurso até a fuga a partir do save do usuário (sala do trono): stick esquerda ×2, esquerda-baixo, esquerda-cima,
 baixo, cima (começa a cutscene), A ×10, baixo-esquerda até a escada, A ×4, segurar baixo = fuga.
