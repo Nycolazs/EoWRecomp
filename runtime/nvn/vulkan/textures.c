@@ -313,6 +313,8 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     // NVN_TEXTURE_FLAGS_IMAGE (0x4): written by shader image stores (SUST; e.g. Echoes of Wisdom's 2D maps filtered
     // from cube maps). Only those get the storage usage: it can turn off Adreno's framebuffer compression. sRGB is not
     // storable: written through a UNORM view (the stored values are raw, as the store does no encoding).
+    // The game flags compressed textures (BCn) as images too: those are never stored to, so no storage usage and no
+    // log here (one per texture filled the log); a store to one is logged when it is bound (exec.c image_view).
     b->storage_format = 0;
     if ((t->flags & 4) && !depthfmt && samples == 1) {
         VkFormat sf = vf == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : vf == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM
@@ -321,8 +323,6 @@ static void create_image(NvnTexture *t, TexBackend *b) {
             usage |= VK_IMAGE_USAGE_STORAGE_BIT;
             if (!format_supports(vf, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
             b->storage_format = sf;
-        } else {
-            LOG("[vk] image texture format %d (nvn %#x) not storable: its shader stores are dropped\n", vf, t->format);
         }
     }
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = type, .format = vf,
