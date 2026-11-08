@@ -60,10 +60,28 @@ static uint64_t submit_seq;  // last submitted
 static pthread_mutex_t seq_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool in_pass;
 
+// The last submission known done, without asking the driver. vkGetSemaphoreCounterValue - and a zero-timeout
+// vkWaitSemaphores just the same - on Turnip (kgsl) block until the submission just made has finished: ~11 ms after
+// each frame's main submission, measured on an AYN Thor, and the render thread asks at every submission
+// (vk_collect_dead) and in the upload / vertex cache recycling. So the game and the GPU ran in turns: the rift chase at
+// the end of the prologue ran at 24 fps with both idle half the time. Instead each submission ends by writing its
+// number into a small host-coherent buffer, which the CPU reads. vk_wait_seq still waits through the timeline.
+static VkBuffer seq_buf;
+static VmaAllocation seq_mem;
+static volatile uint64_t *seq_ptr;
+static _Atomic uint64_t g_done_seq;
 uint64_t vk_completed_seq(void) {
     uint64_t v = 0;
-    vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v);
-    return v;
+    if (seq_ptr) v = *seq_ptr;
+    else vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v);
+    if (v > submit_seq) v = submit_seq;  // (never ahead of what was submitted)
+    uint64_t prev = atomic_load(&g_done_seq);
+    while (prev < v && !atomic_compare_exchange_weak(&g_done_seq, &prev, v)) {}
+    return v > prev ? v : prev;
+}
+static void seq_note_done(uint64_t seq) {  // (a wait on the timeline succeeded)
+    uint64_t prev = atomic_load(&g_done_seq);
+    while (prev < seq && !atomic_compare_exchange_weak(&g_done_seq, &prev, seq)) {}
 }
 
 // (EOWRECOMP_VK_PROF) waits on the GPU by cause: the caller names it in wait_why just before waiting
@@ -81,22 +99,54 @@ static void wait_account(uint64_t ns) {
 
 static void cq_resolve_done(uint64_t done);
 
+// The timeline semaphore (g_vk.timeline) signalled by every submission, or only the completion marker (seq_buf):
+// Turnip on kgsl emulates timelines, and each vkQueueSubmit signalling one first waited on the CPU for the earlier
+// points (vk_sync_timeline_gc_locked -> kgsl_syncobj_wait): the game's main thread sat a third of every frame there
+// (simpleperf --trace-offcpu, AYN Thor). Android: the marker only (EOWRECOMP_VK_TIMELINE=1: the timeline too).
+static bool use_timeline(void) {
+    static int v = -1;
+    if (v < 0) {
+#ifdef __ANDROID__
+        v = getenv("EOWRECOMP_VK_TIMELINE") && *getenv("EOWRECOMP_VK_TIMELINE") == '1';
+#else
+        v = 1;
+#endif
+    }
+    return v || !seq_ptr;
+}
+
 void vk_wait_seq(uint64_t seq) {
     if (!seq) { wait_why = NULL; return; }
-    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
-                              .pValues = &seq};
     uint64_t t0 = SDL_GetTicksNS();
-    VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
+    VkResult r = VK_SUCCESS;
+    if (use_timeline()) {
+        VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
+                                  .pValues = &seq};
+        r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
+    } else {  // the marker, polled: sleeps from 20 us up to 1 ms; a lost device shows in vkDeviceWaitIdle after 10 s
+        uint64_t sleep_ns = 20000, waited = 0;
+        while (*seq_ptr < seq) {
+            struct timespec ts = {0, (long)sleep_ns};
+            nanosleep(&ts, NULL);
+            waited += sleep_ns;
+            if (sleep_ns < 1000000) sleep_ns *= 2;
+            if (waited > 10ull * 1000000000ull) {
+                r = vkDeviceWaitIdle(g_vk.dev);
+                if (r == VK_SUCCESS && *seq_ptr < seq) r = VK_TIMEOUT;
+                break;
+            }
+        }
+    }
     stat_wait_ns += SDL_GetTicksNS() - t0;
     cum_wait += SDL_GetTicksNS() - t0;
     wait_account(SDL_GetTicksNS() - t0);
     if (r == VK_TIMEOUT) LOG("[vk] GPU did not finish submission %llu within 10 s (device lost?)\n", (unsigned long long)seq);
-    else if (r == VK_SUCCESS) cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
+    else if (r == VK_SUCCESS) seq_note_done(seq), cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
     else {
         extern void vk_devlost_dump(void);
         vk_devlost_dump();
         vk_device_fault_report();
-        FATAL("vkWaitSemaphores: %d (device lost)\n", r);
+        FATAL("GPU wait: %d (device lost)\n", r);
     }
 }
 
@@ -271,7 +321,7 @@ VkCommandBuffer vk_cmd(void) {
             if (q->pool) vkCmdResetQueryPool(s->main, q->pool, 0, CQ_MAX);
         }
         gp_mark(s->main, "(submission start; includes GPU idle before it)");
-        if (prof && prof_qp) {
+        if (prof_qp) {  // (always: two timestamps a submission, so the fps log has the GPU's time without a debug build)
             vkCmdResetQueryPool(s->main, prof_qp, (uint32_t)cur_sub * 2, 2);
             vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_NONE, prof_qp, (uint32_t)cur_sub * 2);
             s->ts = true;
@@ -376,16 +426,29 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     }
     vk_cmd();  // (an empty main buffer still carries the semaphores)
     if (s->ts) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
+    if (seq_buf) {  // the completion marker (vk_completed_seq): after all of this submission's work
+        vk_full_barrier(s->main);
+        uint64_t v = submit_seq + 1;
+        vkCmdUpdateBuffer(s->main, seq_buf, 0, sizeof v, &v);
+        VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                               .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                               .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+        vkCmdPipelineBarrier2(s->main, &di);
+    }
     VK_CHECK(vkEndCommandBuffer(s->main));
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
-    VkSemaphoreSubmitInfo sig[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
-                                     .value = submit_seq + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
-                                    {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = signal,
-                                     .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}};
-    VkSemaphoreSubmitInfo wt = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = wait,
-                                .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
+    VkSemaphoreSubmitInfo sig[2], wt = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = wait,
+                                        .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
+    uint32_t nsig = 0;
+    if (use_timeline())
+        sig[nsig++] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
+                                              .value = submit_seq + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    if (signal)
+        sig[nsig++] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = signal,
+                                              .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = (uint32_t)n, .pCommandBufferInfos = cbs,
-                        .signalSemaphoreInfoCount = signal ? 2 : 1, .pSignalSemaphoreInfos = sig,
+                        .signalSemaphoreInfoCount = nsig, .pSignalSemaphoreInfos = sig,
                         .waitSemaphoreInfoCount = wait ? 1 : 0, .pWaitSemaphoreInfos = &wt};
     {
         PROF_T0();
@@ -743,6 +806,18 @@ const char *renderer_stats(void) {
         extern void vk_alias_stats(void);
         vk_alias_stats();
     }
+    {   // always: the GPU's busy time and this thread's CPU time over the interval, ms - which side holds a slow frame
+        // rate back on a player's device (the game's main thread runs the game and the NVN translation)
+        static uint64_t cpu_prev;
+        struct timespec ts;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        uint64_t cpu = (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+        size_t n = strlen(stats_text);
+        if (cpu_prev && !prof)
+            snprintf(stats_text + n, sizeof stats_text - n, " | gpu %.0f ms, main thread cpu %.0f ms", prof_gpu / 1e6, (cpu - cpu_prev) / 1e6);
+        cpu_prev = cpu;
+        if (!prof) prof_gpu = 0;
+    }
     if (prof) {
         prof_up = prof_up_ns;
         prof_up_ns = 0;
@@ -809,10 +884,21 @@ static void st_defaults(void) {
 
 void vk_exec_init(void) {
     prof = getenv("EOWRECOMP_VK_PROF") != NULL;
-    if (prof) {
-        prof_up_ns = 0;
-        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = SUBS * 2};
-        if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &prof_qp) != VK_SUCCESS) prof_qp = VK_NULL_HANDLE;
+    prof_up_ns = 0;
+    VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = SUBS * 2};
+    if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &prof_qp) != VK_SUCCESS) prof_qp = VK_NULL_HANDLE;
+    {   // the completion marker (vk_completed_seq)
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 64, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST, .requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+        VmaAllocationInfo info;
+        if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &seq_buf, &seq_mem, &info) == VK_SUCCESS) {
+            seq_ptr = info.pMappedData;
+            *seq_ptr = submit_seq;
+        } else {
+            seq_buf = VK_NULL_HANDLE;
+            LOG("[vk] no completion marker buffer: completion queried through the timeline\n");
+        }
     }
     st_defaults();
 }
