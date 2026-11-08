@@ -132,9 +132,11 @@ GuestFn dispatch_lookup(uint64_t addr) {
     return NULL;
 }
 
-// Small direct-mapped cache in front of the binary search
+// Small direct-mapped cache in front of the binary search, one per guest thread, reached through its Cpu: as a
+// __thread array it cost a TLS access (Android: a TLSDESC call into the linker) on every indirect call, branch and
+// return through rt_dispatch.
 #define DCACHE 4096
-static __thread struct { uint64_t addr; GuestFn fn; } dcache[DCACHE];
+typedef struct { uint64_t addr; GuestFn fn; } DEntry;
 
 static GuestFn dispatch_slow(Cpu *c) {
     uint64_t pc = c->pc;
@@ -155,16 +157,20 @@ static GuestFn dispatch_slow(Cpu *c) {
         const char *s = loader_symbol_at(c->x[30], &off);
         FATAL("no function at %llx (lr=%llx %s+%llx)\n", pc, c->x[30], s ? s : "?", off);
     }
+    DEntry *d = c->dcache;
+    if (!d) d = c->dcache = calloc(DCACHE, sizeof *d);  // (freed with the thread: kernel_reset)
+    if (!d) return f;
     unsigned h = (unsigned)(pc >> 2) & (DCACHE - 1);
-    dcache[h].addr = pc;
-    dcache[h].fn = f;
+    d[h].addr = pc;
+    d[h].fn = f;
     return f;
 }
 
 // Always tail-calls, so chains of indirect jumps don't grow the host stack.
 void rt_dispatch(Cpu *c) {
+    const DEntry *d = c->dcache;
     unsigned h = (unsigned)(c->pc >> 2) & (DCACHE - 1);
-    GuestFn f = dcache[h].addr == c->pc && dcache[h].fn ? dcache[h].fn : dispatch_slow(c);  // (empty slots: addr 0)
+    GuestFn f = d && d[h].addr == c->pc && d[h].fn ? d[h].fn : dispatch_slow(c);  // (empty slots: addr 0)
     __attribute__((musttail)) return f(c);
 }
 

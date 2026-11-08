@@ -834,6 +834,7 @@ void kernel_reset(void) {
     for (KThread *t = g_threads, *next; t; t = next) {
         next = t->anext;
         pthread_cond_destroy(&t->cond);
+        free(t->cpu.dcache);
         free(t);
     }
     g_threads = NULL;
