@@ -1427,7 +1427,20 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         case 0x25: set_reg(c, d, "ctaid.x"); break;
         case 0x26: set_reg(c, d, "ctaid.y"); break;
         case 0x27: set_reg(c, d, "ctaid.z"); break;
-        case 0x00: set_reg(c, d, "0u"); break;
+        case 0x00:  // LANEID, and the lane masks EQ / LT / LE / GT / GE (0x38-0x3c) over the 32-lane warp. Warp-aggregated
+        case 0x38:  // appends (one ATOM per warp for the ballot's popcount, each lane at base + popcount(ballot & LTMASK),
+        case 0x39:  // compute 12a4711000) need them: as 0 every lane of a warp wrote the same slot. Vertex functions have
+        case 0x3a:  // no subgroup operations (their ballots are the lane's own, see VOTE): lane 0 there.
+        case 0x3b:
+        case 0x3c: {
+            const char *ln = "0u";
+            if (c->stage != STAGE_VERTEX) { c->uses_lane = true; ln = "lane"; }
+            static const char *const fm[] = {"%s", "(1u << %s)", "((1u << %s) - 1u)", "((2u << %s) - 1u)", "(~((2u << %s) - 1u))",
+                                             "(~((1u << %s) - 1u))"};
+            sprintf(t, fm[sr == 0 ? 0 : sr - 0x37], ln);
+            set_reg(c, d, t);
+            break;
+        }
         default: sprintf(t, "0u /* sr %#x */", sr); set_reg(c, d, t);
         }
     } else if (OPM(0x5c30000000000000ull, 0xfff8000000000000ull) || OPM(0x4c30000000000000ull, 0xfff8000000000000ull) ||
@@ -2434,8 +2447,8 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         sp(&s, "fragment FOut main0(FIn in [[stage_in]], bool front_facing [[front_facing]]%s%s) {\n",
            c->uses_lane ? ", uint lane [[thread_index_in_simdgroup]]" : "", args.buf ? args.buf : "");
     } else {
-        sp(&s, "kernel void main0(uint3 tid [[thread_position_in_threadgroup]], uint3 ctaid [[threadgroup_position_in_grid]]%s) {\n",
-           args.buf ? args.buf : "");
+        sp(&s, "kernel void main0(uint3 tid [[thread_position_in_threadgroup]], uint3 ctaid [[threadgroup_position_in_grid]]%s%s) {\n",
+           c->uses_lane ? ", uint lane [[thread_index_in_simdgroup]]" : "", args.buf ? args.buf : "");
     }
     free(args.buf);
     for (int i = 0; i < 256; i++)
