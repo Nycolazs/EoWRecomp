@@ -3993,6 +3993,20 @@ static void exec_list(uint64_t handle, int depth) {
             renderer_flush();
             memmove((void *)(uintptr_t)r->x[1], (void *)(uintptr_t)r->x[0], r->x[2]);
             break;
+        case CMD_CLEAR_BUFFER: {
+            // ClearBuffer(cmd, address, size, value): recorded but never executed until now (PokeZ-Android found the
+            // same gap). In command order like the buffer copy above: the GPU's earlier work done, then the 32-bit
+            // fill in guest memory.
+            static int logged;
+            if (!logged++) LOG("[nvn] ClearBuffer %llx +%llu = %#x (first use)\n", (unsigned long long)r->x[0],
+                               (unsigned long long)r->x[1], (unsigned)r->x[2]);
+            if (!r->x[0] || !r->x[1]) break;
+            wait_why = "buffer clear";
+            renderer_flush();
+            uint32_t *d = (uint32_t *)(uintptr_t)r->x[0], v = (uint32_t)r->x[2];
+            for (uint64_t i = 0; i < r->x[1] / 4; i++) d[i] = v;
+            break;
+        }
         default: break;
         }
         p += r->size;

@@ -485,7 +485,11 @@ PLAIN(nvnCommandBufferBarrier, CMD_BARRIER)
 PLAIN(nvnCommandBufferSignalEvent, CMD_SIGNAL_EVENT)
 PLAIN(nvnCommandBufferWaitEvent, CMD_WAIT_EVENT)
 PLAIN(nvnCommandBufferReportCounter, CMD_REPORT_COUNTER)
-NVN(nvnCommandBufferReportValue) { (void)c; }
+NVN(nvnCommandBufferReportValue) {  // (not implemented: logged once, to know whether the game uses it)
+    static int logged;
+    if (!logged++) LOG("[nvn] ReportValue called (ignored)\n");
+    (void)c;
+}
 NVN(nvnCommandBufferResetCounter) { (void)c; }
 NVN(nvnCommandBufferCallCommands) { record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
 NVN(nvnCommandBufferCopyCommands) { record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
