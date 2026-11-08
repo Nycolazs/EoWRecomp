@@ -65,8 +65,13 @@ seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p*
 - **Crash quando a Zelda é libertada** (fim do prólogo): `FATAL: no function at 1001a65870`. `f_7001a657e0` (switch
   0-8, tabela `ldrh`) tinha 4 `mov` entre o `add` e o `br`: o `adr` da base ficou fora da janela de 6 instruções de
   `adr_feeds_br`, foi tomado por callback e a função partida no primeiro caso (casos 1-8 sem função). Janela 16
-  (para em b/bl/blr/ret): +46 tabelas nos quatro módulos. Visto no C gerado (os 9 casos no switch); no aparelho, a
-  confirmar repetindo o fim do prólogo (o usuário).
+  (para em b/bl/blr/ret): +46 tabelas nos quatro módulos. Visto no C gerado (os 9 casos no switch) e no aparelho: a
+  parte da Zelda carrega e se joga.
+- **Threads no core do render**: os threads criados a partir do thread de render herdavam a afinidade dele (cpu7
+  sozinho): workers de pipeline, tradutor de shaders, áudio do SDL e mixer. Agora vão para os outros cores
+  (`plat_children_elsewhere`); no cpu7 sobra só o render. Sem mudança de fps aqui (já 30 fixos); achado do
+  PokeZ-Android no mesmo aparelho (lá +2 fps).
+- `nvnCommandBufferClearBuffer` era gravado e descartado: agora executado em ordem. O EoW não o usa no prólogo.
 
 ### Ainda errado / medido no Thor
 - A lista "Which data would you like to load?" vazia por alguns segundos e objetos que aparecem um pouco depois na
