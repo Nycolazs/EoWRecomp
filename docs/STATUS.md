@@ -72,6 +72,15 @@ seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p*
   (`plat_children_elsewhere`); no cpu7 sobra só o render. Sem mudança de fps aqui (já 30 fixos); achado do
   PokeZ-Android no mesmo aparelho (lá +2 fps).
 - `nvnCommandBufferClearBuffer` era gravado e descartado: agora executado em ordem. O EoW não o usa no prólogo.
+- **Fuga do Rift lenta (24-27 fps)** com a GPU e o thread principal ambos ocupados menos da metade do tempo. Causa:
+  no Turnip (kgsl) os timeline semaphores são emulados - `vkGetSemaphoreCounterValue` (e `vkWaitSemaphores` com
+  timeout 0) bloqueava até a submissão recém-feita acabar (~11 ms), e todo `vkQueueSubmit` que sinalizava o timeline
+  esperava na CPU pelos pontos anteriores (`vk_sync_timeline_gc_locked -> kgsl_syncobj_wait`, simpleperf
+  `--trace-offcpu`): jogo e GPU andavam em turnos. Agora cada submissão termina gravando seu número num buffer
+  coerente (`vkCmdUpdateBuffer`), lido/esperado por polling; no Android o timeline não é mais sinalizado
+  (`EOWRECOMP_VK_TIMELINE=1` volta). Mesma fuga, mesmo percurso: 30 fps fixos; cutscenes chegam a 52-60.
+  A linha de fps do log agora sempre traz `gpu X ms, main thread cpu Y ms` (por 2 s).
+- `rt_dispatch`: o cache de chamadas indiretas saiu do TLS (TLSDESC no Android) para o `Cpu` do thread.
 
 ### Ainda errado / medido no Thor
 - A lista "Which data would you like to load?" vazia por alguns segundos e objetos que aparecem um pouco depois na
@@ -85,9 +94,13 @@ seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p*
   bombas e explosões, tochas, escadas, menus de pausa (Key Items / System), lista de saves.
 
 ### Próximo passo (Android)
-1. 30 fps estáveis (meta do MVP) no prólogo; medir o overworld quando o jogo chegar lá.
-2. CPU do thread do jogo: a sincronização entre threads do guest (tempo no kernel) e `rt_dispatch`.
-3. Áudio e save em jogo mais longo.
+1. Passar da fuga do Rift (o percurso automático morre nela) e medir o overworld.
+2. Shader de fundo do pass `12a46f5000` (263 instruções, 1 draw) custa 4,3 ms de GPU na fuga: ver por quê.
+3. CPU do thread do jogo: a sincronização entre threads do guest (tempo no kernel).
+4. Áudio e save em jogo mais longo.
+
+Percurso até a fuga a partir do save do usuário (sala do trono): stick esquerda ×2, esquerda-baixo, esquerda-cima,
+baixo, cima (começa a cutscene), A ×10, baixo-esquerda até a escada, A ×4, segurar baixo = fuga.
 
 ### Testes no aparelho (scripts)
 `adb shell input swipe` usa um ponteiro só (pular andando não funciona). Multi-toque: `sendevent` em
