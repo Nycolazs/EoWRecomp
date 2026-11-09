@@ -488,11 +488,14 @@ class Module:
 from patches import PATCHES
 
 
-def adr_feeds_br(m, i, rd, window=6):
+def adr_feeds_br(m, i, rd, window=16):
     """ADR whose register reaches a `br` within a few instructions: the base of a compact jump table's cases
     (LLVM: adr xB, cases ; ldrb/ldrh wO, [table, idx] ; add xB, xB, xO, lsl #2 ; br xB), code inside the same
     function - not a callback. Treating it as a function start split the function at its cases, so its table
-    couldn't be resolved (main: 71 tables resolved, 1832 left to the all-instruction fallback)."""
+    couldn't be resolved (main: 71 tables resolved, 1832 left to the all-instruction fallback).
+    The window is 16 words: f_7001a657e0 (the crash after leaving the first room) has its br 7 words after the ADR, with
+    register moves scheduled in between; a window of 6 missed it, the cases became a separate function and the br's
+    target (7001a65870) was in neither piece: "no function at"."""
     regs = {rd}
     for k in range(i + 1, min(i + 1 + window, len(m.words))):
         w = m.words[k]

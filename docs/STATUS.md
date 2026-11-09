@@ -205,3 +205,12 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
   (volta ao antigo, mas na RX 580 trava os builds de pipeline: usar só numa cena curta com `EOWRECOMP_SHADER_THREADS` alto).
   `[tex] type mismatch: want 3 (CUBE) have 1 (2D) 1408x792 fmt 0x35`: um sampler de cubo recebe uma textura 2D de render target
   (slot não usado/obsoleto); vira textura preta, provavelmente inofensivo.
+
+- 2026-11-09 (crash resolvido por leitura do log, aguarda teste): o diagnóstico novo mostrou `f_7001a657e0`:
+  `adr x10,+0x20; ldrh w11,[x9,x8,lsl#1]; add x10,x10,x11,lsl#2; 4x mov; br x10` — tabela compacta LLVM com o `br` 7 palavras depois do ADR.
+  `adr_feeds_br` olhava só 6 → o ADR virou início de função, a função foi dividida, o alvo (7001a65870) ficou em nenhum pedaço.
+  Janela passou a 16 (`tools/gen.py`); `tools/test_gen_br.py` usa a sequência real (janela 6 falha, 16 passa). Exige regenerar o código do jogo.
+  (A mudança `ldr xt,[xb,xi,lsl #3]` do commit b9850dc não era a causa; o fallback ficou, é inofensivo.)
+- `[brx]` do log do usuário: 148 linhas, 66 shaders, tabelas de 3/5/6/8/13 entradas, ascendentes e sensatas (mesmo BRX na inst 30 dá 5 ou 8 entradas conforme
+  o shader) — o port do BRX parece correto; a suspeita sobre ele enfraqueceu.
+- Link, capa do Ganon esticados e portal do void ausente: todos deformação/partículas → suspeita volta ao compute shader `SUST` (7 dispatches/frame pulados).

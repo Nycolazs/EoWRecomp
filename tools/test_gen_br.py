@@ -2,6 +2,7 @@
 """computed_target(): which `br xN` get the all-instruction fallback (address arithmetic or an indexed table load)
 and which stay a plain dispatch (callback/vtable loads). Stubbed words, no NSO needed."""
 import sys
+import types
 sys.path.insert(0, __file__.rsplit('/', 1)[0])
 from unittest import mock
 for m in ('unicorn', 'unicorn.arm64_const', 'capstone', 'capstone.arm64', 'lz4', 'lz4.block'):  # only computed_target() runs here
@@ -33,6 +34,15 @@ for name, w, want in (
     ('ldr x10,[x9,#0x10]', 0xF940092A, False),
 ):
     got = run([w])
+    print(('ok   ' if got == want else 'FAIL ') + name)
+    fail += got != want
+
+# the sequence from the crash (7001a65830..4c, log 2026-11-09): adr x10; ldrh w11,[x9,x8,lsl#1]; add x10,x10,x11,lsl#2;
+# four register moves; br x10 - the br is 7 words after the ADR
+seq = [0x1000010a, 0x7868792b, 0x8b0b094a, 0x2a0203f6, 0x2a0103f5, 0xaa0003f4, 0x2a0103f9, 0xd61f0140]
+m = types.SimpleNamespace(words=seq)
+for name, win, want in (('adr_feeds_br default window', None, True), ('adr_feeds_br old window 6', 6, False)):
+    got = gen.adr_feeds_br(m, 0, 10) if win is None else gen.adr_feeds_br(m, 0, 10, win)
     print(('ok   ' if got == want else 'FAIL ') + name)
     fail += got != want
 sys.exit(1 if fail else 0)
