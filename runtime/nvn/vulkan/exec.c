@@ -2899,6 +2899,17 @@ static void draw_(CmdRec *r, bool indexed) {
     snap_reason = "draw-colorwrite";
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i] && ((st.channel_mask >> (i * 4)) & 0xF)) snapshots_invalidate(st.rt.color[i]);
+    if (pr->fi->uses_gmem_store) {  // (vk_texture_unscale: such a pass's fragments are work, not pixels)
+        extern bool vk_texture_unscale(NvnTexture *t);
+        for (int i = 0; i < st.rt.ncolor; i++) {
+            float sx, sy;
+            if (!st.rt.color[i]) continue;
+            renderer_texture_scale(st.rt.color[i], &sx, &sy);
+            if (sx == 1 && sy == 1) continue;
+            vk_end_pass();
+            if (vk_texture_unscale(st.rt.color[i])) st.rt_dirty = true;
+        }
+    }
     begin_pass();
     VkCommandBuffer cb = vk_cmd();
 

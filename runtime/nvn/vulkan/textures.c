@@ -405,6 +405,21 @@ static TexBackend *tex_backend(NvnTexture *t) {
     return b;
 }
 
+// A target a fragment shader with memory stores draws into keeps the guest size: there each fragment is work, not
+// a pixel. EoW's clustered lights (vs 12a46e1000 / fs 12a46e1400) rasterize light volumes into a 128x72 grid (16:9,
+// so scaled as an image would be) and OR each covered cell's bit into a buffer; at 2/3 scale only 85x48 fragments
+// reached its 128x72 cells, the cells in between had no lights, and floors showed a grid of dark lines along the
+// cluster borders (the dungeon with Tri, the castle entrance). Returns whether the image was reallocated.
+bool vk_texture_unscale(NvnTexture *t) {
+    TexBackend *b = t ? t->backend : NULL;
+    if (!b || !b->scalable) return false;
+    destroy_image(b);
+    b->scalable = false;
+    create_image(t, b);
+    LOG("[vk] render target %ux%u written by a storing fragment shader: kept at the guest size\n", t->width, t->height);
+    return true;
+}
+
 void backend_texture_destroyed(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
