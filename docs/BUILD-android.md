@@ -10,10 +10,11 @@ packed into a personal APK that you keep to yourself.
 
 ## Build (on a Mac or Linux computer)
 
-Android SDK with NDK 27.2 (`sdkmanager 'ndk;27.2.12479018' 'platforms;android-36'`), Java 17+, and the macOS setup
-of [BUILD-macos.md](BUILD-macos.md) (or Linux's) for the recompiler's Python.
+Android SDK with NDK 27.2 (`sdkmanager 'ndk;27.2.12479018' 'platforms;android-36' 'cmake;3.31.6'`), Java 17-21
+(Gradle 8.14 doesn't run on Java 25), and the macOS setup of [BUILD-macos.md](BUILD-macos.md) (or Linux's) for the
+recompiler's Python.
 
-    tools/android/build_deps.sh                  # FFmpeg, shaderc, Vulkan headers, VMA, volk, SDL3 (once, ~15 min)
+    tools/android/build_deps.sh                  # FFmpeg, shaderc, Vulkan headers, VMA, volk, SDL3, libadrenotools, Turnip (once, ~15 min)
     (cd android && ./gradlew assembleDebug)       # the app: libmain.so (the runtime) + SDL3
     tools/android/build_game.sh extracted --apk   # the game code (libeowgame.so) from your exefs/, and the APK with it
 
@@ -34,7 +35,15 @@ over adb instead.
 The app keeps its files in `Android/data/com.eowrecomp.android/files/` (saves in `save/`, the log in
 `eowrecomp.log`). Test and debug variables go into `env.txt` there, one `EOWRECOMP_...=value` per line.
 
+## Graphics driver
+
+Vulkan runs on Mesa's Turnip driver (K11MCH1's 26.0.0 R8 build, shipped in the APK) through libadrenotools: phones'
+own Qualcomm drivers are often too old (an AYN Thor's 1.3.128: no text on the file select). `EOWRECOMP_DRIVER=system`
+in `env.txt` uses the phone's own driver instead; `EOWRECOMP_DRIVER=<file>` another driver copied into the app's
+internal `files/res/` (run-as on a debug build).
+
 ## State
 
-Checked on an Android 15 emulator (arm64, gfxstream Vulkan): the start screen, landscape, the folder picker, the
-package read through its document, going to the background and back. Not yet run on a phone with the game.
+Checked on an AYN Thor (Adreno 740, Android 13) with the game: the title movie, the file select with its text, the
+prologue (see docs/STATUS.md for what still draws wrong). Earlier on an Android 15 emulator (arm64, gfxstream Vulkan):
+the start screen, landscape, the folder picker, going to the background and back.

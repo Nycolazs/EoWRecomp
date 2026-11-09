@@ -940,10 +940,12 @@ static void renderer_open_output(Renderer *r) {
     if (getenv("EOWRECOMP_NO_AUDIO") && strcmp(getenv("EOWRECOMP_NO_AUDIO"), "0")) return;
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) { LOG("[audren] SDL audio init failed: %s\n", SDL_GetError()); return; }
     SDL_AudioSpec spec = {SDL_AUDIO_F32, 2, (int)r->sample_rate};
+    plat_children_elsewhere(true);  // (SDL's audio threads start here: not on the caller's core)
     r->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (r->stream) SDL_ResumeAudioStreamDevice(r->stream);
+    plat_children_elsewhere(false);
     if (!r->stream) { LOG("[audren] SDL audio open failed: %s\n", SDL_GetError()); return; }
     if (getenv("EOWRECOMP_AUDIO_GAIN")) SDL_SetAudioStreamGain(r->stream, (float)atof(getenv("EOWRECOMP_AUDIO_GAIN")));
-    SDL_ResumeAudioStreamDevice(r->stream);
 }
 
 static void audio_renderer(Service *s, IpcReq *req, IpcResp *resp) {
@@ -1015,7 +1017,9 @@ SERVICE("audren:u", audren_u) {
         r->fx = calloc(r->effects ? r->effects : 1, sizeof(Effect));
         renderer_open_output(r);
         r->event = kernel_create_event_pair(&r->event_w, &r->event_r);
+        plat_children_elsewhere(true);  // (the mixer thread: not on this caller's core, the render core on phones)
         pthread_create(&r->thread, NULL, renderer_tick, r);
+        plat_children_elsewhere(false);
         audio_track(r, NULL);
         LOG("[audren] renderer %u Hz, %u samples/frame, %u voices, %u mixes, %u mix buffers, %u splitters, %u effects, "
             "revision %.4s (REV%d)\n", r->sample_rate, r->sample_count, r->voices, r->nmix, r->mix_buffers, r->splitters,
@@ -1229,6 +1233,7 @@ SERVICE("audout:u", audout_u) {
         if (getenv("EOWRECOMP_AUDOUT_WAV")) a->wav = fopen(getenv("EOWRECOMP_AUDOUT_WAV"), "wb");
         if (!(getenv("EOWRECOMP_NO_AUDIO") && strcmp(getenv("EOWRECOMP_NO_AUDIO"), "0")) && SDL_InitSubSystem(SDL_INIT_AUDIO)) {
             SDL_AudioSpec spec = {SDL_AUDIO_S16, (int)a->channels, (int)a->rate};
+            plat_children_elsewhere(true);  // (SDL's audio threads, and the audio-out thread below: not on this core)
             a->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
             if (a->stream) {
                 if (getenv("EOWRECOMP_AUDIO_GAIN")) SDL_SetAudioStreamGain(a->stream, (float)atof(getenv("EOWRECOMP_AUDIO_GAIN")));
@@ -1236,6 +1241,7 @@ SERVICE("audout:u", audout_u) {
             }
         }
         pthread_create(&a->thread, NULL, audout_thread, a);
+        plat_children_elsewhere(false);
         audio_track(NULL, a);
         IpcBuf *b = out_buf(req, 0);
         if (b && b->size) strncpy((char *)(uintptr_t)b->addr, "DeviceOut", b->size);
