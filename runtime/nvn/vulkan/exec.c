@@ -192,6 +192,9 @@ static int vk_counter_mode(void) {
 // frames don't fit 60 (12 of the last 60 over 16.2 ms), the counters report a frame of at least PACE_SLOW_NS: the game
 // takes its 30 fps mode, at full speed. Back to the real times after 2 s with headroom (busy under 13 ms on average,
 // at most 2 of the last 60 frames over). The game itself also tries 60 again now and then.
+// Headroom in the 30 fps mode doesn't prove 60 fits (the user's 9 Nov run, castle and dungeon: 19 switches in 18 min,
+// each back at 60 for 5-100 s at 52-57 fps with the GPU near full, then down again - a visible stutter each time): a
+// fall back within 60 s of returning doubles the headroom needed next time (up to 2 min); 60 s held at 60 resets it.
 // EOWRECOMP_PACE=0: off.
 #define PACE_SLOW_NS 20000000ull
 extern __thread uint64_t g_blocked_ns;  // kernel.c: this thread's time blocked in waits / sleeps
@@ -221,17 +224,23 @@ void vk_pace_frame(void) {
     over[idx] = (uint8_t)o;
     idx = (idx + 1) % 60;
     if (!on) return;  // (measured and counted all the same: EOWRECOMP_LOG_PACE, the stats)
+    static uint64_t back_at;  // when 60 was last given back
+    static int backoff;       // headroom needed: 120 frames << backoff
     if (!pace_slow && nover >= 12) {
         pace_slow = true, calm = 0;
-        LOG("[pace] frames don't fit 60 fps (%d of the last 60 over 16.2 ms busy): the game's 30 fps mode\n", nover);
+        if (back_at && now - back_at < 60000000000ull && backoff < 5) backoff++;
+        LOG("[pace] frames don't fit 60 fps (%d of the last 60 over 16.2 ms busy): the game's 30 fps mode (%d frames of "
+            "headroom to go back)\n", nover, 120 << backoff);
     } else if (pace_slow) {
         // headroom: busy well under a 60 fps frame on average, hardly a frame over (single spikes are normal play)
         calm = avg < 13.0 && nover <= 2 ? calm + 1 : 0;
-        if (calm >= 120) {
-            pace_slow = false, nover = 0;
+        if (calm >= 120 << backoff) {
+            pace_slow = false, nover = 0, back_at = now;
             memset(over, 0, sizeof over);
-            LOG("[pace] 2 s with headroom: back to the game's own choice\n");
+            LOG("[pace] %d frames with headroom: back to the game's own choice\n", calm);
         }
+    } else if (backoff && now - back_at > 60000000000ull) {
+        backoff = 0;  // 60 held: the next fall back starts over
     }
 }
 
