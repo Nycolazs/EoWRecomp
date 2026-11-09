@@ -214,3 +214,9 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
 - `[brx]` do log do usuário: 148 linhas, 66 shaders, tabelas de 3/5/6/8/13 entradas, ascendentes e sensatas (mesmo BRX na inst 30 dá 5 ou 8 entradas conforme
   o shader) — o port do BRX parece correto; a suspeita sobre ele enfraqueceu.
 - Link, capa do Ganon esticados e portal do void ausente: todos deformação/partículas → suspeita volta ao compute shader `SUST` (7 dispatches/frame pulados).
+
+- 2026-11-09 (2º crash, após a cutscene do logo): `no function at 7001810220`, lr=700180f698 (lr-4 é `blr`, sem dump do callee), x9=tabela em rodata,
+  x8=0xa, x11=0x2e, x10=base+0xb8 → mesmo padrão de tabela compacta, mas o `br` não foi achado. O 1º crash (janela do ADR) foi corrigido e passou.
+  Correção geral em `tools/gen.py`: `same_function()` — endereço de código materializado (ADR / ADRP+ADD) dentro da própria função do .eh_frame
+  nunca é callback, então não vira início de função. Teste em `tools/test_gen_br.py`. NÃO verificado: precisa do pacote novo.
+  `dispatch.c` agora também despeja 0x150 bytes antes do alvo (o `br` fica logo antes dos casos).

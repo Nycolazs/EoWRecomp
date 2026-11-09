@@ -148,6 +148,16 @@ static void dispatch_dump_unresolved(const Cpu *c, uint64_t pc) {
         fprintf(stderr, "  x%-2d=%016llx%s", i, (unsigned long long)c->x[i], i % 4 == 3 ? "\n" : "");
     fprintf(stderr, "\n");
     uint64_t lr = c->x[30];
+    // the code just before the target: a compact jump table's br sits right before its cases (ADR base .. br x10), so the
+    // cause shows even when the callee isn't a plain `bl` (crash at 7001810220: lr-4 was a blr)
+    if (guest_text(pc) && guest_text(pc - 0x150)) {
+        fprintf(stderr, "[dispatch] code before the target:\n");
+        for (int i = 0; i < 0x150 / 4; i++) {
+            uint64_t a = pc - 0x150 + 4 * i;
+            fprintf(stderr, "  %llx: %08x%s", (unsigned long long)a, *(const uint32_t *)a, i % 4 == 3 ? "\n" : "");
+        }
+        fprintf(stderr, "\n");
+    }
     if (!guest_text(lr) || !guest_text(lr - 4)) return;
     uint32_t w = *(const uint32_t *)(lr - 4);
     if ((w & 0xFC000000) != 0x94000000) return;  // not a BL

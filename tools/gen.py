@@ -508,6 +508,15 @@ def adr_feeds_br(m, i, rd, window=16):
     return False
 
 
+def same_function(m, pc, target):
+    """A code address materialized inside the .eh_frame function it points into is a case/branch target of that
+    function, never a callback (a function pointer points at a function start, already a boundary). Backstop of
+    adr_feeds_br: the crash after the logo cutscene (no function at 7001810220, x10 = adr base + idx*4) was a compact
+    table whose ADR..br distance the window didn't cover; the cases became a function of their own."""
+    lo, hi = m.true_function(pc)
+    return lo < target < hi
+
+
 def write_if_changed(path, text):
     """Leaves unchanged chunks untouched so make only recompiles what a patch affected."""
     try:
@@ -565,7 +574,7 @@ def main():
             imm = ((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)
             if imm & (1 << 20):
                 imm -= 1 << 21
-            if m.in_text(pc + imm) and not adr_feeds_br(m, i, w & 31):
+            if m.in_text(pc + imm) and not adr_feeds_br(m, i, w & 31) and not same_function(m, pc, pc + imm):
                 start_set.add(pc + imm)
         elif (w & 0x9F000000) == 0x90000000:  # ADRP
             imm = ((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)
@@ -576,7 +585,7 @@ def main():
             rn, rd = (w >> 5) & 31, w & 31
             if rn in adrp_regs and i - adrp_regs[rn][1] <= 8:
                 t = adrp_regs[rn][0] + ((w >> 10) & 0xFFF)
-                if m.in_text(t):
+                if m.in_text(t) and not same_function(m, pc, t):
                     start_set.add(t)
     scanned = {}
     rounds = 0

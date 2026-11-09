@@ -45,4 +45,12 @@ for name, win, want in (('adr_feeds_br default window', None, True), ('adr_feeds
     got = gen.adr_feeds_br(m, 0, 10) if win is None else gen.adr_feeds_br(m, 0, 10, win)
     print(('ok   ' if got == want else 'FAIL ') + name)
     fail += got != want
+
+# same_function(): an address inside the eh_frame function of the ADR is not a callback; the function's own start or another function is
+sm = types.SimpleNamespace(true_function=lambda a: (0x1000, 0x2000))
+for name, tgt, want in (('same_function: case inside', 0x1850, True), ('same_function: other function', 0x2400, False),
+                        ('same_function: own start', 0x1000, False)):
+    got = gen.same_function(sm, 0x1830, tgt)
+    print(('ok   ' if got == want else 'FAIL ') + name)
+    fail += got != want
 sys.exit(1 if fail else 0)
