@@ -2092,6 +2092,15 @@ static bool brx_table_labels(const uint8_t *code, size_t i, size_t end, const ui
         n++;
     }
     if (n) for (size_t k = 0; k < end; k++) label[k] |= mark[k];
+    if (getenv("EOWRECOMP_BRX_LOG")) {  // what the table analysis found, to check against a shader that renders wrong
+        uint32_t h = 2166136261u;
+        for (size_t k = 0; k < end * 8; k++) h = (h ^ ((const uint8_t *)code)[k]) * 16777619u;
+        fprintf(stderr, "[brx] shader %08x (%zu insts): BRX at inst %zu, cb1 table +%#llx imm %lld: %d entries ->", h, end, i,
+                (long long)table, (long long)imm, n);
+        for (size_t k = 0, m = 0; k < end && m < 48; k++)
+            if (mark[k]) { fprintf(stderr, " %zu", k); m++; }
+        fprintf(stderr, "\n");
+    }
     free(mark);
     return n > 0;
 }

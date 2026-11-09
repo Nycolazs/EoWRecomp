@@ -195,3 +195,13 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
 - Abertos: corações da HUD e item largado pretos; malha/textura do Link esticada; compute shader com SUST não traduzido (840 dispatches/2 s);
   efeito de áudio tipo 3; `[tex] type mismatch: want 3 have 1`.
 - Usuário deve testar: novo pacote (regenera o código do jogo, build demorado), jogar >10 min com o save, mandar o log se cair.
+
+- 2026-11-09: crash ao sair da sala persistiu com o pacote do b9850dc (a hipótese `ldr x,[b,i,lsl #3]` não bastou; o fallback ficou, é inofensivo).
+  `dispatch.c` agora imprime x0-x30 e o código da função chamada pelo `bl` antes do lr (até o primeiro `br`) no FATAL; precisa do log.
+- Suspeita nova para corações/item pretos e Link esticado: o port do BRX (labels só dos alvos da tabela). Esses materiais/skinning têm
+  BRX; se a tabela de cb1 lida a partir de `blob+const_offset` estiver incompleta, o dispatcher cai no `default`. No Linux/Intel (antes
+  do port, com todos os labels) a HUD saía certa mesmo com o compute `SUST` pulado, então `SUST` não parece a causa.
+  `EOWRECOMP_BRX_LOG=1` imprime por BRX: hash do shader, nº de entradas e as instruções-alvo. A/B: `EOWRECOMP_BRX_ALL_LABELS=1`
+  (volta ao antigo, mas na RX 580 trava os builds de pipeline: usar só numa cena curta com `EOWRECOMP_SHADER_THREADS` alto).
+  `[tex] type mismatch: want 3 (CUBE) have 1 (2D) 1408x792 fmt 0x35`: um sampler de cubo recebe uma textura 2D de render target
+  (slot não usado/obsoleto); vira textura preta, provavelmente inofensivo.
