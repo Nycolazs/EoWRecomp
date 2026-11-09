@@ -1,6 +1,6 @@
 # Status
 
-Atualizado: 2026-10-20 (sessão 3: macOS / Android).
+Atualizado: 2026-11-08 (sessão 5: gráficos no Android - fendas, Hyrule Castle Town).
 
 ## Jogo fixado (único build suportado)
 
@@ -25,6 +25,143 @@ Build IDs dos módulos (endereços de patches/HLE valem só para estes):
 | rtld | `2f1967113a281280a48ce3fc6dc23049327bf924` | 7 358 B |
 
 RomFS: 10 963 arquivos, 8 032 371 686 bytes (todos com magic válido: FRES, BNTX, MsgS, FSTM, SARC, FSHA, webm…).
+
+## Sessão 4 (2026-11-07, Linux + AYN Thor): o jogo roda e se joga no Android
+
+**Comprovado num aparelho real**: AYN Thor (Snapdragon 8 Gen 2 / QCS8550, **Adreno 740**, Android 13), APK pessoal
+(`tools/android/build_game.sh extracted --apk`), setup pela tela inicial com um NSP v1.0.0. Vulkan pelo **Turnip
+26.0.0 R8** (no APK, via libadrenotools; `EOWRECOMP_DRIVER=system` para o driver Qualcomm 1.3.128). Filme do título,
+seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p** (GPU ~13 ms por frame).
+
+### Corrigido (cada um visto no Thor)
+- Crash ao abrir: features Vulkan pedidas sem consultar o driver (`uniformAndStorageBuffer8BitAccess`).
+- `tools/nca_extract.py`: NSPs com title key (ticket / `title.keys`).
+- Tela preta no título: filmes lidos do RomFS (pacote / `romfs.bin`) por um `AVIOContext`, não só de `extracted/romfs/`.
+- 320 fps no título: o present respeita o intervalo do NVN (60 fps).
+- **Sem texto** na seleção de arquivo: o heap do guest são `AHardwareBuffer`s (blocos de 512 MB) mapeados em
+  `HEAP_BASE` e importados no Vulkan; os shaders leem a memória global por buffer address (`gmw()`), pois o Adreno não
+  tem `VK_EXT_external_memory_host` e o storage buffer vai só até 128 MB. Com o driver Qualcomm o texto continua faltando
+  (memória importada tipo 1, provavelmente sem coerência com o cache da CPU); com Turnip aparece.
+- Turnip 24.3 desenhava tudo preto; 26.0.0 R8 desenha.
+- **1 fps no prólogo** (Turnip): o vertex shader de skinning (12ee694000) tinha um BRX (tabela de salto pelo número de
+  ossos) e caía no laço de dispatch: 48 registros e ~575 spills. A tabela agora é lida das constantes do compilador e o
+  shader fica estruturado: 24 registros, sem spill, 3,3 ms -> ~0 por draw.
+- `LDC.64` na própria base lia a segunda palavra errada (matrizes das ossos): a **faixa vertical escura até o Link**
+  (problema aberto 2) sumiu junto.
+- Opção de resolução "720p" (padrão no Android). Ferramentas: `EOWRECOMP_GPUPROF_DRAWS`, `EOWRECOMP_VK_STATS`,
+  `EOWRECOMP_GLSL_OVERRIDE`.
+- **Corações** (HUD / seleção) eram quadrados vermelhos, também no Linux: o RGB565 do NVN é `B5G6R5` no Vulkan.
+- **Miniatura do save**: saves novos têm a imagem (a cópia textura -> buffer chega à memória do guest); os antigos
+  foram gravados com a cena preta e ficam pretos até serem sobrescritos.
+- Cache de pipelines gravado a cada 30 s enquanto surgem pipelines novos (o Android mata apps sem `exit()`).
+- **Brilho no chão** perto das luzes (Link, bombas): pixels 2x2 com as luzes erradas. O laço de luzes (fs 12ee66f300)
+  junta as listas de luzes no warp (ballot + shuffles) e os subgroups do Adreno têm 64/128 lanes: agora cada 32 lanes
+  do subgroup são um warp (lane, shuffle, ballot, vote).
+- Compute 12a4723000 (filtra cube maps em quatro mapas 2D) não traduzia (`SUST.P.B`): agora vira `imageStore`
+  (imagens ligadas com `nvnCommandBufferBindImage(s)`, `c[2][0x120 + 8 * slot]`; texturas com
+  `NVN_TEXTURE_FLAGS_IMAGE` ganham uso storage). 0 dispatches pulados; no dungeon do prólogo a imagem não muda.
+- **Thread de UI girando um core grande**: o `SDL_WaitEventTimeout` do Android nunca dorme (cada pump enfileira um
+  sentinel que acorda o loop). Agora `SDL_PollEvent` + 4 ms: CPU do app 3,1 -> 1,2 G ciclos/s (simpleperf), mesmo fps.
+- **Crash quando a Zelda é libertada** (fim do prólogo): `FATAL: no function at 1001a65870`. `f_7001a657e0` (switch
+  0-8, tabela `ldrh`) tinha 4 `mov` entre o `add` e o `br`: o `adr` da base ficou fora da janela de 6 instruções de
+  `adr_feeds_br`, foi tomado por callback e a função partida no primeiro caso (casos 1-8 sem função). Janela 16
+  (para em b/bl/blr/ret): +46 tabelas nos quatro módulos. Visto no C gerado (os 9 casos no switch) e no aparelho: a
+  parte da Zelda carrega e se joga.
+- **Threads no core do render**: os threads criados a partir do thread de render herdavam a afinidade dele (cpu7
+  sozinho): workers de pipeline, tradutor de shaders, áudio do SDL e mixer. Agora vão para os outros cores
+  (`plat_children_elsewhere`); no cpu7 sobra só o render. Sem mudança de fps aqui (já 30 fixos); achado do
+  PokeZ-Android no mesmo aparelho (lá +2 fps).
+- `nvnCommandBufferClearBuffer` era gravado e descartado: agora executado em ordem. O EoW não o usa no prólogo.
+- **Fuga do Rift lenta (24-27 fps)** com a GPU e o thread principal ambos ocupados menos da metade do tempo. Causa:
+  no Turnip (kgsl) os timeline semaphores são emulados - `vkGetSemaphoreCounterValue` (e `vkWaitSemaphores` com
+  timeout 0) bloqueava até a submissão recém-feita acabar (~11 ms), e todo `vkQueueSubmit` que sinalizava o timeline
+  esperava na CPU pelos pontos anteriores (`vk_sync_timeline_gc_locked -> kgsl_syncobj_wait`, simpleperf
+  `--trace-offcpu`): jogo e GPU andavam em turnos. Agora cada submissão termina gravando seu número num buffer
+  coerente (`vkCmdUpdateBuffer`), lido/esperado por polling; no Android o timeline não é mais sinalizado
+  (`EOWRECOMP_VK_TIMELINE=1` volta). Mesma fuga, mesmo percurso: 30 fps fixos; cutscenes chegam a 52-60.
+  A linha de fps do log agora sempre traz `gpu X ms, main thread cpu Y ms` (por 2 s).
+- `rt_dispatch`: o cache de chamadas indiretas saiu do TLS (TLSDESC no Android) para o `Cpu` do thread.
+- **Sessão 5 (2026-11-08, Thor, Turnip; build 524c797..c15346d)**, a partir do save do usuário em Hyrule Castle
+  Town / castelo:
+  - **Telhados e paredes listrados, soleiras e caminhos pretos** nas casas de Hyrule Castle Town (mudavam com a
+    câmera: as "texturas tremendo" e "sobreposições" do usuário). Causa: o modo depth-stencil STENCIL do NVN (view ou
+    textura) era ignorado - a view era sempre a de profundidade. O draw que recorta a fenda (fs 12a46f5000) lê dois
+    bits do stencil (R2P) e puxa a profundidade da cena para a frente onde eles estão zerados, e o pass com EQUAL
+    depois deixa um buraco; lendo a profundidade, os bits do float decidiam. Agora a view é o aspecto stencil e o slot
+    um sampler inteiro (ShaderKey.stencil_tex). Achado pulando draws num debug frame (`EOWRECOMP_DEBUG_FRAME` +
+    `EOWRECOMP_SKIP_FSHASH`): sem esse draw a casa saía limpa. Visto no Thor (Vulkan): casa, soleira e pedras certas.
+    O backend Metal (`renderer.m`) ainda lê a profundidade nesse caso.
+  - Compute 12a4711000 / 12a4715000 não traduziam (`VMNMX`, depois `ATOM.E.ADD.S32`): todos os dispatches e
+    ~120-850 draws a cada 2 s pulados ("compute program") na sala do trono, na cutscene da fenda e na cidade. Agora
+    0 pulados. `S2R` LANEID e as máscaras de lane (LTMASK etc.) também (o append por warp do mesmo shader).
+  - `fmin`/`fmax`/`saturate` como NMin/NMax/NClamp (do PokeZ-Android): laço de luzes 4,00 -> 3,78 ms, frame
+    21,5 -> 21,3 ms na cidade.
+  - Medido na cidade (GPU por frame, `EOWRECOMP_GPUPROF_AT`): ~21 ms a 30 fps; os mais caros: fs 12a5c12e00
+    (estático) 4,2 ms, laço de luzes 12ee66f300 3,8 ms, pre-pass com skinning 12ee695200 3,6 ms.
+
+### Ainda errado / medido no Thor
+- A lista "Which data would you like to load?" vazia por alguns segundos e objetos que aparecem um pouco depois na
+  primeira visita: são os draws pulados enquanto os pipelines compilam (assíncrono de propósito: sem travadas).
+  Com o cache quente acontece quase só durante o fade do carregamento.
+- Thread do jogo (simpleperf, prólogo): 42% código do jogo, 22% kernel (sincronização: ~2500 trocas de contexto/s
+  no thread principal, 0 page faults), 21% runtime (`rt_dispatch` 9%: saltos indiretos), 4% Turnip. Onde os threads
+  bloqueiam (simpleperf `sched:sched_switch`): `svc_wait_process_wide_key` (condvar) e `svc_arbitrate_lock` (mutex
+  disputado), chamados de f_700c4f82b0 / f_700c4fa1f0 do SDK pelos workers do jogo (~17 000 trocas/s no processo).
+- Testado nesta sessão sem defeitos novos: cutscene de abertura do novo jogo (profundidade de campo), combate,
+  bombas e explosões, tochas, escadas, menus de pausa (Key Items / System), lista de saves.
+- **Fenda sem o vazio preto - corrigido (97d8b3e)**: em Hyrule Castle Town há uma fenda sobre uma casa; ao vivo
+  aparecia só o contorno roxo, a casa inteira dentro (o usuário confirmou no jogo: nas cutscenes as fendas são buracos
+  pretos, jogando só contornos - também no dungeon depois do atalho). Os constant buffers são copiados na CPU quando o
+  draw é gravado (`guest_copy`), e a compute 12a4705000 (1x1x1, sbuf 127e80a300+0x470) escreve parâmetros que draws
+  da mesma submissão leem como constant buffer: a cópia saía velha. Achado com flush depois de cada pass (o vazio
+  aparece) e bissecção até o pass logo depois das computes 12a46fe000 / 12a4705000 / 12a470d000, mais
+  `EOWRECOMP_COPY_TRACE`. Agora esses constant buffers são lidos no lugar (o buffer do heap AHardwareBuffer como
+  uniform buffer): a fenda vira vazio preto de bordas roxas, a Zelda na frente, 30 fps.
+- **Grade escura no piso - corrigido (43967b4)**: com o constant buffer certo a iluminação em clusters do jogo
+  passou a valer (a luz da Tri, os raios de sol) e o piso ficou com uma grade de linhas escuras serrilhadas (Suthorn
+  com a Tri, entrada do castelo; o usuário confirmou que é erro). Não eram as sombras (`EOWRECOMP_NO_SHADOW=1` não
+  mudava). Isolado com `EOWRECOMP_GLSL_OVERRIDE`: só o campo `cb4[70][2]` (escala vertical da grade de clusters,
+  0 na cópia da CPU, ~0,116 da compute) e só no par vs `12a46e1000` / fs `12a46e1400`. Esse passe rasteriza os
+  volumes das luzes numa grade 128x72 (e 64x36) e o fs faz `atomicOr` do bit da luz em cada célula coberta; sendo
+  16:9 o alvo era escalado (2/3) como uma imagem: 85x48 fragmentos para 128x72 células, as do meio sem luz. Agora um
+  alvo em que um fs com stores desenha volta ao tamanho do guest (`vk_texture_unscale`, log "kept at the guest
+  size"). Metal tem a mesma escala e não foi tocado.
+- **Travadas nas animações (17b48b5)**: no log da run do usuário (18 min) o pacing trocou 19 vezes entre os modos
+  60 e 30 fps do jogo: em 30 parecia haver folga, voltava a 60, ficava 5-100 s a 52-57 fps com a GPU quase cheia e
+  caía de novo. Uma queda menos de 60 s depois de voltar agora dobra a folga exigida (até 3840 frames); 60 s em 60
+  zeram. Lógica testada fora do aparelho (a cena testada ficou estável em 30).
+- Pre-pass e EQUAL: as listras não eram falta de precisão entre os dois vertex shaders (as contas de posição são as
+  mesmas a menos de comutação; um bias de 256 unidades D24 escondia as listras, 128 não - era o recorte da fenda).
+
+### Próximo passo (Android)
+1. Feedback do usuário (9/11) ainda aberto: texturas tremendo às vezes (talvez as células sem luz da grade, que
+   mudam com a câmera - confirmar), o menu de ecos (L segurado; no aparelho os ícones e o fundo parecem normais -
+   saber o que ele estranha), os jardins do castelo à noite pretos até os shaders compilarem (primeira entrada
+   depois de o GLSL mudar; na segunda deve vir do cache).
+2. GPU (cidade ~21 ms por frame): fs `12a5c12e00` (2727 instruções, ~4,2 ms) e o laço de luzes `12ee66f300`
+   (3,8 ms; ballot + shuffles em warps de 32 dentro dos subgroups de 64/128 do Adreno).
+3. CPU do thread do jogo: a sincronização entre threads do guest (tempo no kernel).
+4. Áudio e save em jogo mais longo.
+
+**Para o usuário testar (build com 17b48b5):** pisos sem a grade escura (dungeon, entrada do castelo), a Tri com a
+luz dela, as fendas como buracos pretos; e se as animações ainda dão trancos (o log mostra as trocas: `[pace]`).
+
+Entrada pelo controle no aparelho: `sendevent /dev/input/event9` (o "Odin Controller"; o shell está no grupo
+`input`): `BTN_TL` 0x136 = L, segurar para o menu de ecos. Os `input keyevent` do adb não chegam como controle.
+
+Percurso até a fuga a partir do save do usuário (sala do trono): stick esquerda ×2, esquerda-baixo, esquerda-cima,
+baixo, cima (começa a cutscene), A ×10, baixo-esquerda até a escada, A ×4, segurar baixo = fuga.
+
+### Testes no aparelho (scripts)
+`adb shell input swipe` usa um ponteiro só (pular andando não funciona). Multi-toque: `sendevent` em
+`/dev/input/event6` (`fts_ts`, tela principal; protocolo B: slot 0 o stick, slot 1 o botão; com a tela em paisagem
+raw_x = 1080 - y, raw_y = x).
+
+### Como testar no Android
+`tools/android/build_deps.sh`, `(cd android && ./gradlew assembleDebug)`, `tools/android/build_game.sh extracted --apk`,
+`adb install -r android/app/build/outputs/apk/debug/app-debug.apk` (a release alpha_1 tem outra chave: desinstalar
+antes). Log: `Android/data/com.eowrecomp.android/files/eowrecomp.log` ou `adb logcat -s EoWRecomp`. Gradle 8.14 não
+roda no Java 25: usar um JDK 21.
 
 ## Sessão 3 (2026-10-20, MacBook Air M1 8 GB, macOS 27): macOS e Android
 
