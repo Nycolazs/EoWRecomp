@@ -174,3 +174,12 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
   `struct_blocks`, port do StructuredIr do Ryujinx, MIT): if/else/do-while em vez do laço `switch (pc)`; padrão no Mali/Adreno.
   Candidato a port se o `.glsl` travado for dominado pelo laço `switch (pc)`.
 - Próximo passo: o usuário roda com `EOWRECOMP_MAX_FS_GLSL=30000` e `EOWRECOMP_SAVE_MSL=1`, manda `eowrecomp.log` e o `.glsl`.
+
+- 2026-11-08 (later): causa provável do travamento: os shaders pesados (vs 72a5c0e100 990 cases, vs 72a5c2b000 392, fs 72eb9d4700 1254)
+  têm todos um `BRX`, que fazia o tradutor rotular TODAS as instruções como destino (um `case` por instrução no laço `switch (pc)`).
+  O LASRecomp já corrigiu isso (d92cc2a, issue #237, "AMD Windows nunca termina o build"): só os destinos da tabela de saltos (cb1) ganham
+  `case`. Portado para `translate.c` (`brx_table_labels`; `EOWRECOMP_BRX_ALL_LABELS=1` volta ao antigo) + `tools/test_brx.sh`
+  (4 labels com a tabela, 11 sem). MSL inalterado (só GLSL). Ainda NÃO verificado no PC do usuário (RX 580, Windows).
+- Também: `EOWRECOMP_MAX_FS_GLSL` / `EOWRECOMP_MAX_VS_GLSL` (descartam pipelines grandes, só experimento), `EOWRECOMP_NO_PIPELINE_CACHE`,
+  linha `[vk] jobs` com o job mais longo (tipo, fs/vs, tamanho). `EOWRECOMP_VK_OPT=1` não ajudou.
+- Usuário deve testar: duplo clique, sem variáveis; olhar se a cena 3D aparece e se `pipeline compiling` zera, mandar `eowrecomp.log`.

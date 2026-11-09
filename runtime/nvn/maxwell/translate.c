@@ -2042,6 +2042,60 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     return info;
 }
 
+// BRX (indirect branch, Vulkan / GLSL only): label just the targets its jump table can name. Ported from LASRecomp
+// (d92cc2a, MIT, issue #237). Here: on a Radeon RX 580 / Windows the vertex shaders 72a5c0e100 (990 cases) and
+// 72a5c2b000 (392 cases) and the 131 KB fragment shader 72eb9d4700 (1254) - every one with a BRX - kept pipeline builds
+// running for minutes (log 2026-11-08). A BRX used to make every
+// instruction a case of the dispatcher switch (any one may be a target): hundreds of cases falling into each other
+// inside the dispatcher loop. Suspected of what AMD's Windows driver never finishes building (issue #237: the dialogue
+// body text's vertex shader stayed "building", its draws skipped - Tarin's name showed, the message stayed blank).
+// The compiler puts the table in the program's own constants (cb1, after the code: blob + const_offset), loaded into
+// the BRX register by an LDC c[0x1][Rx + table] shortly before: BRX Ra, imm goes to pc + 8 + table[k] + imm. Entries
+// are read until one isn't an instruction of this shader (the end of the table; a word past it that still looks like
+// one only adds a harmless case). False: not that shape (the register set some other way, no constants, nothing
+// valid) - the caller labels every instruction as before. EOWRECOMP_BRX_ALL_LABELS=1: always every instruction.
+static bool brx_table_labels(const uint8_t *code, size_t i, size_t end, const uint8_t *blob, size_t const_offset, uint8_t *label) {
+    static int all = -1;
+    if (all < 0) { const char *e = getenv("EOWRECOMP_BRX_ALL_LABELS"); all = e && atoi(e) != 0; }
+    if (all || const_offset >= 0x10000 || const_offset < 0x80) return false;  // (0x10000: no constants known)
+    uint64_t brx = ((const uint64_t *)code)[i];
+    int ra = (int)bits(brx, 8, 8);
+    int64_t imm = sbits(brx, 20, 24);
+    if (ra == RZ) return false;
+    // the instruction that set ra: an LDC from cb1 within the few before, nothing else writing ra (or a branch) between
+    int64_t table = -1;
+    for (size_t k = i, seen = 0; k-- > 0 && seen < 32;) {
+        if (k % 4 == 0) continue;  // (scheduling words)
+        seen++;
+        uint64_t w = ((const uint64_t *)code)[k];
+        if ((w & 0xfff0000000000000ull) >= 0xe200000000000000ull && (w & 0xfff0000000000000ull) <= 0xe350000000000000ull)
+            return false;  // flow control between: not straight-line
+        if ((w & 0xfff8000000000000ull) == 0xef90000000000000ull && (int)bits(w, 0, 8) == ra) {  // LDC ra, c[idx][Rx + off]
+            if (bits(w, 36, 5) != 1 || bits(w, 48, 3) != 4) return false;  // (cb1, 32-bit)
+            table = (int64_t)bits(w, 20, 16);
+            break;
+        }
+        if ((int)bits(w, 0, 8) == ra) return false;  // (something else may write ra: unknown)
+    }
+    if (table < 0) return false;
+    const uint8_t *tab = blob + const_offset + table;
+    uint8_t *mark = calloc(end + 4, 1);
+    int n = 0;
+    for (int k = 0; k < 256; k++) {
+        int32_t v;
+        memcpy(&v, tab + 4 * k, 4);
+        int64_t t = (int64_t)i * 8 + 8 + v + imm;
+        if (t < 8 || (t & 7) || (size_t)(t / 8) >= end) break;
+        t = norm_target(t);  // (as the BRX itself does at run time)
+        if ((size_t)(t / 8) >= end) break;
+        mark[t / 8] = 1;
+        n++;
+    }
+    if (n) for (size_t k = 0; k < end; k++) label[k] |= mark[k];
+    free(mark);
+    return n > 0;
+}
+
 ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
     ShaderInfo *info = calloc(1, sizeof *info);
     info->stage = stage;
@@ -2111,10 +2165,10 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
                 }
             }
         }
-        if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) {  // BRX: any instruction may be a target
+        if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) {  // BRX: its jump table's targets, else any instruction
             any_branch = true;
             forward = false;
-            memset(label, 1, end);
+            if (!c->glsl || !brx_table_labels(code, i, end, blob, max_size, label)) memset(label, 1, end);
         }
         if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull || (w & 0xfff0000000000000ull) == 0xe340000000000000ull ||
             (w & 0xfff0000000000000ull) == 0xe350000000000000ull)
