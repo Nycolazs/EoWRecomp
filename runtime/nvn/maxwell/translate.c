@@ -767,6 +767,92 @@ static void emit_texs(Ctx *c, uint64_t w, bool fetch) {
     write_tex_result(c, slot, call, mask, d0, d1, true, !bits(w, 59, 1));  // 0xd0/0xd2: .F16 results
 }
 
+// SUST (surface store; compute, GLSL). Bit 52 clear = formatted ("SUST.P", the store converts to the image's format), set =
+// raw bytes (".D"/"B": not translated). Layout as in nouveau's gm107 emitter (emitSUST) and checked against the real
+// shader 72a4723000 at 0x358, `eb20138600f70018` = SUST.P.2D.RGBA [R0], R24, R39: data register at bit 0, coordinates
+// at 8, component mask at 20 (4 bits), dimension at 32 (4 bits: 6 = 2D), immediate-handle flag at 51 (clear = the handle is
+// in the register at bit 39: R39 here), 13-bit immediate handle index at 36. The handle (tic | sampler << 20) of a register handle
+// comes from a constant buffer (LDC / MOV c[b][o] a few instructions earlier): the image is "c[bank][offset]", resolved
+// by the runtime at dispatch time (exec.c image_info).
+static bool trace_handle(Ctx *c, int rg, size_t i, uint32_t *bank, uint32_t *off, uint64_t *writer) {
+    *writer = 0;
+    const uint64_t *code = (const uint64_t *)c->code;
+    if (rg == RZ) return false;
+    for (size_t k = i, seen = 0; k-- > 0 && seen < 64;) {
+        if (k % 4 == 0) continue;  // (scheduling words)
+        seen++;
+        uint64_t w = code[k];
+        if ((w & 0xfff0000000000000ull) >= 0xe200000000000000ull && (w & 0xfff0000000000000ull) <= 0xe350000000000000ull)
+            return false;  // flow control between: not straight-line
+        if ((int)bits(w, 0, 8) != rg) continue;
+        if ((w & 0xfff8000000000000ull) == 0xef90000000000000ull && (int)bits(w, 8, 8) == RZ) {  // LDC rg, c[b][imm]
+            *bank = (uint32_t)bits(w, 36, 5);
+            *off = (uint32_t)bits(w, 20, 16);
+            return true;
+        }
+        if ((w & 0xfff8000000000000ull) == 0x4c98000000000000ull) {  // MOV rg, c[b][imm]
+            *bank = (uint32_t)bits(w, 34, 5);
+            *off = (uint32_t)bits(w, 20, 14) * 4;
+            return true;
+        }
+        *writer = w;
+        return false;  // (written some other way: the caller reports the instruction)
+    }
+    return false;
+}
+
+static int image_slot(Ctx *c, uint32_t bank, uint32_t off) {
+    for (int i = 0; i < c->info->ntex; i++) {
+        ShaderTexture *t = &c->info->tex[i];
+        if (t->is_image && t->bindless_cbuf == bank && t->bindless_offset == off) return i;
+    }
+    int s = c->info->ntex++;
+    if (s >= 31) { fail(c, "too many textures"); return 0; }
+    ShaderTexture *t = &c->info->tex[s];
+    memset(t, 0, sizeof *t);
+    t->is_image = t->bindless = true;
+    t->bindless_cbuf = bank;
+    t->bindless_offset = off;
+    t->handle_offset = off;
+    t->type = TEXTYPE_2D;
+    return s;
+}
+
+static void emit_sust(Ctx *c, uint64_t w, uint32_t pc) {
+    int data = (int)bits(w, 0, 8), co = (int)bits(w, 8, 8);
+    uint32_t mask = (uint32_t)bits(w, 20, 4);
+    int dim = (int)bits(w, 32, 4);
+    if (!c->glsl || c->stage != STAGE_COMPUTE) { fail(c, "sust outside a GLSL compute shader"); return; }
+    if (bits(w, 52, 1)) { fail(c, "sust.d (raw store) %016llx", (unsigned long long)w); return; }
+    if (dim != 6) { fail(c, "sust dimension %d (only 2D)", dim); return; }
+    if (!mask) return;
+    uint32_t bank, off;
+    uint64_t wr = 0;
+    if (bits(w, 51, 1)) {
+        bank = 0;
+        off = (uint32_t)bits(w, 36, 13) * 4;  // (like TEX's immediate handle: a word index into the driver constants)
+    } else if (!trace_handle(c, (int)bits(w, 39, 8), pc / 8, &bank, &off, &wr)) {
+        fail(c, "sust: image handle R%d not loaded from a constant buffer (written by %016llx)", (int)bits(w, 39, 8),
+             (unsigned long long)wr);
+        return;
+    }
+    int slot = image_slot(c, bank, off);
+    if (c->fail) return;
+    char v[4][40];
+    int n = 0;
+    for (int k = 0; k < 4; k++) {
+        if (mask & (1u << k)) {
+            int r = data + n++;
+            if (data == RZ) strcpy(v[k], "0.0f");
+            else { c->reg_used[r] = 1; sprintf(v[k], "as_type<float>(r%d)", r); }
+        } else {
+            strcpy(v[k], k == 3 ? "1.0f" : "0.0f");
+        }
+    }
+    sp(&c->body, "    imageStore(t%d, int2(int(%s), int(%s)), float4(%s, %s, %s, %s));\n", slot, co == RZ ? "0u" : R(co),
+       co == RZ ? "0u" : R(co + 1), v[0], v[1], v[2], v[3]);
+}
+
 // TEX (full form): coordinates from consecutive registers at gpr8, extra parameters at gpr20.
 static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8);
@@ -927,6 +1013,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             if (dyn) c->info->cbuf_size[idx] = 0x10000;
             set_reg(c, d + i, cb);
         }
+    } else if (OPM(0xeb20000000000000ull, 0xffe0000000000000ull)) {  // SUST
+        emit_sust(c, w, pc);
     } else if (OPM(0xd000000000000000ull, 0xf600000000000000ull)) {  // TEXS
         emit_texs(c, w, false);
     } else if (OPM(0xd200000000000000ull, 0xf600000000000000ull)) {  // TLDS
@@ -1934,6 +2022,10 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     }
     for (int i = 0; i < info->ntex; i++) {
         ShaderTexture *t = &info->tex[i];
+        if (t->is_image) {  // SUST target (writeonly, no format: shaderStorageImageWriteWithoutFormat)
+            sp(&s, "layout(set = %d, binding = %d) uniform writeonly image2D t%d;\n", set, 32 + i, i);
+            continue;
+        }
         sp(&s, "layout(set = %d, binding = %d) uniform %s t%d;\n", set, 32 + i, glsl_sampler_type(t), i);
         // size of level l as (width, height, depth or layers)
         switch (t->type) {
@@ -2134,6 +2226,8 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (w == 0 && i > 4) break;
         end = i + 1;
     }
+    c->code = code;  // (emit_sust reads back through earlier instructions)
+    c->ninsts = end;
     // collect branch targets (labels)
     uint8_t *label = calloc(end + 4, 1);
     label[1] = 1;

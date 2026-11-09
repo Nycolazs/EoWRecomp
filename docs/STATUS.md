@@ -220,3 +220,11 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
   Correção geral em `tools/gen.py`: `same_function()` — endereço de código materializado (ADR / ADRP+ADD) dentro da própria função do .eh_frame
   nunca é callback, então não vira início de função. Teste em `tools/test_gen_br.py`. NÃO verificado: precisa do pacote novo.
   `dispatch.c` agora também despeja 0x150 bytes antes do alvo (o `br` fica logo antes dos casos).
+
+- 2026-11-09 SUST (compute `72a4723000`, `eb20138600f70018` = SUST.P.2D.RGBA [R0], R24, R39): traduzido (`emit_sust` em translate.c: imageStore em
+  `image2D` writeonly sem formato; handle = LDC/MOV c[b][o] achado voltando no código; se não achar, o erro mostra a instrução que escreveu o registrador).
+  Runtime (Vulkan): `vk_reflect` reconhece imagem de escrita; texturas com a flag NVN IMAGE (0x4) ganham `STORAGE`; `image_info()` resolve o handle
+  (banco 0: slots de textura 0x20.., imagens 0x120.. — PALPITE; outros bancos: lê o handle da memória do buffer); features
+  `shaderStorageImageWriteWithoutFormat/ExtendedFormats`; barreira total depois do dispatch. Teste: `tools/test_sust.sh`.
+  NÃO verificado em execução (sem Vulkan/GPU aqui; só tradutor testado). O log do usuário mostra `[cs-img] ...` com handle/textura/flags: se disser
+  "NOT writable" ou "(none)", o palpite do offset ou o valor da flag IMAGE está errado. Hipótese a confirmar: era isso que esticava Link/capa/portal.

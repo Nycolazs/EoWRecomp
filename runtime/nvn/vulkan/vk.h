@@ -84,6 +84,7 @@ typedef struct TexBackend {
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     bool scalable, presented;
+    bool storage;  // created with STORAGE usage (an NVN texture with the IMAGE flag): a compute shader's SUST may write it
     uint64_t touched_frame, frame_cleared;
     uint32_t level_gen;
     float sx, sy;
@@ -104,6 +105,9 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
 VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,
                           uint32_t nly, VkComponentMapping sw, VkImageAspectFlags aspect);
 VkImageView vk_dummy_view(int textype);
+// Writable (storage) 2D view of t for a compute shader's SUST, or VK_NULL_HANDLE when t can't be one (no IMAGE flag, format
+// without storage support, multisampled). Marks t GPU-owned: its contents are the compute shader's, not the CPU copy's.
+VkImageView vk_storage_view(NvnTexture *t);
 VkSampler vk_sampler(NvnSamplerDesc *d);
 VkSampler vk_default_sampler(bool linear);
 void vk_image_init_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect);

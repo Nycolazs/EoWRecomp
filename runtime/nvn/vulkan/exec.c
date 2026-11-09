@@ -443,9 +443,10 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
             if (s->npools == 16) FATAL("descriptor pools exhausted\n");
             VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
                                             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
-                                            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024}};
+                                            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},
+                                            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256}};
             VkDescriptorPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 8192,
-                                             .poolSizeCount = 5, .pPoolSizes = sizes};
+                                             .poolSizeCount = 6, .pPoolSizes = sizes};
             VK_CHECK(vkCreateDescriptorPool(g_vk.dev, &ci, NULL, &s->pools[s->npools++]));
         }
         VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -2456,6 +2457,39 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     *out = (VkDescriptorImageInfo){smp, view, VK_IMAGE_LAYOUT_GENERAL};
 }
 
+// A compute shader's SUST image ("c[bank][offset]" holds its 32-bit handle, tic | sampler << 20: translate.c emit_sust).
+// Bank 0 is the driver's own constants: texture handles from 0x20 (8 bytes each, st.tex), the image handles after them
+// (guess: 0x120 + 8 * index = st.img[stage][index], NVN's nvnCommandBufferBindImage); any other bank is the game's
+// uniform buffer (bank 3 + n = st.ubuf[stage][n]) and the handle is read from guest memory. The first resolutions are
+// logged: the guess and the texture's IMAGE flag are what this depends on.
+static VkDescriptorImageInfo cs_img_ii[64];
+
+static bool image_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out) {
+    ShaderTexture *t = &si->tex[i];
+    uint64_t h = 0;
+    const char *how = "?";
+    if (t->bindless_cbuf == 0) {
+        if (t->bindless_offset >= 0x20 && t->bindless_offset < 0x120) { h = st.tex[stage][(t->bindless_offset - 0x20) / 8]; how = "texture slot"; }
+        else if (t->bindless_offset >= 0x120 && t->bindless_offset < 0x160) { h = st.img[stage][(t->bindless_offset - 0x120) / 8]; how = "image slot"; }
+    } else {
+        int idx = (int)t->bindless_cbuf - 3;
+        Range r = (idx >= 0 && idx < 18) ? st.ubuf[stage][idx] : (Range){0, 0};
+        if (r.addr && t->bindless_offset + 4 <= r.size) { h = *(const uint32_t *)(uintptr_t)(r.addr + t->bindless_offset); how = "uniform buffer"; }
+    }
+    NvnTexture *tex = NULL;
+    uint32_t tic = h & 0xFFFFF;
+    if (h && st.tpool && tic < (uint32_t)st.tpool->count) tex = ((NvnTexEntry *)st.tpool->entries)[tic].tex;
+    VkImageView v = tex ? vk_storage_view(tex) : VK_NULL_HANDLE;
+    static int nlog;
+    if (nlog++ < 12)
+        LOG("[cs-img] c[%u][%#x] (%s): handle %#llx -> texture %p%s%s\n", t->bindless_cbuf, t->bindless_offset, how, (unsigned long long)h,
+            (void *)tex, tex ? "" : " (none)", tex ? (v ? " storage view ok" : " NOT writable (no IMAGE flag / format)") : "");
+    if (tex && !v && nlog < 40) LOG("[cs-img]   texture %ux%u fmt %#x flags %#x target %u\n", tex->width, tex->height, tex->format, tex->flags, tex->target);
+    if (!v) return false;
+    *out = (VkDescriptorImageInfo){VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_GENERAL};
+    return true;
+}
+
 // Writes the descriptor set of one stage. gx..gz: compute group counts (driver constants).
 // pre_ii: texture descriptors already resolved by the caller (draw: fragment textures, needed earlier for the
 // viewport decision), or NULL.
@@ -2484,6 +2518,9 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 tex_sc[sg][ti][0] = sc[0]; tex_sc[sg][ti][1] = sc[1];
                 tex_wh[sg][ti][0] = wh[0]; tex_wh[sg][ti][1] = wh[1];
             }
+            w[n].pImageInfo = &ii[n];
+        } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && b->binding >= 32 && b->binding - 32 < 64) {
+            ii[n] = cs_img_ii[b->binding - 32];  // (resolved by dispatch_compute)
             w[n].pImageInfo = &ii[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding < 17) {
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
@@ -2622,6 +2659,12 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         }
         LOG("\n");
     }
+    bool writes_image = false;
+    for (int i = 0; i < cp->si->ntex && i < 64; i++) {
+        if (!cp->si->tex[i].is_image) continue;
+        if (!image_info(5, cp->si, i, &cs_img_ii[i])) { SKIP(SKIP_COMPUTE_PROG); return; }  // (no writable image bound: as before SUST)
+        writes_image = true;
+    }
     if (cp->si->uses_gmem_map) gfast_prepare(cb);
     VkDescriptorSet ds = stage_set(&cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
@@ -2629,6 +2672,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     vkCmdDispatch(cb, gx, gy, gz);
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
     if (cp->si->uses_gmem_store) vc_mark_sbufs(5);
+    if (writes_image) vk_full_barrier(cb);  // (the next pass samples what SUST wrote)
     stat_dispatches++;
 }
 
