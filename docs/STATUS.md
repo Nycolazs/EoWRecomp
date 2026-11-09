@@ -117,30 +117,37 @@ seleção de arquivo com texto, novo jogo, prólogo jogável a **30 fps em 720p*
   aparece) e bissecção até o pass logo depois das computes 12a46fe000 / 12a4705000 / 12a470d000, mais
   `EOWRECOMP_COPY_TRACE`. Agora esses constant buffers são lidos no lugar (o buffer do heap AHardwareBuffer como
   uniform buffer): a fenda vira vazio preto de bordas roxas, a Zelda na frente, 30 fps.
-- **Luz amarela com sombras em grade** na entrada do castelo (save "Hyrule Castle", depois da Tri): com o constant
-  buffer certo aparece uma luz em volta da Zelda (provavelmente a da Tri; com a cópia velha ela não existia) e o piso
-  fica com uma grade de sombras serrilhadas. As sombras do fs `12a5c12e00` vêm de `t2` (`sampler2DArrayShadow`,
-  1024x1024 D24S8, camada 0, 4 amostras em cruz com o passo de `cb4[40]`): ver o sampler real (filtro / compare) no
-  aparelho e se `EOWRECOMP_NO_SHADOW=1` tira a grade.
+- **Grade escura no piso - corrigido (43967b4)**: com o constant buffer certo a iluminação em clusters do jogo
+  passou a valer (a luz da Tri, os raios de sol) e o piso ficou com uma grade de linhas escuras serrilhadas (Suthorn
+  com a Tri, entrada do castelo; o usuário confirmou que é erro). Não eram as sombras (`EOWRECOMP_NO_SHADOW=1` não
+  mudava). Isolado com `EOWRECOMP_GLSL_OVERRIDE`: só o campo `cb4[70][2]` (escala vertical da grade de clusters,
+  0 na cópia da CPU, ~0,116 da compute) e só no par vs `12a46e1000` / fs `12a46e1400`. Esse passe rasteriza os
+  volumes das luzes numa grade 128x72 (e 64x36) e o fs faz `atomicOr` do bit da luz em cada célula coberta; sendo
+  16:9 o alvo era escalado (2/3) como uma imagem: 85x48 fragmentos para 128x72 células, as do meio sem luz. Agora um
+  alvo em que um fs com stores desenha volta ao tamanho do guest (`vk_texture_unscale`, log "kept at the guest
+  size"). Metal tem a mesma escala e não foi tocado.
+- **Travadas nas animações (17b48b5)**: no log da run do usuário (18 min) o pacing trocou 19 vezes entre os modos
+  60 e 30 fps do jogo: em 30 parecia haver folga, voltava a 60, ficava 5-100 s a 52-57 fps com a GPU quase cheia e
+  caía de novo. Uma queda menos de 60 s depois de voltar agora dobra a folga exigida (até 3840 frames); 60 s em 60
+  zeram. Lógica testada fora do aparelho (a cena testada ficou estável em 30).
 - Pre-pass e EQUAL: as listras não eram falta de precisão entre os dois vertex shaders (as contas de posição são as
   mesmas a menos de comutação; um bias de 256 unidades D24 escondia as listras, 128 não - era o recorte da fenda).
 
 ### Próximo passo (Android)
-1. Sombras em grade (acima) e a Tri ("feia ou com erro?", no dungeon): debug frame no aparelho, `EOWRECOMP_NO_SHADOW`.
-2. Feedback do usuário (9/11, jogando o build da sessão 5) ainda sem causa: animações com pequenos travamentos,
-   texturas tremendo às vezes, o menu de troca de ecos (ícones dos objetos) com texturas estranhas, e os jardins do
-   castelo à noite (saindo do labirinto dos quartos) todos pretos por um tempo antes das texturas aparecerem
-   (compilação de shaders na primeira entrada? o GLSL mudou e o cache do usuário zerou). Puxar o log da run dele
-   (`eowrecomp.log` / `eowrecomp.prev.log`) antes de rodar qualquer coisa.
-3. GPU (cidade ~21 ms por frame): fs `12a5c12e00` (2727 instruções, ~4,2 ms) e o laço de luzes `12ee66f300`
+1. Feedback do usuário (9/11) ainda aberto: texturas tremendo às vezes (talvez as células sem luz da grade, que
+   mudam com a câmera - confirmar), o menu de ecos (L segurado; no aparelho os ícones e o fundo parecem normais -
+   saber o que ele estranha), os jardins do castelo à noite pretos até os shaders compilarem (primeira entrada
+   depois de o GLSL mudar; na segunda deve vir do cache).
+2. GPU (cidade ~21 ms por frame): fs `12a5c12e00` (2727 instruções, ~4,2 ms) e o laço de luzes `12ee66f300`
    (3,8 ms; ballot + shuffles em warps de 32 dentro dos subgroups de 64/128 do Adreno).
-4. CPU do thread do jogo: a sincronização entre threads do guest (tempo no kernel).
-5. Áudio e save em jogo mais longo.
+3. CPU do thread do jogo: a sincronização entre threads do guest (tempo no kernel).
+4. Áudio e save em jogo mais longo.
 
-**Para o usuário testar (sessão 5, build com 97d8b3e):** as fendas jogando (cidade, dungeon) devem ser buracos
-pretos como nas cutscenes; a Tri e a luz dela (entrada do castelo, dungeon): sombras em grade no piso são o defeito
-conhecido acima. Na primeira entrada em cada área os shaders recompilam (o GLSL mudou): objetos surgindo por alguns
-segundos é esperado; na segunda vez não deve acontecer.
+**Para o usuário testar (build com 17b48b5):** pisos sem a grade escura (dungeon, entrada do castelo), a Tri com a
+luz dela, as fendas como buracos pretos; e se as animações ainda dão trancos (o log mostra as trocas: `[pace]`).
+
+Entrada pelo controle no aparelho: `sendevent /dev/input/event9` (o "Odin Controller"; o shell está no grupo
+`input`): `BTN_TL` 0x136 = L, segurar para o menu de ecos. Os `input keyevent` do adb não chegam como controle.
 
 Percurso até a fuga a partir do save do usuário (sala do trono): stick esquerda ×2, esquerda-baixo, esquerda-cima,
 baixo, cima (começa a cutscene), A ×10, baixo-esquerda até a escada, A ×4, segurar baixo = fuga.
