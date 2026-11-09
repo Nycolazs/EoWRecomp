@@ -183,3 +183,15 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
 - Também: `EOWRECOMP_MAX_FS_GLSL` / `EOWRECOMP_MAX_VS_GLSL` (descartam pipelines grandes, só experimento), `EOWRECOMP_NO_PIPELINE_CACHE`,
   linha `[vk] jobs` com o job mais longo (tipo, fs/vs, tamanho). `EOWRECOMP_VK_OPT=1` não ajudou.
 - Usuário deve testar: duplo clique, sem variáveis; olhar se a cena 3D aparece e se `pipeline compiling` zera, mandar `eowrecomp.log`.
+
+- 2026-11-08 (verificado): com o port do BRX a cena 3D renderiza na RX 580 / Windows (Vulkan), 60 fps, workers ociosos, memória estável.
+- Abertura/título com save existente: o vídeo agora é lido do RomFS (XCI) quando não existe no disco (`fs_rom_read`, `movie.c`);
+  CI ok, ainda NÃO verificado pelo usuário com save.
+- Crash após ~6 min: `FATAL: no function at 7001a65870 (lr=7001a65160)`, x10 = alvo. É um `br` indireto não resolvido pelo lifter
+  (alvo ~0x710 depois do lr: provavelmente dentro da mesma função). Hipótese: tabela de endereços absolutos
+  (`ldr xt,[xb,xi,lsl #3]; br xt`), que `computed_target` não reconhecia e ia direto para `rt_dispatch`. Correção em `tools/gen.py`
+  (esse padrão ganha o fallback de todas as instruções) + `tools/test_gen_br.py`. NÃO verificada: o binário do jogo não está
+  neste ambiente; precisa regenerar no PC do usuário. Se repetir, o alvo/lr novos dizem se a hipótese estava errada.
+- Abertos: corações da HUD e item largado pretos; malha/textura do Link esticada; compute shader com SUST não traduzido (840 dispatches/2 s);
+  efeito de áudio tipo 3; `[tex] type mismatch: want 3 have 1`.
+- Usuário deve testar: novo pacote (regenera o código do jogo, build demorado), jogar >10 min com o save, mandar o log se cair.

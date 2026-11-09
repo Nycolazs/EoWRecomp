@@ -316,6 +316,11 @@ class Module:
                     return True
                 if (w & 0x9F000000) == 0x10000000:  # ADR
                     return True
+                if (w & 0xFFE00C00) == 0xF8600800:  # LDR Xt, [Xn, Xm{, extend}]: table of absolute case addresses
+                    # (a vtable/callback load is `ldr xt, [xn, #imm]`, which stays a plain dispatch). The
+                    # table isn't emulated, but the case targets lie in this function: the all-instruction
+                    # fallback reaches them instead of aborting with "no function at" (crash at 7001a65870).
+                    return True
                 return False
             a -= 4
         return False
