@@ -107,7 +107,7 @@ VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uin
 VkImageView vk_dummy_view(int textype);
 // Writable (storage) 2D view of t for a compute shader's SUST, or VK_NULL_HANDLE when t can't be one (no IMAGE flag, format
 // without storage support, multisampled). Marks t GPU-owned: its contents are the compute shader's, not the CPU copy's.
-VkImageView vk_storage_view(NvnTexture *t);
+VkImageView vk_storage_view(NvnTexture *t, const NvnTextureView *v);
 VkSampler vk_sampler(NvnSamplerDesc *d);
 VkSampler vk_default_sampler(bool linear);
 void vk_image_init_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect);

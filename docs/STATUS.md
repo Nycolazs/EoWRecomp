@@ -234,3 +234,14 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
   Outros 2 computes (`72a4711000`, `72a4715000`, mesma instrução em 0xd28: `3b7707e061172a0f`) seguem sem tradução; ainda não identifiquei a instrução
   (não é SHF/BFI/DFMA; Rd=R15, Ra=R42, pred PT). A mensagem de erro agora traz as 3 instruções antes e depois. Gráficos ainda estranhos: corações com fundo vermelho
   opaco (alfa ignorado), Link/capa/espadas esticados, portal do void.
+
+## 2026-11-09 (noite) — SUST por view, DEBUG_FRAME no Windows
+- `vk_storage_view(tex, view)` agora usa o nível base / camada do view de cada handle (setmask 1/2): o log mostrava 6 handles da
+  mesma textura (saídas de uma cadeia de mips) e todos escreviam no nível 0. **Não verificado em execução** (precisa de log novo:
+  `[cs-img]` + imagem).
+- `vk_save_png` cria o diretório de destino: no Windows não existe `build/` ao lado do exe e DEBUG_FRAME/SHOT_AT falhavam.
+- **Aberto:** instrução `3b7707e061172a0f` (computes 72a4711000/72a4715000), reg-form 0x5d77. Campos: Rd bits 0-7, Ra 8-15,
+  Rc = bits 39-46 (nos dois exemplos Rc == Rd/R31, vindo de um IADD32I logo antes), imm16 em 20-35 (0x611 / 0x610). Hipótese:
+  VMNMX (vmin/vmax do PTX: d = op2(min|max(a,b), c)); sem a tabela de bits de min/max, sinal e seletores NÃO traduzido de propósito
+  (chutar produziria índices de ossos errados). Pista de uso: IMNMX seguinte é max(R15,R16).
+- Próximo teste do usuário: `$env:EOWRECOMP_DEBUG_FRAME="300"; .\eowrecomp.exe`; enviar `build/pass_*.png` + log (corações vermelhos).

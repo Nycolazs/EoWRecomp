@@ -2477,9 +2477,14 @@ static bool image_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *
         if (r.addr && t->bindless_offset + 4 <= r.size) { h = *(const uint32_t *)(uintptr_t)(r.addr + t->bindless_offset); how = "uniform buffer"; }
     }
     NvnTexture *tex = NULL;
+    const NvnTextureView *tv = NULL;
     uint32_t tic = h & 0xFFFFF;
-    if (h && st.tpool && tic < (uint32_t)st.tpool->count) tex = ((NvnTexEntry *)st.tpool->entries)[tic].tex;
-    VkImageView v = tex ? vk_storage_view(tex) : VK_NULL_HANDLE;
+    if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
+        NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
+        tex = e->tex;
+        if (e->has_view) tv = &e->view;
+    }
+    VkImageView v = tex ? vk_storage_view(tex, tv) : VK_NULL_HANDLE;
     static int nlog;
     if (nlog++ < 12)
         LOG("[cs-img] c[%u][%#x] (%s): handle %#llx -> texture %p%s%s\n", t->bindless_cbuf, t->bindless_offset, how, (unsigned long long)h,

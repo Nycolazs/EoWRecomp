@@ -745,10 +745,16 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
     return vk_dummy_view(want_textype);
 }
 
-VkImageView vk_storage_view(NvnTexture *t) {
+// Storage-image view of one SUST handle: the texture view's base mip level / layer (setmask 1 / 2), exactly one of each,
+// no swizzle (a storage image needs the identity one). The log of 2026-11-09 had 6 handles of one texture (mip chain
+// outputs): a view of level 0 for all of them wrote every output over the first level.
+VkImageView vk_storage_view(NvnTexture *t, const NvnTextureView *v) {
     TexBackend *b = vk_tex(t, true);
     if (!b->storage || b->samples != 1) return VK_NULL_HANDLE;
-    return vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, 0, 1, 0, 1, IDENTITY, VK_IMAGE_ASPECT_COLOR_BIT);
+    uint32_t lv = v && (v->setmask & 1) ? v->base_level : 0, ly = v && (v->setmask & 2) ? v->min_layer : 0;
+    if (lv >= b->levels) lv = 0;
+    if (ly >= b->layers) ly = 0;
+    return vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, lv, 1, ly, 1, IDENTITY, VK_IMAGE_ASPECT_COLOR_BIT);
 }
 
 // 1x1 black textures for unbound slots, per type
