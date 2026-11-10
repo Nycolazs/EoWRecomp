@@ -1403,6 +1403,10 @@ static VkFormat vertex_format(uint32_t f) {
     case 0x2F: return VK_FORMAT_R32G32B32A32_UINT;
     case 0x30: return VK_FORMAT_R32G32B32A32_SINT;
     case 0x3D: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    // RGB10A2UI: attr_kind() already declares it uvec4 in the shader, but without this case it fell to the float4
+    // default below (16 bytes read per vertex instead of 4, so the 2nd/3rd components came from the next vertex).
+    // Skinned meshes pack bone indices like this (a 10-bit index in the low bits, the rest zero).
+    case 0x3E: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
     case 0x69: return VK_FORMAT_A2B10G10R10_SNORM_PACK32;
     case 0x3F: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     case 0x40: return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
@@ -3114,6 +3118,14 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             LOG(" | words");
             for (int k = 0; k < 8; k++) LOG(" %08x", ((const uint32_t *)v)[k]);
             LOG("\n");
+        }
+        // Each used vertex attribute: NVN format, stream, offset and whether the shader sees it as float / int / uint.
+        // The skinning bone index (a7) is the one to check: it must be a uint format, read with the right component count.
+        for (int i = 0; i < 32 && i < st.nattrib; i++) {
+            if (!(pr->vi->attr_mask & (1u << i))) continue;
+            uint32_t a = st.attrib[i], fmt = a & 0xFF;
+            LOG("[draw]   attr a%d fmt %#x stream %u off %u kind %d stride %u\n", i, fmt, (a >> 8) & 0x1F, a >> 13, attr_kind(fmt),
+                ((a >> 8) & 0x1F) < (uint32_t)st.nstream ? (unsigned)st.stream[(a >> 8) & 0x1F][0] : 0u);
         }
         // The vertex stage's own cbufs: skinned characters read their bone matrices (3x4 floats, 0x30 bytes each, index * 0x30)
         // from one of them (2026-11-10: Zelda's body is right but one part is stretched into a long beam: a wrong or
