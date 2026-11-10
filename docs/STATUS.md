@@ -245,3 +245,15 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
   VMNMX (vmin/vmax do PTX: d = op2(min|max(a,b), c)); sem a tabela de bits de min/max, sinal e seletores NÃO traduzido de propósito
   (chutar produziria índices de ossos errados). Pista de uso: IMNMX seguinte é max(R15,R16).
 - Próximo teste do usuário: `$env:EOWRECOMP_DEBUG_FRAME="300"; .\eowrecomp.exe`; enviar `build/pass_*.png` + log (corações vermelhos).
+
+## 2026-11-10 — diagnóstico de skinning / corações (sem correção ainda)
+- Testes do usuário (RX 580) com a build 2b7ae2a: 60 fps estáveis, 0 compute pulado (SUST OK). Link/Zelda continuam esticados **só controlando**
+  (algumas cutscenes normais); corpo da Zelda ok, uma peça vira um feixe vertical. `EOWRECOMP_VK_VCACHE=0` e `EOWRECOMP_VK_NO_GMEM=1`
+  não mudam o esticamento (cache de vértices e gmem descartados; NO_GMEM só faz o texto sumir).
+- VS 72a5c2b000 (personagem): índice de osso em a7 (uvec4, 32 bits) * 0x30 → matriz 3x4 lida de `cb6` (UBO do jogo, `ubuf[0][3]`).
+- Corações: FS 7269fa9900 = (tex*cb3[0] + cb3[1]) * cor do vértice; textura 250x100 ASTC 4x4 sRGB (0x87). Ícones ASTC (0x8a/0x8b) saem certos.
+  Decodificador ASTC revisado (modos de cor, pesos): sem erro achado. Blend factor: sem "unknown blend" nos logs.
+- `EOWRECOMP_DEBUG_DATA=1` (com F9) agora também imprime todos os vertex streams (floats + words) e os cbufs do VS (`vcbN`, tamanho do
+  range vs. declarado). **Pedir ao usuário:** `$env:EOWRECOMP_DEBUG_DATA="1"; $env:EOWRECOMP_DEBUG_FRAME="300"; .\eowrecomp.exe`, F9 com a Zelda
+  esticada na tela, e enviar o log (e `build/pass_*.png` finais) — e o mesmo na cena dos corações para `fcb3`.
+- Aberto: VMNMX (`3b77…`, tabelas do envytools recebidas; falta o bit min/max da 1ª operação).

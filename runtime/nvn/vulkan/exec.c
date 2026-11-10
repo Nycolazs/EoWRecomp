@@ -3105,12 +3105,25 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n", st.viewport[0][0], st.viewport[0][1],
         st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
         st.channel_mask);
-    if (getenv("EOWRECOMP_DEBUG_DATA")) {  // vertex streams 0-1 and fragment cbufs: the first floats
-        for (int s = 0; s < 2; s++) {
+    if (getenv("EOWRECOMP_DEBUG_DATA")) {  // vertex streams and vertex / fragment cbufs: the first floats (and words)
+        for (int s = 0; s < 17; s++) {
             if (!st.vbuf[s].addr) continue;
             const float *v = (const float *)(uintptr_t)st.vbuf[s].addr;
             LOG("[draw]   vbuf%d %llx size %llu:", s, (unsigned long long)st.vbuf[s].addr, (unsigned long long)st.vbuf[s].size);
             for (int k = 0; k < 16; k++) LOG(" %.4g", v[k]);
+            LOG(" | words");
+            for (int k = 0; k < 8; k++) LOG(" %08x", ((const uint32_t *)v)[k]);
+            LOG("\n");
+        }
+        // The vertex stage's own cbufs: skinned characters read their bone matrices (3x4 floats, 0x30 bytes each, index * 0x30)
+        // from one of them (2026-11-10: Zelda's body is right but one part is stretched into a long beam: a wrong or
+        // out-of-range matrix?). Size = the range the game bound; the matrices after the first few are the interesting ones.
+        for (int c = 3; c < 18; c++) {
+            if (!((pr->vi->cbuf_mask >> (c)) & 1) || !st.ubuf[0][c - 3].addr) continue;
+            const float *u = (const float *)(uintptr_t)st.ubuf[0][c - 3].addr;
+            uint32_t sz = st.ubuf[0][c - 3].size, nf = sz / 4 < 144 ? sz / 4 : 144;
+            LOG("[draw]   vcb%d %llx size %u (shader declares %u):", c, (unsigned long long)st.ubuf[0][c - 3].addr, sz, (unsigned)pr->vi->cbuf_size[c]);
+            for (uint32_t k = 0; k < nf; k++) LOG(" %.5g", u[k]);
             LOG("\n");
         }
         for (int c = 0; c < 18; c++) {
