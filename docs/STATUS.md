@@ -268,3 +268,14 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
 - 2026-11-10: UBO in-place (10ce7aa) NÃO resolveu o esticamento (usuário testou). Próximo: `EOWRECOMP_DEBUG_DATA` imprime por draw skinned
   "skin: N vertices, palette cbK P matrices, max bone index, indices out of range, unsane matrices". (Nota: as linhas "vbuf16" dos logs
   anteriores eram na verdade ubuf[0][0] — overrun de vbuf[16], corrigido.)
+- 2026-11-10 (tarde): log DEBUG_DATA com a build 0ff6ddb+: a7 = R8UI (stride 32, 1 osso) ou RGBA8UI (stride 40, 4 ossos, pesos em a8 RGBA16 UNORM), a0 = F32x3,
+  nenhum atributo usa 0x3E; 36 verificações `skin:` limpas (índices dentro da paleta de 58 matrizes, matrizes sãs). Ainda esticado (usuário testou).
+  Índices, paleta e formatos de atributo estão descartados como causa. Novo em `EOWRECOMP_DEBUG_DATA` (**não verificado em jogo**):
+  - `skin-cpu:` por draw skinned — faz o skinning na CPU com os mesmos dados que a GPU lê e imprime bbox bind-pose vs. skinned, distância média,
+    nº de vértices a mais de 8x a média e o pior vértice (ossos e pesos). Se já aparece um feixe aqui, o problema está nos dados (pose/pesos);
+    se a malha sai compacta aqui mas esticada na tela, o problema está no lado da GPU (VS traduzido, fetch do atributo).
+  - `blend rtN on:` por draw — fatores/operações de blend crus + máscara de escrita + formato do RT (corações com fundo vermelho opaco).
+  - `[astc] nvn fmt ... alpha min/max ...` para cada textura ASTC decodificada na CPU, e PNGs `build/astc_87_WxH_N.png` + `_alpha.png` das primeiras
+    texturas 0x87 (4x4 sRGB, a dos corações é 250x100): mostra se o alfa já está errado no decodificador.
+  Pedir ao usuário: `$env:EOWRECOMP_DEBUG_DATA="1"; $env:EOWRECOMP_DEBUG_FRAME="300"; .\eowrecomp.exe`, F9 com Link/Zelda esticados na tela (e
+  de novo na cena dos corações), e enviar o log + os `build/astc_87_*.png`.

@@ -4,6 +4,7 @@
 #include <float.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -552,6 +553,39 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, blocks, l.w, l.h, l.wb * 16);
                 VkSpan s = vk_transient((uint64_t)l.w * l.h * 4, 16);
                 astc_decode_ldr(blocks, l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb, s.ptr);
+                if (lv == 0 && layer == 0 && getenv("EOWRECOMP_DEBUG_DATA")) {
+                    // 2026-11-10: the HUD hearts (ASTC 4x4 sRGB, 0x87) show an opaque red background. Is the alpha already wrong in the
+                    // decoded texture (decoder), or right here and lost later (blend / fragment shader)? Alpha stats for every
+                    // CPU-decoded texture, plus a PNG of the first few 4x4 sRGB ones (RGB as decoded; alpha in the _alpha.png copy).
+                    static int nlog, ndump;
+                    const uint8_t *px = (const uint8_t *)s.ptr;
+                    uint64_t npx = (uint64_t)l.w * l.h, translucent = 0, clear = 0;
+                    uint8_t amin = 255, amax = 0;
+                    for (uint64_t i = 0; i < npx; i++) {
+                        uint8_t al = px[i * 4 + 3];
+                        if (al < amin) amin = al;
+                        if (al > amax) amax = al;
+                        if (al < 255) translucent++;
+                        if (al == 0) clear++;
+                    }
+                    if (nlog++ < 300)
+                        LOG("[astc] nvn fmt %#x %ux%u block %ux%u srgb %d: alpha min %u max %u, %llu of %llu texels < 255 (%llu fully clear)\n", t->format,
+                            l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb ? 1 : 0, amin, amax, (unsigned long long)translucent,
+                            (unsigned long long)npx, (unsigned long long)clear);
+                    if (t->format == 0x87 && l.w <= 1024 && l.h <= 1024 && ndump < 12) {
+                        char path[128];
+                        snprintf(path, sizeof path, "build/astc_%x_%ux%u_%d.png", t->format, l.w, l.h, ndump);
+                        vk_save_png(path, px, l.w, l.h);
+                        uint8_t *am = malloc(npx * 4);
+                        if (am) {  // alpha as grey, fully opaque, so it can be seen on its own
+                            for (uint64_t i = 0; i < npx; i++) am[i * 4] = am[i * 4 + 1] = am[i * 4 + 2] = px[i * 4 + 3], am[i * 4 + 3] = 255;
+                            snprintf(path, sizeof path, "build/astc_%x_%ux%u_%d_alpha.png", t->format, l.w, l.h, ndump);
+                            vk_save_png(path, am, l.w, l.h);
+                            free(am);
+                        }
+                        ndump++;
+                    }
+                }
                 free(blocks);
                 VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.w, .bufferImageHeight = l.h,
                                         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},

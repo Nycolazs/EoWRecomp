@@ -3174,6 +3174,15 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             LOG("[draw]   attr a%d fmt %#x stream %u off %u kind %d stride %u\n", i, fmt, (a >> 8) & 0x1F, a >> 13, attr_kind(fmt),
                 ((a >> 8) & 0x1F) < (uint32_t)st.nstream ? (unsigned)st.stream[(a >> 8) & 0x1F][0] : 0u);
         }
+        // Blend state of every enabled colour target (raw NVN bytes, the ones blend_factor()/blend_op() translate):
+        // b[1] src colour, b[2] dst colour, b[3] src alpha, b[4] dst alpha, b[5] colour op, b[6] alpha op.
+        // 2026-11-10: the HUD hearts come out with an opaque red background (alpha ignored): is the blend what the game asked for?
+        for (int i = 0; i < st.rt.ncolor && i < 8; i++) {
+            if (!((st.color_state[0] >> i) & 1)) continue;
+            const uint8_t *bb = st.blend[i];
+            LOG("[draw]   blend rt%d on: colour src %u dst %u op %u | alpha src %u dst %u op %u | write mask %x | rt format %#x\n", i, bb[1], bb[2], bb[5],
+                bb[3], bb[4], bb[6], (st.channel_mask >> (i * 4)) & 0xF, st.rt.color[i] ? st.rt.color[i]->format : 0);
+        }
         // Skinned draws (a7 = bone indices in stream 0): do the vertices' indices fit the bone palette that is bound, and is every
         // palette matrix sane? (2026-11-10: parts of Link / Zelda stretch into beams; the first matrices looked fine.)
         if (pr->vi->attr_mask & 0x80 && st.nattrib > 7 && st.vbuf[0].addr) {
@@ -3200,6 +3209,66 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
                 }
                 LOG("[draw]   skin: %u vertices, palette cb%d %u matrices, max bone index %u, %u indices out of range (first at vertex %d), "
                     "%u unsane matrices (first %d)\n", nv, pk, pal, maxi, over, (int)firstover, bad, (int)firstbad);
+                // The same skinning done on the CPU with the data the GPU reads: p' = sum(w_c * M[idx_c] * (pos, 1)), M = 3x4 row-major
+                // (translation in column 3). 2026-11-10: indices, palette and attribute formats all checked out, yet parts still stretch.
+                // If a beam already shows up here (huge bbox, a vertex far from the rest) the bad pose is in the data (palette / weights);
+                // if the mesh is compact here but stretched on screen, the bug is on the GPU side (translated VS, attribute fetch).
+                uint32_t a0 = st.attrib[0], o0 = a0 >> 13, a8 = st.nattrib > 8 ? st.attrib[8] : 0, f8 = a8 & 0xFF, o8 = a8 >> 13;
+                uint32_t wn = (pr->vi->attr_mask & 0x100) && ((a8 >> 8) & 0x1F) == 0 ? (f8 == 0x2A || f8 == 0x25 ? 4 : f8 == 0x0D ? 2 : 0) : 0;
+                float *sp = (pr->vi->attr_mask & 1) && (a0 & 0xFF) == 0x22 && ((a0 >> 8) & 0x1F) == 0 && nv ? malloc((size_t)nv * 3 * sizeof(float)) : NULL;
+                if (sp) {
+                    double cen[3] = {0, 0, 0};
+                    float lo[3] = {FLT_MAX, FLT_MAX, FLT_MAX}, hi[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX}, rlo[3] = {FLT_MAX, FLT_MAX, FLT_MAX},
+                          rhi[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+                    uint32_t used = 0;
+                    for (uint32_t v = 0; v < nv; v++) {
+                        const uint8_t *vp = vb + (uint64_t)v * stride;
+                        const float *pos = (const float *)(vp + o0);
+                        float w[4] = {1, 0, 0, 0}, o[3] = {0, 0, 0};
+                        for (uint32_t c = 0; c < ncomp; c++)
+                            w[c] = wn > c ? (f8 == 0x2A ? ((const uint16_t *)(vp + o8))[c] / 65535.0f : vp[o8 + c] / 255.0f)
+                                          : (ncomp > 1 && !wn ? 1.0f / ncomp : (c == 0 ? 1.0f : 0.0f));
+                        for (uint32_t c = 0; c < ncomp; c++) {
+                            uint32_t ix = vp[o7 + c];
+                            if (ix >= pal) continue;
+                            const float *mm = m + ix * 12;
+                            for (int r = 0; r < 3; r++) o[r] += w[c] * (mm[r * 4] * pos[0] + mm[r * 4 + 1] * pos[1] + mm[r * 4 + 2] * pos[2] + mm[r * 4 + 3]);
+                        }
+                        for (int r = 0; r < 3; r++) {
+                            sp[v * 3 + r] = o[r];
+                            if (o[r] < lo[r]) lo[r] = o[r];
+                            if (o[r] > hi[r]) hi[r] = o[r];
+                            if (pos[r] < rlo[r]) rlo[r] = pos[r];
+                            if (pos[r] > rhi[r]) rhi[r] = pos[r];
+                            cen[r] += o[r];
+                        }
+                        used++;
+                    }
+                    for (int r = 0; r < 3; r++) cen[r] /= used;
+                    double sumd = 0, worstd = 0;
+                    uint32_t worst = 0;
+                    for (uint32_t v = 0; v < nv; v++) {
+                        double dx = sp[v * 3] - cen[0], dy = sp[v * 3 + 1] - cen[1], dz = sp[v * 3 + 2] - cen[2], d = sqrt(dx * dx + dy * dy + dz * dz);
+                        sumd += d;
+                        if (d > worstd) { worstd = d; worst = v; }
+                    }
+                    double meand = sumd / nv;
+                    uint32_t nfar = 0;
+                    for (uint32_t v = 0; v < nv; v++) {
+                        double dx = sp[v * 3] - cen[0], dy = sp[v * 3 + 1] - cen[1], dz = sp[v * 3 + 2] - cen[2];
+                        if (sqrt(dx * dx + dy * dy + dz * dz) > 8 * meand) nfar++;
+                    }
+                    const uint8_t *wp = vb + (uint64_t)worst * stride;
+                    LOG("[draw]   skin-cpu: %u verts, bind-pose size %.1f %.1f %.1f -> skinned size %.1f %.1f %.1f centre %.1f %.1f %.1f, mean dist %.2f, "
+                        "%u verts farther than 8x mean; worst v%u dist %.1f bones %u %u %u %u weights %.2f %.2f %.2f %.2f\n",
+                        nv, rhi[0] - rlo[0], rhi[1] - rlo[1], rhi[2] - rlo[2], hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2], cen[0], cen[1], cen[2],
+                        meand, nfar, worst, worstd, wp[o7], ncomp > 1 ? wp[o7 + 1] : 0, ncomp > 2 ? wp[o7 + 2] : 0, ncomp > 3 ? wp[o7 + 3] : 0,
+                        wn > 0 ? (f8 == 0x2A ? ((const uint16_t *)(wp + o8))[0] / 65535.0f : wp[o8] / 255.0f) : 1.0f,
+                        wn > 1 ? (f8 == 0x2A ? ((const uint16_t *)(wp + o8))[1] / 65535.0f : wp[o8 + 1] / 255.0f) : 0.0f,
+                        wn > 2 ? (f8 == 0x2A ? ((const uint16_t *)(wp + o8))[2] / 65535.0f : wp[o8 + 2] / 255.0f) : 0.0f,
+                        wn > 3 ? (f8 == 0x2A ? ((const uint16_t *)(wp + o8))[3] / 65535.0f : wp[o8 + 3] / 255.0f) : 0.0f);
+                    free(sp);
+                }
             }
         }
         // The vertex stage's own cbufs: skinned characters read their bone matrices (3x4 floats, 0x30 bytes each, index * 0x30)
