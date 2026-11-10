@@ -14,7 +14,7 @@
 <p align="center">
   <img alt="status" src="https://img.shields.io/badge/status-active%20development-orange">
   <img alt="platform" src="https://img.shields.io/badge/target-Windows%20x64-blue">
-  <img alt="graphics" src="https://img.shields.io/badge/graphics-Vulkan- red">
+  <img alt="graphics" src="https://img.shields.io/badge/graphics-Vulkan-red">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
@@ -23,7 +23,7 @@
 EoWRecomp translates the game's ARM64 machine code into C ahead of time and recompiles it for the host PC. Its runtime replaces the Switch operating-system services used by the game and implements the NVN graphics API on top of Vulkan. It is based on [LAS Recomp](https://github.com/peiikai/LASRecomp).
 
 > [!IMPORTANT]
-> **Windows is the active testing and optimization target.** The results below come from testing on Windows 10 with a Xeon E5-2650 v4, Radeon RX 580 8 GB and Vulkan. The project is still in development: some character rendering and visual effects remain incorrect.
+> **Windows is the active testing and optimization target.** The results below come from testing on Windows 10 with a Xeon E5-2650 v4, Radeon RX 580 8 GB, 16 GB RAM and Vulkan. The project is still in development: some character rendering and visual effects remain incorrect.
 
 > [!WARNING]
 > **No game files are included.** You must provide your own legally obtained copy of *The Legend of Zelda: Echoes of Wisdom* v1.0.0 (title ID `01008CF01BAAC000`) and your own `prod.keys`. The repository does not provide game files, keys, or instructions for obtaining them.
@@ -43,7 +43,7 @@ The Windows build has moved beyond simply opening the application. The game code
 | Runtime | All 4 modules load; SDK boot succeeds |
 | Game data | RomFS read directly from XCI — 10,963 files |
 | Graphics | Vulkan swapchain at 1280×720 |
-| Performance | **60 FPS stable** in the latest user test |
+| Performance | **52 FPS** in the user capture, in **Hyrule Castle Town** (Windows 10, RX 580) |
 | Compute shaders | **SUST storage-image path working; 0 compute dispatches skipped** in the latest test |
 | Audio and input | Audren initializes; XInput detected |
 
@@ -105,7 +105,7 @@ See **[docs/STATUS.md](docs/STATUS.md)** for the detailed technical log:
 
 ## Credits
 
-- **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai and contributors — the foundation for the recompiler, runtime, NVN implementation, Maxwell shader translator and Vulkan renderer.
+- **[EoWRecomp original project](https://github.com/Nycolazs/EoWRecomp)** by **Nycolazs** — original project and foundation this fork builds upon.\n- **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai and contributors — the foundation for the recompiler, runtime, NVN implementation, Maxwell shader translator and Vulkan renderer.
 - [SDL 3](https://libsdl.org), [FFmpeg](https://ffmpeg.org), [Dear ImGui](https://github.com/ocornut/imgui), [Vulkan](https://www.vulkan.org), [volk](https://github.com/zeux/volk), [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator), [shaderc](https://github.com/google/shaderc), [SMAA](https://github.com/iryoku/smaa) and [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR).
 - Documentation and research references: [Switchbrew](https://switchbrew.org), [envytools](https://github.com/envytools/envytools), and the instruction decoders of Ryujinx and yuzu.
 
