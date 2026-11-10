@@ -1966,6 +1966,8 @@ static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
     return (VkDescriptorBufferInfo){s.buf, s.off, size > max ? max : size};
 }
 
+static bool guest_live(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off);
+
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
@@ -2008,6 +2010,21 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
     // and drops the shared copies).
+    // ...except a dynamically indexed one (a skinned character's bone palette): in the game the cloth / hood / sword bones
+    // are computed by compute dispatches of the same submission, and a copy taken now misses their results (2026-11-10: Link's
+    // hood stretched into a beam while controlled, fine in cutscenes where the CPU writes the palette). Read in place, like
+    // vertex data (guest_direct); the barrier before each pass makes the compute writes visible. EOWRECOMP_VK_LIVE_UBO=0: copy.
+    static int live = -1;
+    if (live < 0) { const char *e = getenv("EOWRECOMP_VK_LIVE_UBO"); live = !e || atoi(e) != 0; }
+    if (live && (si->cbuf_dynamic & (1u << k)) && stage != 5) {
+        VkBuffer lb;
+        VkDeviceSize lo;
+        uint64_t al = g_vk.props.limits.minUniformBufferOffsetAlignment;
+        if (guest_live(r.addr, size, &lb, &lo) && (!al || lo % al == 0)) {
+            uint64_t max = g_vk.props.limits.maxUniformBufferRange;
+            return (VkDescriptorBufferInfo){lb, lo, size > max ? max : size};
+        }
+    }
     return ubo_span(guest_copy(r.addr, size), size);
 }
 
@@ -2037,7 +2054,8 @@ static bool gmem_import(uint64_t size) {
                                            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = size,
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT};
+                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};  // (uniform: live bone palettes, cbuf_info)
     VkBuffer buf;
     if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) { vkFreeMemory(g_vk.dev, mem, NULL); return false; }
     vkBindBufferMemory(g_vk.dev, buf, mem, 0);
@@ -2383,6 +2401,16 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
     if (vcache_lookup(addr, size, buf, off)) return true;
+    *buf = gmem_buf;
+    *off = addr - HEAP_BASE;
+    return true;
+}
+
+// A range of the guest heap in place (no copy, no vertex cache): for data the GPU itself writes during the submission.
+static bool guest_live(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+    if (addr < HEAP_BASE) return false;
+    if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
+    if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
     *buf = gmem_buf;
     *off = addr - HEAP_BASE;
     return true;

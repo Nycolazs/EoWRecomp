@@ -260,3 +260,8 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
 - 2026-11-10 (log DEBUG_DATA, frame 2445): paletas de ossos (vcb6) OK — 1 osso = 48 B, 2 = 96 B, Link/Zelda 58 = 2784 B, matrizes com rotação/translação
   sãs; hipótese "matriz fora da faixa/lixo" não sustentada. Personagens compartilham o mesmo FS (hash 9f4e87dd94e644eb): VS 72a5c2b000,
   72ee694000, 72a6c0c000, 72a64cc000. Novo `EOWRECOMP_SKIP_VSHASH=h1,h2` (+ "vs hash" no log de draw) para achar qual VS desenha o feixe.
+- 2026-11-10 (noite): formatos de atributo de esqueleto conferidos no log (a7 = R8UI/RG8UI/RGBA8UI, a8 = RG8/RGBA8/RGBA16 UNORM, a0 F32x3/F16x4,
+  a6 snorm10): todos mapeados certo em `vertex_format`; 0x3E já tratado. Hipótese testável: paleta de ossos (cb6, dinâmico) copiada por
+  `guest_copy` antes de o compute do mesmo submit escrever os ossos secundários (capuz/capa/espada). `cbuf_info` agora lê UBOs dinâmicos
+  (não-compute) direto do heap (`guest_live`, gmem com usage UNIFORM). `EOWRECOMP_VK_LIVE_UBO=0` volta à cópia. **Não verificado em jogo**:
+  se piorar (tremor/flicker de personagens), testar com LIVE_UBO=0 e reportar.
