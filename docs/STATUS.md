@@ -228,3 +228,9 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
   `shaderStorageImageWriteWithoutFormat/ExtendedFormats`; barreira total depois do dispatch. Teste: `tools/test_sust.sh`.
   NÃO verificado em execução (sem Vulkan/GPU aqui; só tradutor testado). O log do usuário mostra `[cs-img] ...` com handle/textura/flags: se disser
   "NOT writable" ou "(none)", o palpite do offset ou o valor da flag IMAGE está errado. Hipótese a confirmar: era isso que esticava Link/capa/portal.
+
+- 2026-11-09 (log do usuário com o pacote da SUST): o crash dos `br` parou (cutscenes, água, teleporte). O compute `72a4723000` (SUST) traduz e roda, mas
+  `[cs-img] c[2][0x120]: handle 0 -> none`: o handle está no banco 2 (não 0) → `image_info` agora trata bancos 0 e 2 como a tabela do driver (imagens em 0x120+8*i = st.img).
+  Outros 2 computes (`72a4711000`, `72a4715000`, mesma instrução em 0xd28: `3b7707e061172a0f`) seguem sem tradução; ainda não identifiquei a instrução
+  (não é SHF/BFI/DFMA; Rd=R15, Ra=R42, pred PT). A mensagem de erro agora traz as 3 instruções antes e depois. Gráficos ainda estranhos: corações com fundo vermelho
+  opaco (alfa ignorado), Link/capa/espadas esticados, portal do void.

@@ -1814,7 +1814,14 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         else if (c->stage == STAGE_COMPUTE) sp(&c->body, "    barrier();\n");
         else sp(&c->body, "    /* bar */\n");  // GLSL barrier() is compute / tessellation only
     } else {
-        fail(c, "unknown instruction %016llx at %#x", (unsigned long long)w, pc);
+        // (the neighbours too: the opcode alone doesn't say what the instruction does; the log of 2026-11-09 had
+        // 3b7707e061172a0f at 0xd28 in two compute shaders and nothing around it)
+        char nb[160] = "";
+        for (int k = -3; k <= 3 && c->code; k++) {
+            long j = (long)(pc / 8) + k;
+            if (k && j >= 0 && (size_t)j < c->ninsts) sprintf(nb + strlen(nb), " %+d:%016llx", k, (unsigned long long)((const uint64_t *)c->code)[j]);
+        }
+        fail(c, "unknown instruction %016llx at %#x [neighbours%s]", (unsigned long long)w, pc, nb);
     }
     (void)op13;
     if (guarded) sp(&c->body, "  }\n");

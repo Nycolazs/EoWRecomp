@@ -2458,7 +2458,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
 }
 
 // A compute shader's SUST image ("c[bank][offset]" holds its 32-bit handle, tic | sampler << 20: translate.c emit_sust).
-// Bank 0 is the driver's own constants: texture handles from 0x20 (8 bytes each, st.tex), the image handles after them
+// Banks 0 / 2 are the driver's own constants: texture handles from 0x20 (8 bytes each, st.tex), the image handles after them
 // (guess: 0x120 + 8 * index = st.img[stage][index], NVN's nvnCommandBufferBindImage); any other bank is the game's
 // uniform buffer (bank 3 + n = st.ubuf[stage][n]) and the handle is read from guest memory. The first resolutions are
 // logged: the guess and the texture's IMAGE flag are what this depends on.
@@ -2468,7 +2468,7 @@ static bool image_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *
     ShaderTexture *t = &si->tex[i];
     uint64_t h = 0;
     const char *how = "?";
-    if (t->bindless_cbuf == 0) {
+    if (t->bindless_cbuf == 0 || t->bindless_cbuf == 2) {  // (the log of 2026-11-09: SUST's handle is c[2][0x120])
         if (t->bindless_offset >= 0x20 && t->bindless_offset < 0x120) { h = st.tex[stage][(t->bindless_offset - 0x20) / 8]; how = "texture slot"; }
         else if (t->bindless_offset >= 0x120 && t->bindless_offset < 0x160) { h = st.img[stage][(t->bindless_offset - 0x120) / 8]; how = "image slot"; }
     } else {
