@@ -569,6 +569,12 @@ void vk_frame_end(const char *shot_path) {
 }
 
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
+    // O diretório relativo "build/" não existe ao lado do exe no Windows (só no checkout de dev):
+    // sem criá-lo, DEBUG_FRAME/SHOT_AT falhavam com "caminho não encontrado".
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s", path);
+    for (char *c = dir; *c; c++)
+        if ((*c == '/' || *c == '\\') && c != dir) { char ch = *c; *c = 0; SDL_CreateDirectory(dir); *c = ch; }
     SDL_Surface *s = SDL_CreateSurfaceFrom((int)w, (int)h, SDL_PIXELFORMAT_ABGR8888, (void *)rgba, (int)w * 4);
     if (!s || !SDL_SavePNG(s, path)) LOG("[vk] saving %s failed: %s\n", path, SDL_GetError());
     else LOG("[vk] saved %s (%ux%u)\n", path, w, h);
