@@ -1643,7 +1643,7 @@ static void build_pipeline(void *arg) {
 static NvnTexture *feedback_tex[4];
 static VkImageView feedback_view[4];
 static int nfeedback;
-static uint64_t g_cur_fs_hash;
+static uint64_t g_cur_fs_hash, g_cur_vs_hash;
 static NvnTexture *snap_tex[8];
 static bool snap_ok[8];
 static const char *snap_why[8];
@@ -2753,6 +2753,24 @@ static void draw_(CmdRec *r, bool indexed) {
             }
         }
         for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { SKIP(SKIP_LIST); return; }
+        // Same for the vertex shader (EOWRECOMP_SKIP_VSHASH): the main characters share one fragment shader, so only the vertex
+        // shader tells the skinned meshes apart when hunting the stretched part (2026-11-10).
+        static uint64_t last_vs, last_vhash, vskip[16];
+        static int nvskip = -1;
+        uint64_t vs = st.program->stages[0].code_addr;
+        if (vs != last_vs) {
+            last_vs = vs;
+            last_vhash = vs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(vs + 0x30), 0x200) : 0;
+        }
+        if (nvskip < 0) {
+            nvskip = 0;
+            for (const char *p = getenv("EOWRECOMP_SKIP_VSHASH"); p && *p && nvskip < 16;) {
+                vskip[nvskip++] = strtoull(p, (char **)&p, 16);
+                while (*p == ',') p++;
+            }
+        }
+        for (int i = 0; i < nvskip; i++) if (last_vhash == vskip[i]) { SKIP(SKIP_LIST); return; }
+        g_cur_vs_hash = last_vhash;
         if (g_debug_frame && getenv("EOWRECOMP_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
     }
@@ -3106,7 +3124,8 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         pr->vi->cbuf_mask, pr->fi->cbuf_mask, st.rt.ncolor);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format);
     if (st.rt.depth) LOG(" d%#x %p", st.rt.depth->format, (void *)st.rt.depth);
-    LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n", st.viewport[0][0], st.viewport[0][1],
+    LOG(" | vs hash %016llx | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n",
+        (unsigned long long)g_cur_vs_hash, st.viewport[0][0], st.viewport[0][1],
         st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
         st.channel_mask);
     if (getenv("EOWRECOMP_DEBUG_DATA")) {  // vertex streams and vertex / fragment cbufs: the first floats (and words)

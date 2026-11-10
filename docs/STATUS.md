@@ -257,3 +257,6 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
   range vs. declarado). **Pedir ao usuário:** `$env:EOWRECOMP_DEBUG_DATA="1"; $env:EOWRECOMP_DEBUG_FRAME="300"; .\eowrecomp.exe`, F9 com a Zelda
   esticada na tela, e enviar o log (e `build/pass_*.png` finais) — e o mesmo na cena dos corações para `fcb3`.
 - Aberto: VMNMX (`3b77…`, tabelas do envytools recebidas; falta o bit min/max da 1ª operação).
+- 2026-11-10 (log DEBUG_DATA, frame 2445): paletas de ossos (vcb6) OK — 1 osso = 48 B, 2 = 96 B, Link/Zelda 58 = 2784 B, matrizes com rotação/translação
+  sãs; hipótese "matriz fora da faixa/lixo" não sustentada. Personagens compartilham o mesmo FS (hash 9f4e87dd94e644eb): VS 72a5c2b000,
+  72ee694000, 72a6c0c000, 72a64cc000. Novo `EOWRECOMP_SKIP_VSHASH=h1,h2` (+ "vs hash" no log de draw) para achar qual VS desenha o feixe.
