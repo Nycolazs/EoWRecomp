@@ -265,3 +265,6 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
   `guest_copy` antes de o compute do mesmo submit escrever os ossos secundários (capuz/capa/espada). `cbuf_info` agora lê UBOs dinâmicos
   (não-compute) direto do heap (`guest_live`, gmem com usage UNIFORM). `EOWRECOMP_VK_LIVE_UBO=0` volta à cópia. **Não verificado em jogo**:
   se piorar (tremor/flicker de personagens), testar com LIVE_UBO=0 e reportar.
+- 2026-11-10: UBO in-place (10ce7aa) NÃO resolveu o esticamento (usuário testou). Próximo: `EOWRECOMP_DEBUG_DATA` imprime por draw skinned
+  "skin: N vertices, palette cbK P matrices, max bone index, indices out of range, unsane matrices". (Nota: as linhas "vbuf16" dos logs
+  anteriores eram na verdade ubuf[0][0] — overrun de vbuf[16], corrigido.)

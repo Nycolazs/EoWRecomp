@@ -3157,7 +3157,7 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
         st.channel_mask);
     if (getenv("EOWRECOMP_DEBUG_DATA")) {  // vertex streams and vertex / fragment cbufs: the first floats (and words)
-        for (int s = 0; s < 17; s++) {
+        for (int s = 0; s < 16; s++) {  // (vbuf has 16 entries: the "vbuf16" lines of earlier logs were really ubuf[0][0])
             if (!st.vbuf[s].addr) continue;
             const float *v = (const float *)(uintptr_t)st.vbuf[s].addr;
             LOG("[draw]   vbuf%d %llx size %llu:", s, (unsigned long long)st.vbuf[s].addr, (unsigned long long)st.vbuf[s].size);
@@ -3173,6 +3173,34 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             uint32_t a = st.attrib[i], fmt = a & 0xFF;
             LOG("[draw]   attr a%d fmt %#x stream %u off %u kind %d stride %u\n", i, fmt, (a >> 8) & 0x1F, a >> 13, attr_kind(fmt),
                 ((a >> 8) & 0x1F) < (uint32_t)st.nstream ? (unsigned)st.stream[(a >> 8) & 0x1F][0] : 0u);
+        }
+        // Skinned draws (a7 = bone indices in stream 0): do the vertices' indices fit the bone palette that is bound, and is every
+        // palette matrix sane? (2026-11-10: parts of Link / Zelda stretch into beams; the first matrices looked fine.)
+        if (pr->vi->attr_mask & 0x80 && st.nattrib > 7 && st.vbuf[0].addr) {
+            uint32_t a7 = st.attrib[7], f7 = a7 & 0xFF, o7 = a7 >> 13, s7 = (a7 >> 8) & 0x1F;
+            uint32_t ncomp = f7 == 0x03 ? 1 : f7 == 0x0F ? 2 : f7 == 0x27 ? 4 : 0;
+            uint32_t stride = st.nstream > 0 ? (uint32_t)st.stream[0][0] : 0;
+            int pk = -1;
+            for (int c = 3; c < 18; c++) if (((pr->vi->cbuf_dynamic >> c) & 1) && st.ubuf[0][c - 3].addr) { pk = c; break; }
+            if (ncomp && s7 == 0 && stride && pk >= 0) {
+                const uint8_t *vb = (const uint8_t *)(uintptr_t)st.vbuf[0].addr;
+                uint32_t nv = (uint32_t)(st.vbuf[0].size / stride), pal = st.ubuf[0][pk - 3].size / 48, maxi = 0, over = 0, firstover = ~0u;
+                for (uint32_t v = 0; v < nv; v++)
+                    for (uint32_t c = 0; c < ncomp; c++) {
+                        uint32_t ix = vb[(uint64_t)v * stride + o7 + c];
+                        if (ix > maxi) maxi = ix;
+                        if (ix >= pal) { over++; if (firstover == ~0u) firstover = v; }
+                    }
+                const float *m = (const float *)(uintptr_t)st.ubuf[0][pk - 3].addr;
+                uint32_t bad = 0, firstbad = ~0u;
+                for (uint32_t b = 0; b < pal; b++) {
+                    int ok = 1;
+                    for (int k = 0; k < 12; k++) { float x = m[b * 12 + k]; if (!(x == x) || x > 1e4f || x < -1e4f) ok = 0; }
+                    if (!ok) { bad++; if (firstbad == ~0u) firstbad = b; }
+                }
+                LOG("[draw]   skin: %u vertices, palette cb%d %u matrices, max bone index %u, %u indices out of range (first at vertex %d), "
+                    "%u unsane matrices (first %d)\n", nv, pk, pal, maxi, over, (int)firstover, bad, (int)firstbad);
+            }
         }
         // The vertex stage's own cbufs: skinned characters read their bone matrices (3x4 floats, 0x30 bytes each, index * 0x30)
         // from one of them (2026-11-10: Zelda's body is right but one part is stretched into a long beam: a wrong or
