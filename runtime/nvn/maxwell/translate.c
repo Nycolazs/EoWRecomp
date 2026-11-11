@@ -1433,6 +1433,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             // it in a loop crawls (the little chain chomps in Madam MeowMeow's house: ~4 ms a dispatch, ~0.07 ms without
             // the heap stores). The dispatch's storage buffers are copied to a device-local buffer (gfast_, address
             // table gmap: exec.c gfast_prepare) and back after it: loads and stores inside them use that copy.
+            // Read-only graphics snapshots also serve GPUs without host-memory import.
             // Anything outside the table goes to the heap as before.
             c->info->uses_gmem_map = true;
             static const char *const gl_small[] = {
