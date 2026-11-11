@@ -2813,31 +2813,43 @@ static void draw_(CmdRec *r, bool indexed) {
         if (g_debug_frame && getenv("EOWRECOMP_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
     }
-    {   // F10 (2026-11-10, stretched Link/enemy parts): step through the skinned meshes (draws with a bone-index attribute a7 and a
-        // dynamically indexed cbuf), skipping one at a time, to see which mesh the beam belongs to. Meshes are told apart by their
-        // index count; the list is sorted so the order is stable. Press F10: none -> 1st -> 2nd -> ... -> none.
-        extern volatile int g_skin_skip_request;
-        static uint32_t seen[32];
-        static int nseen, step, handled;
-        if (pr->vi->cbuf_dynamic && (pr->vi->attr_mask & 0x80) && nseen < 32) {
-            uint32_t cnt = (uint32_t)r->x[2];
+    {   // Bisect for the draw that makes the stretched beam (2026-11-11). The F10 mesh-by-mesh stepper filled up with enemies and
+        // scenery before Link's meshes showed up and never found it, so: every distinct draw (vertex shader + index count) is a
+        // candidate, and the player halves the set. F10 = skip the first half of the candidates; F7 = "the beam is gone" (it is in
+        // that half); F8 = "the beam is still there" (it is in the other half). Down to one candidate, which stays skipped.
+        extern volatile int g_skin_skip_request, g_bisect_gone, g_bisect_still;
+        static uint64_t keys[2048];
+        static int nkeys, frozen, lo, hi, slo, shi, h_f10, h_gone, h_still;
+        uint64_t key = (st.program->stages[0].code_addr << 20) ^ (uint64_t)r->x[2];
+        if (!frozen && nkeys < 2048) {
             int j = 0;
-            while (j < nseen && seen[j] != cnt) j++;
-            if (j == nseen) {  // insert sorted
-                int q = nseen++;
-                while (q > 0 && seen[q - 1] > cnt) { seen[q] = seen[q - 1]; q--; }
-                seen[q] = cnt;
+            while (j < nkeys && keys[j] != key) j++;
+            if (j == nkeys) keys[nkeys++] = key;
+        }
+        if (g_skin_skip_request != h_f10) {  // start (freeze the candidate list) / re-test the current half
+            h_f10 = g_skin_skip_request;
+            if (!frozen) { frozen = 1; lo = 0; hi = nkeys; LOG("[bisect] %d candidate draws\n", nkeys); }
+            slo = lo; shi = lo + (hi - lo + 1) / 2;
+            LOG("[bisect] skipping candidates %d..%d of %d..%d\n", slo, shi - 1, lo, hi - 1);
+        }
+        if (frozen && (g_bisect_gone != h_gone || g_bisect_still != h_still)) {
+            if (g_bisect_gone != h_gone) hi = shi;  // beam vanished: it is among the skipped
+            else lo = shi;                          // beam stayed: it is among the others
+            h_gone = g_bisect_gone; h_still = g_bisect_still;
+            if (hi - lo <= 1) {
+                slo = lo; shi = hi;
+                LOG("[bisect] FOUND candidate %d: vs %llx, index count %llu (all other draws drawn)\n", lo,
+                    (unsigned long long)(keys[lo] >> 20), (unsigned long long)(keys[lo] & 0xFFFFF));
+            } else {
+                slo = lo; shi = lo + (hi - lo + 1) / 2;
+                LOG("[bisect] now %d..%d: skipping %d..%d", lo, hi - 1, slo, shi - 1);
+                if (hi - lo <= 12) for (int q = lo; q < hi; q++) LOG(" [%d vs %llx n %llu]", q, (unsigned long long)(keys[q] >> 20), (unsigned long long)(keys[q] & 0xFFFFF));
+                LOG("\n");
             }
         }
-        if (g_skin_skip_request != handled) {
-            handled = g_skin_skip_request;
-            step = (step + 1) % (nseen + 1);
-            if (step) LOG("[skipmesh] F10: skipping skinned meshes with index count %u (%d of %d; counts:", seen[step - 1], step, nseen);
-            else LOG("[skipmesh] F10: skipping nothing (counts:");
-            for (int q = 0; q < nseen; q++) LOG(" %u", seen[q]);
-            LOG(")\n");
+        if (frozen && shi > slo) {
+            for (int q = slo; q < shi; q++) if (keys[q] == key) { SKIP(SKIP_LIST); return; }
         }
-        if (step && pr->vi->cbuf_dynamic && (pr->vi->attr_mask & 0x80) && (uint32_t)r->x[2] == seen[step - 1]) { SKIP(SKIP_LIST); return; }
     }
     if (g_debug_frame) debug_draw(pr, r, indexed);
     if (ct_on()) ct_draw(pr, "draw");
