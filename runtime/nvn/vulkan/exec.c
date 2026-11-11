@@ -1916,7 +1916,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
 // Global memory (shader LDG/STG, maxwell_gmem_base = HEAP_BASE): the guest heap imported as a GPU buffer
 // (VK_EXT_external_memory_host), zero-copy like metal.m's g_guest_buffer, so compute results land in guest
 // memory. The import pins its pages, so it covers only the heap the game set up (SetHeapSize), made on first use.
-// EOWRECOMP_VK_NO_GMEM=1: no import, reads return zero.
+// EOWRECOMP_VK_NO_GMEM=1: no import; graphics reads can still use staged NVN storage ranges.
 static VkBuffer gmem_buf;
 static VkDeviceMemory gmem_mem;
 static uint64_t gmem_size;
@@ -1970,6 +1970,40 @@ static VkDescriptorBufferInfo gmem_info(void) {
     static uint32_t zero[1024];
     VkSpan s = vk_transient_copy(zero, sizeof zero, 256);
     return (VkDescriptorBufferInfo){s.buf, s.off, sizeof zero};
+}
+
+// Read-only graphics global memory without VK_EXT_external_memory_host. Glyph vertices
+// fetch per-character data through LDG, not vertex attributes; binding zeros hides all
+// text on Adreno. Snapshot just the NVN storage ranges, never the whole guest heap.
+static VkDescriptorBufferInfo graphics_gmem_info(int stage, const ShaderInfo *si, uint32_t *map) {
+    VkDescriptorBufferInfo empty = gmem_info();
+    if (gmem_buf || si->uses_gmem_store) return empty;
+    Range ranges[16];
+    uint64_t offsets[16], total = 0, heap = kernel_heap_size();
+    uint64_t budget = 32ull << 20;
+    if (budget > g_vk.props.limits.maxStorageBufferRange) budget = g_vk.props.limits.maxStorageBufferRange;
+    int n = 0;
+    for (int i = 0; i < 16; i++) {
+        Range r = st.sbuf[stage][i];
+        if (!r.addr || !r.size || r.addr < HEAP_BASE || r.addr - HEAP_BASE > heap ||
+            r.size > heap - (r.addr - HEAP_BASE)) continue;
+        uint64_t padded = (r.size + 15) & ~15ull;
+        if (padded > budget - total) continue;
+        ranges[n] = r; offsets[n++] = total; total += padded;
+    }
+    if (!n) return empty;
+    VkSpan data = vk_transient(total, 256);
+    memset(data.ptr, 0, (size_t)total);
+    for (int i = 0; i < n; i++) {
+        memcpy((uint8_t *)data.ptr + offsets[i], (const void *)(uintptr_t)ranges[i].addr, (size_t)ranges[i].size);
+        map[i * 4] = (uint32_t)(ranges[i].addr - HEAP_BASE);
+        map[i * 4 + 1] = (uint32_t)ranges[i].size;
+        map[i * 4 + 2] = (uint32_t)(offsets[i] / 4);
+    }
+    map[GMAP_MAX * 4] = (uint32_t)n;
+    static bool logged;
+    if (!logged) { LOG("[vk] graphics global memory: staged NVN storage buffers (no host import)\n"); logged = true; }
+    return (VkDescriptorBufferInfo){data.buf, data.off, total};
 }
 
 // Compute dispatches that use global memory: the imported heap is host memory across PCIe on a discrete GPU, and a
@@ -2374,6 +2408,9 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     VkDescriptorImageInfo ii[MAX_BIND];
     int n = 0;
     int sg = stage == 1 ? 1 : 0;
+    uint32_t draw_map[(GMAP_MAX + 1) * 4] = {0};
+    VkDescriptorBufferInfo draw_gmem = {0};
+    if (stage != 5 && si->uses_gmem_map) draw_gmem = graphics_gmem_info(stage, si, draw_map);
     float rs[66][4] = {{1, 1, 0, 0}};  // ([65]: a mirrored composite's width in LAS Recomp; unused, 0)
     if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
     for (int i = 0; i < p->nbinds; i++) {
@@ -2396,7 +2433,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
             w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-            bi[n] = b->binding == GFAST_BUFFER_INDEX ? gfast_info() : gmem_info();
+            bi[n] = b->binding == GFAST_BUFFER_INDEX ? (stage == 5 ? gfast_info() : draw_gmem) : gmem_info();
             w[n].pBufferInfo = &bi[n];
         } else {
             continue;  // rscale / tint: written below, once the textures (and their scales) are known
@@ -2409,8 +2446,8 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             (b->binding != 18 && b->binding != 19 && b->binding != GMAP_BUFFER_INDEX)) continue;
         w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = b->binding,
                                       .descriptorCount = 1, .descriptorType = b->type};
-        if (b->binding == GMAP_BUFFER_INDEX) {  // (compute) this dispatch's fast-copy table: gfast_prepare
-            bi[n] = ubo_span(vk_transient_copy(gmap_tab, sizeof gmap_tab, 256), sizeof gmap_tab);
+        if (b->binding == GMAP_BUFFER_INDEX) {  // compute fast-copy table or this draw's read-only storage snapshot
+            bi[n] = ubo_span(vk_transient_copy(stage == 5 ? gmap_tab : draw_map, sizeof gmap_tab, 256), sizeof gmap_tab);
         } else if (b->binding == 18) {
             for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
             bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rs, 256), sizeof rs);

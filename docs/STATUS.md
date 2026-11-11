@@ -2,6 +2,12 @@
 
 Atualizado: 2026-10-20 (sessão 3: macOS / Android).
 
+## Stock Adreno / Chinese text validation — 2026-11-11
+
+Read-only graphics storage snapshots restore missing glyphs without host-memory import; Chinese language/font
+fallback and concurrent font loading were also checked. See [text validation](ANDROID-text-validation.md).
+Opening-scene phone screenshots use an integration build with the separate startup/HUD/skinning fixes as well.
+
 ## Jogo fixado (único build suportado)
 
 | | |

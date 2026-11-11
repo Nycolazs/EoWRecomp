@@ -10,11 +10,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <pthread.h>
 
 #include "../hle.h"
 #include "../paths.h"
+#include "../settings.h"
 
 typedef struct { uint64_t addr, size; } Font;
+static pthread_mutex_t g_font_lock = PTHREAD_MUTEX_INITIALIZER;
 static Font fonts[2];  // [0] Standard (every type), [1] NintendoExt when a dump provides it
 
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
@@ -114,8 +117,14 @@ static void load_fonts(void) {
     // (the copy the app ships: third_party/fonts/DejaVu - Android has no TrueType system font to rely on)
     static char shipped[1100];
     if (!rt_resource("DejaVuSans.ttf", "third_party/fonts/DejaVu/DejaVuSans.ttf", shipped, sizeof shipped)) shipped[0] = 0;
+    // Keep one consistent fallback for all regional requests, as this service
+    // already does. The bundled Latin font has no Chinese glyphs.
+    char cjk[1100] = {0};
+    if (!strncmp(settings_language(), "zh", 2))
+        rt_resource("EowSansSC-Regular.ttf", "third_party/fonts/NotoSansSC/EowSansSC-Regular.ttf", cjk, sizeof cjk);
     const char *std[] = {env, "fonts/nintendo_udsg-r_std_003.bfttf", "fonts/nintendo_udsg-r_std_003.ttf",
                          "fonts/nintendo_udsgr_std_003.ttf", "fonts/nintendo_udsgr_std_003.bfttf",
+                         cjk[0] ? cjk : NULL,
                          "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc", "C:/Windows/Fonts/YuGothR.ttc",
                          "C:/Windows/Fonts/YuGothM.ttc", "/System/Library/Fonts/Supplemental/Arial.ttf",
                          "C:/Windows/Fonts/arial.ttf",
@@ -131,8 +140,13 @@ static void load_fonts(void) {
 
 // SharedFontType: 0 Standard, 1 ChineseSimple, 2 ChineseSimpleExt, 3 ChineseTraditional, 4 Korean, 5 NintendoExt
 static const Font *font_for(uint64_t type) {
+    // Address and Size can be requested by different guest font workers.
+    // Publish neither until the first font load is complete.
+    pthread_mutex_lock(&g_font_lock);
     load_fonts();
-    return type == 5 && fonts[1].addr ? &fonts[1] : &fonts[0];
+    const Font *font = type == 5 && fonts[1].addr ? &fonts[1] : &fonts[0];
+    pthread_mutex_unlock(&g_font_lock);
+    return font;
 }
 
 HLE_FUNC("_ZN2nn2pl22GetSharedFontLoadStateENS0_14SharedFontTypeE", pl_get_load_state) { c->x[0] = 1; }

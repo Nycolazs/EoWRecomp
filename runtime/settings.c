@@ -30,7 +30,7 @@ Settings g_settings = {
 // game picks one from the system language it reads back (runtime/services/am.c), as on the console. Codes as the
 // Switch reports them (nn::settings::LanguageCode).
 const char *const g_language_codes[N_LANGUAGES] = {"auto", "ja", "en-US", "en-GB", "fr", "fr-CA", "de", "it", "es",
-                                                   "es-419", "nl", "ru", "ko", "zh-CN", "zh-TW", "pt-BR"};
+                                                   "es-419", "nl", "ru", "ko", "zh-Hans", "zh-Hant", "pt-BR"};
 const char *const g_language_names[N_LANGUAGES] = {"Auto", "Japanese", "English (US)", "English (UK)", "French",
                                                    "French (Canada)", "German", "Italian", "Spanish",
                                                    "Spanish (Latin America)", "Dutch", "Russian", "Korean",
@@ -49,13 +49,18 @@ static const char *host_language(void) {
     if (!e || !*e || !strcmp(e, "C") || !strcmp(e, "POSIX")) return "en-US";
     char l[8] = {0};
     size_t n = 0;
-    for (const char *p = e; *p && *p != '.' && *p != '@' && *p != '_' && n < sizeof l - 1; p++) l[n++] = *p;
+    for (const char *p = e; *p && *p != '.' && *p != '@' && *p != '_' && *p != '-' && n < sizeof l - 1; p++) l[n++] = *p;
     static const struct { const char *loc, *code; } map[] = {{"ja", "ja"}, {"ko", "ko"}, {"ru", "ru"}, {"nl", "nl"},
                                                              {"de", "de"}, {"it", "it"}, {"fr", "fr"}, {"es", "es"},
                                                              {"pt", "pt-BR"}};
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (!strcmp(l, map[i].loc)) return map[i].code;
-    if (!strcmp(l, "zh")) return e[n] == '_' && e[n + 1] == 'T' ? "zh-TW" : "zh-CN";  // (TW / HK: traditional)
+    if (!strcmp(l, "zh")) {
+        const char *region = e + n;
+        if (*region == '_' || *region == '-') region++;
+        return !strncmp(region, "TW", 2) || !strncmp(region, "HK", 2) || !strncmp(region, "MO", 2) ||
+               !strncmp(region, "Hant", 4) ? "zh-Hant" : "zh-Hans";
+    }
     return "en-US";
 }
 
@@ -81,8 +86,9 @@ void settings_load(void) {
     bool tip_key = false, aspect_key = false;
     while (fgets(line, sizeof line, f)) {
         char key[64];
-        char val[128];
+        char val[128] = {0};
         if (sscanf(line, " %63[^= ] = %127[^\n]", key, val) < 1) continue;
+        val[strcspn(val, "\r")] = 0;  // accept settings copied from Windows with CRLF
         if (!strcmp(key, "aspect")) g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : ASPECT_UNLOCKED;
         else if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
@@ -101,9 +107,11 @@ void settings_load(void) {
         else if (!strcmp(key, "prompts")) g_settings.prompts = !strcmp(val, "nintendo") ? PROMPTS_NINTENDO : !strcmp(val, "xbox") ?
                                                               PROMPTS_XBOX : !strcmp(val, "playstation") ? PROMPTS_PLAYSTATION : PROMPTS_AUTO;
         else if (!strcmp(key, "language")) {  // ("auto" or one of the game's codes; anything else: auto)
+            // EoW uses the modern script codes. Keep old saved settings readable.
+            const char *code = !strcmp(val, "zh-CN") ? "zh-Hans" : !strcmp(val, "zh-TW") ? "zh-Hant" : val;
             g_settings.language = LANG_AUTO;
             for (int i = 1; i < N_LANGUAGES; i++)
-                if (!strcmp(val, g_language_codes[i])) g_settings.language = i;
+                if (!strcmp(code, g_language_codes[i])) g_settings.language = i;
         }
         else if (!strcmp(key, "menu_tip_seen")) g_settings.menu_tip_seen = atoi(val) != 0, tip_key = true;
         else if (!strcmp(key, "aspect_asked")) g_settings.aspect_asked = atoi(val) != 0, aspect_key = true;
