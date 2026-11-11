@@ -2677,6 +2677,12 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         LOG(" | ubufs:");
         for (int i = 0; i < 18; i++)
             if (st.ubuf[5][i].addr) LOG(" c%d %llx+%x", i + 3, (unsigned long long)st.ubuf[5][i].addr, (unsigned)st.ubuf[5][i].size);
+        LOG(" | tex:");  // (the light-cone map is 128x72: which compute reads it?)
+        for (int i = 0; i < cp->si->ntex && i < 64; i++) {
+            NvnTexture *t = shader_texture_object(5, &cp->si->tex[i]);
+            if (t) LOG(" %s%ux%u/f%#x", cp->si->tex[i].is_image ? "I:" : "", t->width, t->height, t->format);
+            else LOG(" none");
+        }
         LOG("\n");
     }
     if (cp->si->uses_gmem && getenv("EOWRECOMP_LOG_CS_SBUF")) {  // (debug) the storage buffers bound to gmem dispatches
