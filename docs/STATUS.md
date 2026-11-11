@@ -282,3 +282,8 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
 - 2026-11-10 (log eb740ce4, build fe3a172): 36 draws skinned, todos com índices de osso dentro da paleta (58 matrizes, max 57) e 0 matrizes
   NaN/enormes; 12 primeiras matrizes = rotação de escala 1 + translação ~(160,-45,170). Novo diagnóstico: "skin: bones used by vertices that look
   uncomputed (zero / near origin)" — hipótese: ossos secundários (capuz/capa/espada) com matriz nunca calculada → vértices colapsam à origem.
+
+### 2026-11-10 — corações (fs 72d9aafe00)
+- GLSL do fs: alfa final = sat(t2.r + t2.g*(1-t0.a) + [cb3[0].y!=0] * (t0.a+t2.a+t1.a)*cb3[0].y); cor = t0.rgb + t1.rgb*cb3[3].xyz*t0.a*cb3[2].w + t2.g*cb3[1].xyz. t0 = ASTC, t1 = RG8, t2 = RGB565. A forma do coração vem de t2.r (RGB565) e/ou de cb3[0].y.
+- O log `fcb` indexava `ubuf[1][c]` em vez de `ubuf[1][c-3]` (o "1.13 4 0 1" visto antes era outro banco, não o cb3 real). Corrigido; falta ver o cb3 real do fs num log novo.
+- Mapeamento 0x3C→R5G6B5 mantido (igual ao Metal/MoltenVK); sem evidência de troca R/B.
