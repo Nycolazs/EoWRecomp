@@ -3276,6 +3276,23 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
                     if (used[b] && (r2 == 0 || t2 < 1.0f) && nlisted++ < 16) LOG(" %u(|t|=%.3g,|m|=%.3g)", b, sqrtf(t2), sqrtf(r2));
                 }
                 LOG(" total %d\n", nlisted);
+                // Scale of every used bone matrix (norm of its three columns): physics-driven bones (hair, hood, cloth) that blow up
+                // look sane to the checks above but stretch the mesh along one axis. 2026-11-11: hair / hood / cloth are the stretched parts.
+                {
+                    float smin = FLT_MAX, smax = 0;
+                    int nl = 0;
+                    LOG("[draw]   skin: bone scales outside 0.5..2:");
+                    for (uint32_t b = 0; b < pal && b < 256; b++) {
+                        if (!used[b]) continue;
+                        const float *mm = m + b * 12;
+                        float sc[3];
+                        for (int c = 0; c < 3; c++) sc[c] = sqrtf(mm[c] * mm[c] + mm[4 + c] * mm[4 + c] + mm[8 + c] * mm[8 + c]);
+                        for (int c = 0; c < 3; c++) { if (sc[c] < smin) smin = sc[c]; if (sc[c] > smax) smax = sc[c]; }
+                        if ((sc[0] < 0.5f || sc[0] > 2 || sc[1] < 0.5f || sc[1] > 2 || sc[2] < 0.5f || sc[2] > 2) && nl++ < 12)
+                            LOG(" %u(%.3g %.3g %.3g)", b, sc[0], sc[1], sc[2]);
+                    }
+                    LOG(" total %d, overall scale %.3g..%.3g\n", nl, smin == FLT_MAX ? 0.f : smin, smax);
+                }
                 LOG("[draw]   skin: %u vertices, palette cb%d %u matrices, max bone index %u, %u indices out of range (first at vertex %d), "
                     "%u unsane matrices (first %d)\n", nv, pk, pal, maxi, over, (int)firstover, bad, (int)firstbad);
                 // The same skinning done on the CPU with the data the GPU reads: p' = sum(w_c * M[idx_c] * (pos, 1)), M = 3x4 row-major
