@@ -3194,9 +3194,11 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             if (ncomp && s7 == 0 && stride && pk >= 0) {
                 const uint8_t *vb = (const uint8_t *)(uintptr_t)st.vbuf[0].addr;
                 uint32_t nv = (uint32_t)(st.vbuf[0].size / stride), pal = st.ubuf[0][pk - 3].size / 48, maxi = 0, over = 0, firstover = ~0u;
+                uint8_t used[256] = {0};
                 for (uint32_t v = 0; v < nv; v++)
                     for (uint32_t c = 0; c < ncomp; c++) {
                         uint32_t ix = vb[(uint64_t)v * stride + o7 + c];
+                        used[ix] = 1;
                         if (ix > maxi) maxi = ix;
                         if (ix >= pal) { over++; if (firstover == ~0u) firstover = v; }
                     }
@@ -3207,6 +3209,17 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
                     for (int k = 0; k < 12; k++) { float x = m[b * 12 + k]; if (!(x == x) || x > 1e4f || x < -1e4f) ok = 0; }
                     if (!ok) { bad++; if (firstbad == ~0u) firstbad = b; }
                 }
+                // A bone world matrix that is all zero or sits at the world origin (characters stand around x,z ~ 100-200) was
+                // never computed: vertices weighted to it collapse to the origin = a beam from the character to there.
+                LOG("[draw]   skin: bones used by vertices that look uncomputed (zero / near origin):");
+                int nlisted = 0;
+                for (uint32_t b = 0; b < pal && b < 256; b++) {
+                    const float *mm = m + b * 12;
+                    float t2 = mm[3] * mm[3] + mm[7] * mm[7] + mm[11] * mm[11], r2 = 0;
+                    for (int k = 0; k < 12; k++) r2 += mm[k] * mm[k];
+                    if (used[b] && (r2 == 0 || t2 < 1.0f) && nlisted++ < 16) LOG(" %u(|t|=%.3g,|m|=%.3g)", b, sqrtf(t2), sqrtf(r2));
+                }
+                LOG(" total %d\n", nlisted);
                 LOG("[draw]   skin: %u vertices, palette cb%d %u matrices, max bone index %u, %u indices out of range (first at vertex %d), "
                     "%u unsane matrices (first %d)\n", nv, pk, pal, maxi, over, (int)firstover, bad, (int)firstbad);
                 // The same skinning done on the CPU with the data the GPU reads: p' = sum(w_c * M[idx_c] * (pos, 1)), M = 3x4 row-major

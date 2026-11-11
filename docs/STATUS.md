@@ -279,3 +279,6 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
     texturas 0x87 (4x4 sRGB, a dos corações é 250x100): mostra se o alfa já está errado no decodificador.
   Pedir ao usuário: `$env:EOWRECOMP_DEBUG_DATA="1"; $env:EOWRECOMP_DEBUG_FRAME="300"; .\eowrecomp.exe`, F9 com Link/Zelda esticados na tela (e
   de novo na cena dos corações), e enviar o log + os `build/astc_87_*.png`.
+- 2026-11-10 (log eb740ce4, build fe3a172): 36 draws skinned, todos com índices de osso dentro da paleta (58 matrizes, max 57) e 0 matrizes
+  NaN/enormes; 12 primeiras matrizes = rotação de escala 1 + translação ~(160,-45,170). Novo diagnóstico: "skin: bones used by vertices that look
+  uncomputed (zero / near origin)" — hipótese: ossos secundários (capuz/capa/espada) com matriz nunca calculada → vértices colapsam à origem.
