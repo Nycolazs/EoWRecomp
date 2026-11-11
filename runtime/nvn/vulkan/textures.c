@@ -182,7 +182,12 @@ uint64_t renderer_present_count(void);
 
 static bool tex_scalable(const NvnTexture *t) {
     if (getenv("EOWRECOMP_NO_SCALE")) return false;
-    if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < 32 || t->height < 16) return false;
+    // 2026-11-11: the light-cone pass (vs 72a46e1000) renders into a 128x72 RGBA8 map that later passes read as data; it is 16:9 and
+    // used to be scaled 2/3 like a screen buffer (85x48), and the bisect showed the stretched orange / blue "beams" come from it.
+    // Tiny maps are not screen buffers: only targets of at least EOWRECOMP_SCALE_MIN_W (default 160) pixels width are scaled.
+    static int min_w = -1;
+    if (min_w < 0) { const char *e = getenv("EOWRECOMP_SCALE_MIN_W"); min_w = e ? atoi(e) : 160; }
+    if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < (uint32_t)min_w || t->height < 16) return false;
     float a = (float)t->width / (float)t->height;
     return a > 1.74f && a < 1.81f;
 }
