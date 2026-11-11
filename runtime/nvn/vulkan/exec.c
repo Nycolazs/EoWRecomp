@@ -2668,6 +2668,17 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         if (skip == ~0ull) { const char *e = getenv("EOWRECOMP_SKIP_CS"); skip = e ? strtoull(e, NULL, 16) : 0; }
         if (skip && st.program->stages[5].code_addr == skip) { SKIP(SKIP_LIST); return; }
     }
+    if (g_debug_frame && getenv("EOWRECOMP_DEBUG_DATA")) {  // every dispatch of the captured frame: which buffers it can write
+        // (2026-11-10: does any compute shader write the bone palette (vcb6 of the skinned draws)? match these ranges against it)
+        LOG("[cs-frame] cs %llx %ux%ux%u store %d gmem %d | sbufs:", (unsigned long long)st.program->stages[5].code_addr, gx, gy, gz,
+            cp->si->uses_gmem_store, cp->si->uses_gmem);
+        for (int i = 0; i < 16; i++)
+            if (st.sbuf[5][i].addr) LOG(" sb%d %llx+%llx", i, (unsigned long long)st.sbuf[5][i].addr, (unsigned long long)st.sbuf[5][i].size);
+        LOG(" | ubufs:");
+        for (int i = 0; i < 18; i++)
+            if (st.ubuf[5][i].addr) LOG(" c%d %llx+%x", i + 3, (unsigned long long)st.ubuf[5][i].addr, (unsigned)st.ubuf[5][i].size);
+        LOG("\n");
+    }
     if (cp->si->uses_gmem && getenv("EOWRECOMP_LOG_CS_SBUF")) {  // (debug) the storage buffers bound to gmem dispatches
         static uint64_t seen_cs[16];
         static int seen_n[16];
