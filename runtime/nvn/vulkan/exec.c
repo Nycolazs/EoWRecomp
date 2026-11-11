@@ -2813,6 +2813,32 @@ static void draw_(CmdRec *r, bool indexed) {
         if (g_debug_frame && getenv("EOWRECOMP_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
     }
+    {   // F10 (2026-11-10, stretched Link/enemy parts): step through the skinned meshes (draws with a bone-index attribute a7 and a
+        // dynamically indexed cbuf), skipping one at a time, to see which mesh the beam belongs to. Meshes are told apart by their
+        // index count; the list is sorted so the order is stable. Press F10: none -> 1st -> 2nd -> ... -> none.
+        extern volatile int g_skin_skip_request;
+        static uint32_t seen[32];
+        static int nseen, step, handled;
+        if (pr->vi->cbuf_dynamic && (pr->vi->attr_mask & 0x80) && nseen < 32) {
+            uint32_t cnt = (uint32_t)r->x[2];
+            int j = 0;
+            while (j < nseen && seen[j] != cnt) j++;
+            if (j == nseen) {  // insert sorted
+                int q = nseen++;
+                while (q > 0 && seen[q - 1] > cnt) { seen[q] = seen[q - 1]; q--; }
+                seen[q] = cnt;
+            }
+        }
+        if (g_skin_skip_request != handled) {
+            handled = g_skin_skip_request;
+            step = (step + 1) % (nseen + 1);
+            if (step) LOG("[skipmesh] F10: skipping skinned meshes with index count %u (%d of %d; counts:", seen[step - 1], step, nseen);
+            else LOG("[skipmesh] F10: skipping nothing (counts:");
+            for (int q = 0; q < nseen; q++) LOG(" %u", seen[q]);
+            LOG(")\n");
+        }
+        if (step && pr->vi->cbuf_dynamic && (pr->vi->attr_mask & 0x80) && (uint32_t)r->x[2] == seen[step - 1]) { SKIP(SKIP_LIST); return; }
+    }
     if (g_debug_frame) debug_draw(pr, r, indexed);
     if (ct_on()) ct_draw(pr, "draw");
     alias_draw_check();
