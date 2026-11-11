@@ -1006,13 +1006,18 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int n = sz == 5 ? 2 : 1;
         char rb[16];
         const char *dyn = a == RZ ? NULL : reg(c, a, rb);
+        // LDC.64 Rd, c[b][Ra + off] with Ra == Rd (the 4-influence skin path of vs 72ee694000: LDC.64 R6, c[6][R6+0x28]):
+        // the hardware reads Ra before writing, but r6 = ...; r7 = cbr(..., r6 + 44) used the new r6, so the last
+        // translation component came from a garbage cbuf address and stretched hair/hood/cloth into beams.
+        bool alias = dyn && n > 1 && a >= d && a < d + n;
+        if (alias) { sp(&c->body, "    { uint ldc_a = %s;\n", dyn); dyn = "ldc_a"; }
         for (int i = 0; i < n; i++) {
             char cb[256];
             cbuf_ref(c, idx, off + 4 * i, dyn, cb);
-            if (!dyn && (off + 4 * i) & 0) {}
             if (dyn) c->info->cbuf_size[idx] = 0x10000;
             set_reg(c, d + i, cb);
         }
+        if (alias) sp(&c->body, "    }\n");
     } else if (OPM(0xeb20000000000000ull, 0xffe0000000000000ull)) {  // SUST
         emit_sust(c, w, pc);
     } else if (OPM(0xd000000000000000ull, 0xf600000000000000ull)) {  // TEXS
