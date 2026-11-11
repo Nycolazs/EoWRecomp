@@ -35,13 +35,13 @@ static VkFormat depth24_stencil8(void) {
     return f;
 }
 
-// HUD hearts (fs 72d9aafe00, 2026-11-10): the heart's alpha is the R channel of a 38x38 RGB565 texture (cb3 is sane: p0 off,
-// alpha = t2.r), and the hearts come out as an opaque rectangle. Default = R in the high bits (Metal B5G6R5Unorm, as LASRecomp);
-// EOWRECOMP_RGB565_BGR=1 swaps R and B (Vulkan B5G6R5) to test whether the channel order is the bug.
+// NVN RGB565 (0x3A/0x3C) has R in the LOW bits, i.e. Vulkan B5G6R5. Found 2026-11-10 on the HUD hearts (fs 72d9aafe00): their
+// alpha is the R channel of a 38x38 RGB565 texture, and with R5G6B5 the hearts were an opaque rectangle; the user confirmed
+// EOWRECOMP_RGB565_BGR=1 fixed them. Now the default; EOWRECOMP_RGB565_RGB=1 restores the old order.
 static VkFormat rgb565_vk(void) {
-    static int bgr = -1;
-    if (bgr < 0) bgr = getenv("EOWRECOMP_RGB565_BGR") != NULL;
-    return bgr ? VK_FORMAT_B5G6R5_UNORM_PACK16 : VK_FORMAT_R5G6B5_UNORM_PACK16;
+    static int rgb = -1;
+    if (rgb < 0) rgb = getenv("EOWRECOMP_RGB565_RGB") != NULL;
+    return rgb ? VK_FORMAT_R5G6B5_UNORM_PACK16 : VK_FORMAT_B5G6R5_UNORM_PACK16;
 }
 
 static VkFmt fmt_of(uint32_t f) {
