@@ -35,6 +35,15 @@ static VkFormat depth24_stencil8(void) {
     return f;
 }
 
+// HUD hearts (fs 72d9aafe00, 2026-11-10): the heart's alpha is the R channel of a 38x38 RGB565 texture (cb3 is sane: p0 off,
+// alpha = t2.r), and the hearts come out as an opaque rectangle. Default = R in the high bits (Metal B5G6R5Unorm, as LASRecomp);
+// EOWRECOMP_RGB565_BGR=1 swaps R and B (Vulkan B5G6R5) to test whether the channel order is the bug.
+static VkFormat rgb565_vk(void) {
+    static int bgr = -1;
+    if (bgr < 0) bgr = getenv("EOWRECOMP_RGB565_BGR") != NULL;
+    return bgr ? VK_FORMAT_B5G6R5_UNORM_PACK16 : VK_FORMAT_R5G6B5_UNORM_PACK16;
+}
+
 static VkFmt fmt_of(uint32_t f) {
     switch (f) {
     case 0x01: return (VkFmt){VK_FORMAT_R8_UNORM};
@@ -83,9 +92,9 @@ static VkFmt fmt_of(uint32_t f) {
     case 0x37: return (VkFmt){VK_FORMAT_R8G8B8A8_SRGB, 0, 1};
     case 0x38: return (VkFmt){VK_FORMAT_R8G8B8A8_SRGB};
     case 0x39: return (VkFmt){VK_FORMAT_R4G4B4A4_UNORM_PACK16};   // Metal ABGR4Unorm
-    case 0x3A: return (VkFmt){VK_FORMAT_R5G6B5_UNORM_PACK16};     // Metal B5G6R5Unorm
+    case 0x3A: return (VkFmt){rgb565_vk()};                      // Metal B5G6R5Unorm
     case 0x3B: return (VkFmt){VK_FORMAT_R5G5B5A1_UNORM_PACK16};   // Metal A1BGR5Unorm
-    case 0x3C: return (VkFmt){VK_FORMAT_R5G6B5_UNORM_PACK16};
+    case 0x3C: return (VkFmt){rgb565_vk()};
     case 0x3D: return (VkFmt){VK_FORMAT_A2B10G10R10_UNORM_PACK32};
     case 0x3E: return (VkFmt){VK_FORMAT_A2B10G10R10_UINT_PACK32};
     case 0x3F: return (VkFmt){VK_FORMAT_B10G11R11_UFLOAT_PACK32};

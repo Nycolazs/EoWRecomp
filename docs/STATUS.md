@@ -287,3 +287,4 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
 - GLSL do fs: alfa final = sat(t2.r + t2.g*(1-t0.a) + [cb3[0].y!=0] * (t0.a+t2.a+t1.a)*cb3[0].y); cor = t0.rgb + t1.rgb*cb3[3].xyz*t0.a*cb3[2].w + t2.g*cb3[1].xyz. t0 = ASTC, t1 = RG8, t2 = RGB565. A forma do coração vem de t2.r (RGB565) e/ou de cb3[0].y.
 - O log `fcb` indexava `ubuf[1][c]` em vez de `ubuf[1][c-3]` (o "1.13 4 0 1" visto antes era outro banco, não o cb3 real). Corrigido; falta ver o cb3 real do fs num log novo.
 - Mapeamento 0x3C→R5G6B5 mantido (igual ao Metal/MoltenVK); sem evidência de troca R/B.
+- Log 66497297 (DEBUG_FRAME=1500, fcb corrigido): cb3 real dos corações = (5i,0,0.27,1)(1,1,1,0)(1,1,1,0)(0,0,0,1) → p0 desligado; cor = t0.rgb + t2.g, alfa = t2.r (RGB565). Dados sãos; resta a textura RGB565 (ordem de canais ou conteúdo). Interruptor de teste: EOWRECOMP_RGB565_BGR=1 (B5G6R5). Não verificado.
