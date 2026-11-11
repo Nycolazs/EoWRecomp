@@ -3200,6 +3200,13 @@ static void draw_(CmdRec *r, bool indexed) {
     }
 }
 
+static float dbg_half(uint16_t h) {  // IEEE half -> float (skin-cpu: F16x4 positions)
+    uint32_t sgn = (uint32_t)(h & 0x8000) << 16, e = (h >> 10) & 0x1F, m = h & 0x3FF, u;
+    if (e == 0) { float d = (float)m * (1.0f / 16777216.0f); return sgn ? -d : d; }
+    u = e == 31 ? sgn | 0x7F800000u | (m << 13) : sgn | ((e + 112) << 23) | (m << 13);
+    float f; memcpy(&f, &u, 4); return f;
+}
+
 static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     LOG("[draw] %s inst %llu mode %llu count %llu prog vs=%llx fs=%llx | vs cb %#x fs cb %#x | rt %d", indexed ? "e" : "a",
         (unsigned long long)(indexed ? r->x[6] : r->x[4]), (unsigned long long)r->x[0], (unsigned long long)r->x[2],
@@ -3301,7 +3308,8 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
                 // if the mesh is compact here but stretched on screen, the bug is on the GPU side (translated VS, attribute fetch).
                 uint32_t a0 = st.attrib[0], o0 = a0 >> 13, a8 = st.nattrib > 8 ? st.attrib[8] : 0, f8 = a8 & 0xFF, o8 = a8 >> 13;
                 uint32_t wn = (pr->vi->attr_mask & 0x100) && ((a8 >> 8) & 0x1F) == 0 ? (f8 == 0x2A || f8 == 0x25 ? 4 : f8 == 0x0D ? 2 : 0) : 0;
-                float *sp = (pr->vi->attr_mask & 1) && (a0 & 0xFF) == 0x22 && ((a0 >> 8) & 0x1F) == 0 && nv ? malloc((size_t)nv * 3 * sizeof(float)) : NULL;
+                int f16pos = (a0 & 0xFF) == 0x29;  // 2026-11-11: the 2-bone draws with F16x4 positions were not modelled (hair / hood candidates)
+                float *sp = (pr->vi->attr_mask & 1) && ((a0 & 0xFF) == 0x22 || f16pos) && ((a0 >> 8) & 0x1F) == 0 && nv ? malloc((size_t)nv * 3 * sizeof(float)) : NULL;
                 if (sp) {
                     double cen[3] = {0, 0, 0};
                     float lo[3] = {FLT_MAX, FLT_MAX, FLT_MAX}, hi[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX}, rlo[3] = {FLT_MAX, FLT_MAX, FLT_MAX},
@@ -3309,7 +3317,9 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
                     uint32_t used = 0;
                     for (uint32_t v = 0; v < nv; v++) {
                         const uint8_t *vp = vb + (uint64_t)v * stride;
-                        const float *pos = (const float *)(vp + o0);
+                        float posf[3];
+                        if (f16pos) for (int q = 0; q < 3; q++) posf[q] = dbg_half(((const uint16_t *)(vp + o0))[q]);
+                        const float *pos = f16pos ? posf : (const float *)(vp + o0);
                         float w[4] = {1, 0, 0, 0}, o[3] = {0, 0, 0};
                         for (uint32_t c = 0; c < ncomp; c++)
                             w[c] = wn > c ? (f8 == 0x2A ? ((const uint16_t *)(vp + o8))[c] / 65535.0f : vp[o8 + c] / 255.0f)
