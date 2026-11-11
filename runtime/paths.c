@@ -82,7 +82,7 @@ bool rt_dev_mode(void) { return g_dev; }
 // The files the app ships are APK assets (android/app/build.gradle eowAssets), which only SDL's file streams can read:
 // copied once into <internal storage>/res, which then stands in for the executable's folder (rt_resource).
 static void android_resources(void) {
-    static const char *const names[] = {"Baloo2-SemiBold.ttf", "DejaVuSans.ttf", "icon.png"};
+    static const char *const names[] = {"Baloo2-SemiBold.ttf", "DejaVuSans.ttf", "EowSansSC-Regular.ttf", "icon.png"};
     const char *internal = SDL_GetAndroidInternalStoragePath();
     if (!internal) return;
     snprintf(g_exe_dir, sizeof g_exe_dir, "%s/res", internal);
