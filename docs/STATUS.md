@@ -2,6 +2,15 @@
 
 Atualizado: 2026-10-20 (sessão 3: macOS / Android).
 
+## Vulkan feedback stencil and no-import compute writes — 2026-11-12
+
+A focused follow-up preserves stencil aspect selection in feedback snapshots and adds bounded,
+coherent compute storage copy-back when host-memory import is unavailable. The combined Android
+integration now renders the post-rescue rift correctly on stock Adreno 840; the isolated patch
+still needs the existing shader/text PRs for that end-to-end result. Vulkan GPU regressions and
+before/after captures are recorded in [the validation note](VULKAN-rift-validation.md).
+Metal, full-playthrough and sustained-performance results remain unverified.
+
 ## Jogo fixado (único build suportado)
 
 | | |

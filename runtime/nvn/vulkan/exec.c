@@ -474,6 +474,7 @@ static int new_chunk(uint64_t size) {
                                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO,
+                                  .requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
     if (getenv("EOWRECOMP_VK_RING_SYSMEM")) ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;  // (test: a GPU without resizable BAR)
     VmaAllocationInfo info;
@@ -529,6 +530,7 @@ VkSpan vk_readback(uint64_t size) {
         cap = (size + (16 << 20) - 1) & ~((16ull << 20) - 1);
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = cap, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                      .requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                       .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
         VmaAllocationInfo info;
         VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &buf, &mem, &info));
@@ -1543,7 +1545,7 @@ static void build_pipeline(void *arg) {
 
 // ================================================================== feedback snapshots (renderer.m resolve_feedback)
 static NvnTexture *feedback_tex[4];
-static VkImageView feedback_view[4];
+static VkImageView feedback_view[4], feedback_stencil_view[4];
 static int nfeedback;
 static uint64_t g_cur_fs_hash;
 static NvnTexture *snap_tex[8];
@@ -1591,7 +1593,7 @@ static TexBackend *snapshot_image(NvnTexture *t, TexBackend *src) {
         VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = src->format,
                                 .extent = {src->width, src->height, 1}, .mipLevels = 1, .arrayLayers = 1,
                                 .samples = (VkSampleCountFlagBits)src->samples, .tiling = VK_IMAGE_TILING_OPTIMAL,
-                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
         d->format = src->format; d->width = src->width; d->height = src->height; d->depth = 1; d->layers = 1; d->levels = 1;
@@ -1832,7 +1834,9 @@ static void resolve_feedback(Prog *pr) {
             static const VkComponentMapping id = {0};
             if (!nosnap && si >= 0 && (snap_ok[si] || self_write) && existing) {
                 feedback_tex[nfeedback] = t;
-                feedback_view[nfeedback++] = vk_image_view(&existing->copy, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
+                feedback_view[nfeedback] = vk_image_view(&existing->copy, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
+                feedback_stencil_view[nfeedback++] = (src->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ?
+                    vk_image_view(&existing->copy, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_STENCIL_BIT) : VK_NULL_HANDLE;
                 continue;
             }
             stat_feedback_copies++;
@@ -1855,7 +1859,9 @@ static void resolve_feedback(Prog *pr) {
                 cb = vk_cmd();
             }
             feedback_tex[nfeedback] = t;
-            feedback_view[nfeedback++] = vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
+            feedback_view[nfeedback] = vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
+            feedback_stencil_view[nfeedback++] = (src->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ?
+                vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_STENCIL_BIT) : VK_NULL_HANDLE;
             if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
             snap_ok[si] = true;
             st.rt_dirty = true;
@@ -1987,8 +1993,15 @@ static VmaAllocation gfast_mem;
 static uint32_t gmap_tab[(GMAP_MAX + 1) * 4];  // this dispatch's table (stage_set copies it into binding 20)
 static VkBufferCopy gfast_cp[GMAP_MAX];       // its copies heap -> gfast_buf (reversed after a storing dispatch)
 static int gfast_n;
+// No host-memory import (stock Adreno): each dispatch owns a coherent transient snapshot, so a later CPU upload
+// cannot overwrite an earlier dispatch's inputs. Storing dispatches retire before copying their bound bytes back.
+static VkSpan gfast_host;
+static uint64_t gfast_host_size;
+static VkBufferCopy gfast_host_back[16];
+static int gfast_host_n;
 
 static VkDescriptorBufferInfo gfast_info(void) {
+    if (gfast_host.buf) return (VkDescriptorBufferInfo){gfast_host.buf, gfast_host.off, gfast_host_size};
     if (!gfast_buf) {
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = GFAST_SIZE,
                                  .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -2009,16 +2022,20 @@ static void gfast_prepare(VkCommandBuffer cb) {
     }
     memset(gmap_tab, 0, sizeof gmap_tab);
     gfast_n = 0;
+    gfast_host = (VkSpan){0};
+    gfast_host_n = 0;
     gmem_info();  // (the heap import, made on first use)
-    gfast_info();
-    if (!on || !gmem_buf) return;
+    bool host = !gmem_buf;
+    if (!host && !on) return;
+    uint64_t heap = host ? kernel_heap_size() : gmem_size;
+    if (heap > HEAP_MAX) heap = HEAP_MAX;
     struct { uint64_t lo, hi; } r[16];
     int n = 0;
     for (int i = 0; i < 16; i++) {  // heap offsets of the bound storage buffers, 256-aligned
         uint64_t a = st.sbuf[5][i].addr, sz = st.sbuf[5][i].size;
-        if (!a || !sz || a < HEAP_BASE || a - HEAP_BASE + sz > gmem_size) continue;
+        if (!a || !sz || a < HEAP_BASE || a - HEAP_BASE > heap || sz > heap - (a - HEAP_BASE)) continue;
         uint64_t lo = (a - HEAP_BASE) & ~255ull, hi = (a - HEAP_BASE + sz + 255) & ~255ull;
-        if (hi > gmem_size) hi = gmem_size;
+        if (hi > heap) hi = heap;
         int k = n++;
         while (k > 0 && r[k - 1].lo > lo) { r[k] = r[k - 1]; k--; }  // (insertion sort by start)
         r[k].lo = lo; r[k].hi = hi;
@@ -2032,7 +2049,7 @@ static void gfast_prepare(VkCommandBuffer cb) {
     uint64_t off = 0;
     for (int i = 0; i < m; i++) {
         uint64_t len = r[i].hi - r[i].lo;
-        if (m > GMAP_MAX || off + len > GFAST_SIZE) return;  // (too much: the heap as before)
+        if (m > GMAP_MAX || off + len > GFAST_SIZE || off + len > g_vk.props.limits.maxStorageBufferRange) return;
         cp[i] = (VkBufferCopy){r[i].lo, off, len};
         gmap_tab[i * 4 + 0] = (uint32_t)r[i].lo;
         gmap_tab[i * 4 + 1] = (uint32_t)len;
@@ -2040,6 +2057,30 @@ static void gfast_prepare(VkCommandBuffer cb) {
         off += (len + 255) & ~255ull;
     }
     if (!m) return;
+    if (host) {
+        gfast_host = vk_transient(off, 256);
+        gfast_host_size = off;
+        for (int i = 0; i < m; i++)
+            memcpy((uint8_t *)gfast_host.ptr + cp[i].dstOffset, (const void *)(uintptr_t)(HEAP_BASE + cp[i].srcOffset), (size_t)cp[i].size);
+        // Uploads include aligned padding; only restore bytes the shader's storage bindings own, preserving
+        // unrelated CPU data next to a short binding or in a merged gap.
+        for (int i = 0; i < 16; i++) {
+            Range b = st.sbuf[5][i];
+            if (!b.addr || !b.size || b.addr < HEAP_BASE || b.addr - HEAP_BASE > heap || b.size > heap - (b.addr - HEAP_BASE)) continue;
+            uint64_t start = b.addr - HEAP_BASE;
+            for (int j = 0; j < m; j++)
+                if (start >= cp[j].srcOffset && start + b.size <= cp[j].srcOffset + cp[j].size) {
+                    gfast_host_back[gfast_host_n++] = (VkBufferCopy){cp[j].dstOffset + start - cp[j].srcOffset, start, b.size};
+                    break;
+                }
+        }
+        gmap_tab[GMAP_MAX * 4] = (uint32_t)m;
+        vk_full_barrier(cb);
+        static bool logged;
+        if (!logged) { LOG("[vk] compute global memory: coherent staged storage with copy-back (no host import)\n"); logged = true; }
+        return;
+    }
+    gfast_info();
     if (getenv("EOWRECOMP_LOG_GFAST")) {  // (debug) =<shader code address hex>: that shader's first tables
         static int nlog;
         if (st.program->stages[5].code_addr == strtoull(getenv("EOWRECOMP_LOG_GFAST"), NULL, 16) && nlog++ < 40) {
@@ -2057,6 +2098,21 @@ static void gfast_prepare(VkCommandBuffer cb) {
 
 // After a storing dispatch: its ranges back to the heap (before anything else reads them: draws, the CPU after the fence).
 static void gfast_finish(VkCommandBuffer cb) {
+    if (gfast_host.buf) {
+        VkMemoryBarrier ready = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                                  .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &ready, 0, NULL, 0, NULL);
+        renderer_flush();  // waits for this submission; subsequent uniform snapshots must see these results
+        for (int i = 0; i < gfast_host_n; i++) {
+            VkBufferCopy b = gfast_host_back[i];
+            memcpy((void *)(uintptr_t)(HEAP_BASE + b.dstOffset), (uint8_t *)gfast_host.ptr + b.srcOffset, (size_t)b.size);
+        }
+        guest_copy_flush();
+        st.rt_dirty = true;
+        gfast_host = (VkSpan){0};
+        gfast_host_n = 0;
+        return;
+    }
     if (!gfast_n) return;
     VkBufferCopy back[GMAP_MAX];
     for (int i = 0; i < gfast_n; i++) back[i] = (VkBufferCopy){gfast_cp[i].dstOffset, gfast_cp[i].srcOffset, gfast_cp[i].size};
@@ -2352,7 +2408,11 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
             wh[0] = e->tex->width; wh[1] = e->tex->height;
             for (int k = 0; k < nfeedback; k++)
                 if (e->tex == feedback_tex[k] && (st_->type == TEXTYPE_2D || st_->type == TEXTYPE_2D_ARRAY)) {
-                    view = feedback_view[k];
+                    // The same attachment can be sampled as depth and as stencil in one draw. Keep its view's
+                    // aspect when redirecting to the snapshot; a depth view bound to a usampler returns garbage.
+                    uint32_t mode = e->has_view && (e->view.setmask & 16) ? e->view.ds_mode : e->tex->ds_mode;
+                    bool stencil = mode == 1 || e->tex->format == 0x31;
+                    view = stencil && feedback_stencil_view[k] ? feedback_stencil_view[k] : feedback_view[k];
                     if (st_->type == TEXTYPE_2D_ARRAY) view = vk_dummy_view(TEXTYPE_2D_ARRAY);  // (2D snapshot as array: rare)
                 }
         }
