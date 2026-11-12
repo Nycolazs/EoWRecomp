@@ -313,3 +313,6 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
   Candidato a otimização: cache de pipelines em disco.
 - Deadlock raro (jogo congela, áudio segue): watchdog (`runtime/platform/windows.c`) imprime pilhas + estado das threads + histórico de
   mutex/condvar do kernel (`kernel_dump_threads`). Log 4c1b77be: só a thread principal (t80) presa num condvar, tickers vivos; aguardando um log com o histórico novo.
+- 2026-11-12 (log 5c37cc47, build com VMNMX): VMNMX passou; os mesmos computes 72a4711000/72a4715000 agora param em `ed03000000500005` = `ATOM.E.ADD.S32 R5, [R0], R5`
+  (atômica global COM retorno do valor antigo; só existia RED). ATOM implementada em `translate.c` (campos do Ryujinx InstAtom; add/min/max/inc/dec/and/or/xor/exch,
+  U32/S32; MSL sem inc/dec). Teste: `tools/test_atom.sh`. Hipótese: contador de instâncias visíveis do culling de vegetação (árvores/grama). **Não verificado.**

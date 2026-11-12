@@ -1759,6 +1759,53 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             sp(&c->body, "      if (ok) %s((device atomic_uint *)(gmem + ga), %s, memory_order_relaxed);\n", ms_op[op], R(vr));
         }
         sp(&c->body, "    }\n");
+    } else if (OPM(0xed00000000000000ull, 0xff00000000000000ull)) {  // ATOM: atomic on global memory, returns the old value
+        // fields per Ryujinx's InstAtom: Rd 0-7, address 8-15 (64-bit pair with .E, bit 48), value 20-27, offset 28-47 (signed),
+        // size 49-51 (0 U32, 1 S32), op 52-55 (0 add, 1 min, 2 max, 3 inc, 4 dec, 5 and, 6 or, 7 xor, 8 exch). Seen in Echoes of
+        // Wisdom's ed03000000500005 = ATOM.E.ADD.S32 R5, [R0], R5 (computes 72a4711000 / 72a4715000: the visible-instance counter of
+        // the vegetation culling; untranslated, trees and grass were never drawn). GLSL tested on Vulkan; MSL is untested.
+        int size = (int)bits(w, 49, 3), op = (int)bits(w, 52, 4), vr = (int)bits(w, 20, 8);
+        bool wide = bits(w, 48, 1), sgn = size == 1;
+        int64_t off = sbits(w, 28, 20);
+        if (size > 1 || op > 8) fail(c, "atom size %d op %d", size, op);
+        if (!c->glsl && (op == 3 || op == 4)) fail(c, "atom inc/dec (msl)");
+        c->info->uses_gmem = true;
+        c->uses_gmem_store = true;
+        c->info->uses_gmem_store = true;
+        char addr[256];
+        if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
+        else if (wide) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
+        else sprintf(addr, "(ulong(%s) + ulong(%lld))", R(a), (long long)off);
+        sp(&c->body, "    { ulong ga = %s - 0x%llxul; bool ok = ga < 0x%llxul; uint v_ = %s, o_ = 0u;\n", addr,
+           (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size, R(vr));
+        if (c->glsl) {
+            // new word from the old one (o_) and the operand (v_) for the ops GLSL has no builtin for: a compare-and-swap loop
+            const char *neu = op == 1 ? (sgn ? "uint(min(int(o_), int(v_)))" : "min(o_, v_)")
+                              : op == 2 ? (sgn ? "uint(max(int(o_), int(v_)))" : "max(o_, v_)")
+                              : op == 3 ? "(o_ >= v_ ? 0u : o_ + 1u)" : "((o_ == 0u || o_ > v_) ? v_ : o_ - 1u)";
+            static const char *const bi[] = {"atomicAdd", "", "", "", "", "atomicAnd", "atomicOr", "atomicXor", "atomicExchange"};
+            char st[2][700];
+            const char *words[2] = {"gfast_.w[fw]", "gmem_.w[uint(ga >> 2)]"};
+            for (int k = 0; k < 2; k++) {
+                if (*bi[op]) sprintf(st[k], "o_ = %s(%s, v_);", bi[op], words[k]);
+                else sprintf(st[k], "o_ = %s; for (;;) { uint p_ = atomicCompSwap(%s, o_, %s); if (p_ == o_) break; o_ = p_; }", words[k], words[k], neu);
+            }
+            if (c->stage == STAGE_COMPUTE) {  // (the dispatch's storage buffers have a device-local copy: see LDG / STG)
+                c->info->uses_gmem_map = true;
+                sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
+                sp(&c->body, "      if (fw != 0xFFFFFFFFu) { %s } else if (ok) { %s }\n", st[0], st[1]);
+            } else {
+                sp(&c->body, "      if (ok) { %s }\n", st[1]);
+            }
+        } else {
+            static const char *const mo[] = {"add", "min", "max", "", "", "and", "or", "xor", "exchange"};
+            if (sgn && (op == 1 || op == 2))
+                sp(&c->body, "      if (ok) o_ = uint(atomic_fetch_%s_explicit((device atomic_int *)(gmem + ga), int(v_), memory_order_relaxed));\n", mo[op]);
+            else
+                sp(&c->body, "      if (ok) o_ = atomic_%s%s_explicit((device atomic_uint *)(gmem + ga), v_, memory_order_relaxed);\n", op == 8 ? "" : "fetch_", mo[op]);
+        }
+        set_reg(c, d, "o_");
+        sp(&c->body, "    }\n");
     } else if (OPM(0x38f0000000000000ull, 0xfef8000000000000ull) || OPM(0x5cf0000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x4cf0000000000000ull, 0xfff8000000000000ull)) {  // R2P
         if (bits(w, 40, 1)) { fail(c, "r2p cc"); }
