@@ -551,13 +551,14 @@ void kernel_dump_threads(void) {
         // a ticker thread (a 15 ms timed wait on its own key) fills the ring in seconds, so keys with a flood of events are
         // left out of the tail, and the main game thread's own condvar + mutex are printed separately
         uint64_t n = g_kev_n, from = n > 16384 ? n - 16384 : 0;
-        struct { uint64_t addr; unsigned cnt; } keys[64] = {0};
+        static struct { uint64_t addr; unsigned cnt; } keys[1024];  // (64 hid every key after the first 64: the tail missed most events)
+        memset(keys, 0, sizeof keys);
         int nk = 0;
         for (uint64_t i = from; i < n; i++) {
             uint64_t a = g_kev[i & 16383].addr;
             int k = 0;
             while (k < nk && keys[k].addr != a) k++;
-            if (k == nk && nk < 64) keys[nk++].addr = a;
+            if (k == nk && nk < 1024) keys[nk++].addr = a;
             if (k < nk) keys[k].cnt++;
         }
         KThread *mt = NULL;
