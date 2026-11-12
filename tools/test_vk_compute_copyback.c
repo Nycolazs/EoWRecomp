@@ -154,4 +154,3 @@ int main(void) {
     maxwell_free(si);free(source);
     return ok?0:1;
 }
-
