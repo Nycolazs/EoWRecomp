@@ -302,3 +302,14 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
   Teste: `tools/test_ldc.sh` (PASS). Os dados de ossos/CPU já estavam sãos (log 744b66ec), o que apontou para o shader.
 - Backend: Vulkan (GLSL). O caminho MSL compartilha o mesmo emissor, mas não foi testado no Metal.
 - Verificado: usuário rodou o build 0a8f643 e os feixes sumiram. Próximo: textura faltando no portal do vazio; depois desempenho (overlay, 120 fps) se pedido.
+
+## 2026-11-12 — VMNMX (árvores invisíveis, save 100%) e deadlock raro
+- Log do usuário (F9 na floresta, frame 17381): `skipped: compute program 432` por frame = dispatches dos computes 72a4711000 / 72a4715000, que
+  falhavam em `3b7707e061172a0f` (VMNMX). Hipótese: são eles que alimentam as árvores (invisíveis). **Não verificado** (precisa do exe novo).
+- VMNMX implementado em `translate.c` só para o caso conhecido (Rb registrador, 32 bits, op2 acc/min/max/nop; layout do yuzu
+  `shader_bytecode.h`, commit 76f178ba): nos dois shaders é `Rd = max(Ra, Rb, Rc)` com sinal. Qualquer outra combinação continua falhando (não chuta).
+  Teste: `tools/test_vmnmx.sh` (PASS). Ainda falta a forma imm16 e formatos/seletores estreitos.
+- Shaders pesados (FS/VS de ~60 KB de GLSL) levam 2–9 s para compilar no Xeon: draws pulados ("program/pipeline compiling") até terminar.
+  Candidato a otimização: cache de pipelines em disco.
+- Deadlock raro (jogo congela, áudio segue): watchdog (`runtime/platform/windows.c`) imprime pilhas + estado das threads + histórico de
+  mutex/condvar do kernel (`kernel_dump_threads`). Log 4c1b77be: só a thread principal (t80) presa num condvar, tickers vivos; aguardando um log com o histórico novo.

@@ -1818,6 +1818,27 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (!c->glsl) sp(&c->body, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
         else if (c->stage == STAGE_COMPUTE) sp(&c->body, "    barrier();\n");
         else sp(&c->body, "    /* bar */\n");  // GLSL barrier() is compute / tessellation only
+    } else if (OPM(0x3a00000000000000ull, 0xfe00000000000000ull)) {
+        // VMNMX, register form, full 32-bit operands: Rd = op2(min|max(Ra, Rb), Rc). Bit layout from yuzu's shader_bytecode.h
+        // (https://git.morozoff.pro/aiden/yuzu/commit/76f178ba): sign A/B 48/49, "Rb is a register" 50, op2 51-53 (0-3 merge,
+        // 4 acc, 5 min, 6 max, 7 nop), dest sign 54, sat 55, max 56. The two shaders in the 2026-11-12 log (computes 72a4711000 /
+        // 72a4715000, 432 dispatches skipped per frame in the forest) have exactly mx=1, op2=max, signed, Rb = bits 20-27
+        // (R17 / R16) and bits 28-30 / 36-38 = 0b110: a three-way max(Ra, Rb, Rc). The yuzu field table overlaps its own format and
+        // selector bits, so any other combination (narrow formats, selectors, merge ops, saturation, imm16 form) fails here
+        // instead of being guessed.
+        bool mx = bits(w, 56, 1), sa = bits(w, 48, 1), ds = bits(w, 54, 1);
+        int op2 = (int)bits(w, 51, 3);
+        if (!bits(w, 50, 1) || bits(w, 55, 1) || sa != (bool)bits(w, 49, 1) || bits(w, 28, 3) != 6 || bits(w, 36, 3) != 6 || op2 < 4)
+            fail(c, "vmnmx variant %016llx (only the 32-bit register form with acc/min/max/pass second operation is known)", (unsigned long long)w);
+        const char *x = R(a), *y = R((int)bits(w, 20, 8)), *z = R((int)bits(w, 39, 8));
+        char f[256];
+        if (sa) sprintf(f, "%s(int(%s), int(%s))", mx ? "max" : "min", x, y);
+        else sprintf(f, "%s(%s, %s)", mx ? "max" : "min", x, y);
+        if (op2 == 4) sprintf(t, "(uint(%s) + %s)", f, z);
+        else if (op2 == 7) sprintf(t, "uint(%s)", f);
+        else if (ds) sprintf(t, "uint(%s(int(%s), int(%s)))", op2 == 6 ? "max" : "min", f, z);
+        else sprintf(t, "%s(uint(%s), %s)", op2 == 6 ? "max" : "min", f, z);
+        set_reg(c, d, t);
     } else {
         // (the neighbours too: the opcode alone doesn't say what the instruction does; the log of 2026-11-09 had
         // 3b7707e061172a0f at 0xd28 in two compute shaders and nothing around it)
