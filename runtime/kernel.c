@@ -329,10 +329,10 @@ static uint32_t block_current(int64_t timeout_ns) {
 // WaitProcessWideKey / SignalProcessWideKey around a stuck wait shows a lost wake-up (a signal that found no waiter just
 // before the waiter arrived, a signal that woke the wrong thread, ...).
 typedef struct { uint64_t ms; uint32_t tid; char op; int32_t arg; uint64_t addr; int woken; } KEv;
-static KEv g_kev[512];
+static KEv g_kev[16384];
 static uint64_t g_kev_n;
 static void kev_add(char op, uint64_t addr, int32_t arg, int woken) {
-    KEv *e = &g_kev[g_kev_n++ & 511];
+    KEv *e = &g_kev[g_kev_n++ & 16383];
     e->ms = plat_now_ns() / 1000000;
     e->tid = t_cur ? (uint32_t)t_cur->id : 0;
     e->op = op; e->addr = addr; e->arg = arg; e->woken = woken;
@@ -546,11 +546,45 @@ void kernel_dump_threads(void) {
         fputc('\n', stderr);
     }
     if (locked) {
-        fprintf(stderr, "--- last kernel mutex/condvar events (W/w wait enter/return, S signal key count -> woken, L/l lock wait, U unlock; ms)\n");
-        uint64_t n = g_kev_n, from = n > 160 ? n - 160 : 0;
+        // a ticker thread (a 15 ms timed wait on its own key) fills the ring in seconds, so keys with a flood of events are
+        // left out of the tail, and the main game thread's own condvar + mutex are printed separately
+        uint64_t n = g_kev_n, from = n > 16384 ? n - 16384 : 0;
+        struct { uint64_t addr; unsigned cnt; } keys[64] = {0};
+        int nk = 0;
         for (uint64_t i = from; i < n; i++) {
-            KEv *e = &g_kev[i & 511];
-            fprintf(stderr, "  %llu t%u %c %llx arg %d woken %d\n", (unsigned long long)e->ms, e->tid, e->op, (unsigned long long)e->addr, e->arg, e->woken);
+            uint64_t a = g_kev[i & 16383].addr;
+            int k = 0;
+            while (k < nk && keys[k].addr != a) k++;
+            if (k == nk && nk < 64) keys[nk++].addr = a;
+            if (k < nk) keys[k].cnt++;
+        }
+        KThread *mt = NULL;
+        for (KThread *t = g_threads; t; t = t->anext) if (t->id == 80) mt = t;
+        fprintf(stderr, "--- kernel events (ms, thread, W/w wait enter/return, S signal key count -> woken, L/l lock wait/return, U unlock), %llu in the ring\n", (unsigned long long)(n - from));
+        if (mt && mt->wait_kind != WAIT_NONE) {
+            fprintf(stderr, "main game thread (t80) condvar %llx / mutex %llx, last events on them:\n", (unsigned long long)mt->wait_addr, (unsigned long long)mt->wait_mutex);
+            uint64_t start = n, cnt = 0;
+            while (start > from && cnt < 60) { start--; KEv *e = &g_kev[start & 16383]; if (e->addr == mt->wait_addr || e->addr == mt->wait_mutex) cnt++; }
+            for (uint64_t i = start; i < n; i++) {
+                KEv *e = &g_kev[i & 16383];
+                if (e->addr == mt->wait_addr || e->addr == mt->wait_mutex)
+                    fprintf(stderr, "  %llu t%u %c %llx arg %d woken %d\n", (unsigned long long)e->ms, e->tid, e->op, (unsigned long long)e->addr, e->arg, e->woken);
+            }
+        }
+        fprintf(stderr, "last events of keys that are not floods:\n");
+        uint64_t start = n, cnt = 0;
+        while (start > from && cnt < 150) {
+            start--;
+            KEv *e = &g_kev[start & 16383];
+            for (int k = 0; k < nk; k++) if (keys[k].addr == e->addr && keys[k].cnt < 2000) { cnt++; break; }
+        }
+        for (uint64_t i = start; i < n; i++) {
+            KEv *e = &g_kev[i & 16383];
+            for (int k = 0; k < nk; k++)
+                if (keys[k].addr == e->addr && keys[k].cnt < 2000) {
+                    fprintf(stderr, "  %llu t%u %c %llx arg %d woken %d\n", (unsigned long long)e->ms, e->tid, e->op, (unsigned long long)e->addr, e->arg, e->woken);
+                    break;
+                }
         }
     }
     if (locked) pthread_mutex_unlock(&g_klock);
