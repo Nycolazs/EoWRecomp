@@ -294,11 +294,11 @@ Linux** (Intel Iris Xe, Mesa ANV). Metal não foi tocado nem testado.
 - 2026-11-11: o stepper F10 por malha falhou (lista de 32 encheu com inimigos/cenário; log 5bbbb663: o feixe não sumiu em nenhum passo). Trocado por **busca binária sobre todos os draws** (vs + nº de índices): F10 = pula a 1ª metade dos candidatos; F7 = "o feixe sumiu"; F8 = "o feixe continua"; no fim loga `[bisect] FOUND`.
 - 2026-11-11 (esticado): **bisect achou o feixe**: draw vs 72a46e1000 (336 índices) → cone de luz renderizado num mapa 128x72 RGBA8 (vp 85x48 pela escala 2/3), usado depois como dado. VS lido: modo cb14[3][1] (1/2 = cone com matriz 3x4 em cb14[0..2] e escalas cb14[3][2..3]; outro = clip direto), mapeia (prof. cb4[11], lateral cb4[10]) para x/y do mapa com cb4[70]. Hipótese: o mapa não deve ser escalado (era tratado como buffer de tela 16:9). Mudança: `tex_scalable` exige largura >= EOWRECOMP_SCALE_MIN_W (padrão 160). **Não verificado**; teste sem build: EOWRECOMP_NO_SCALE=1.
 
-## 2026-11-11 — feixes esticados: LDC.64 com endereço == destino (causa provável, aguardando teste do usuário)
+## 2026-11-11 — feixes esticados: LDC.64 com endereço == destino (CONFIRMADO pelo usuário em 2026-11-11, Vulkan/RX 580)
 - vs 72ee694000 / 72ee677700 / 72a5c2b000, caminho de 4 influências (pc 0x7a8): `LDC.64 R6, c[6][R6+0x28]`. O tradutor
   emitia `r6 = cbr(.., r6+40); r7 = cbr(.., r6+44)`, a segunda palavra com o r6 já sobrescrito -> endereço de cbuf lixo
   (clamp no último vec4) -> componente de translação gigante do 4º osso -> cabelo/capuz/capa viram feixes.
 - Correção em `runtime/nvn/maxwell/translate.c` (LD c[idx][reg+imm]): copia o registrador de endereço antes de escrever.
   Teste: `tools/test_ldc.sh` (PASS). Os dados de ossos/CPU já estavam sãos (log 744b66ec), o que apontou para o shader.
 - Backend: Vulkan (GLSL). O caminho MSL compartilha o mesmo emissor, mas não foi testado no Metal.
-- O usuário deve testar: build novo, jogar com Link/Zelda em gameplay (cabelo, capuz, capa, espadas, inimigos). NÃO declarado resolvido até ver.
+- Verificado: usuário rodou o build 0a8f643 e os feixes sumiram. Próximo: textura faltando no portal do vazio; depois desempenho (overlay, 120 fps) se pedido.
