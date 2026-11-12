@@ -26,6 +26,7 @@ struct KThread {
     uint32_t handle;
     int prio, core;
     bool cancel, in_sync_wait;
+    uint64_t wait_since_ms;  // when the current wait began (watchdog dump)
     uint32_t sync_h[4]; int sync_n; int64_t sync_timeout;  // WaitSynchronization in progress (watchdog dump)
     // wait state (protected by g_klock)
     WaitKind wait_kind;

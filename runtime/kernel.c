@@ -336,6 +336,7 @@ static void kev_add(char op, uint64_t addr, int32_t arg, int woken) {
     e->ms = plat_now_ns() / 1000000;
     e->tid = t_cur ? (uint32_t)t_cur->id : 0;
     e->op = op; e->addr = addr; e->arg = arg; e->woken = woken;
+    if (t_cur && (op == 'W' || op == 'L')) t_cur->wait_since_ms = e->ms;
 }
 
 static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) {
@@ -543,6 +544,7 @@ void kernel_dump_threads(void) {
             fprintf(stderr, " addr %llx = %#x", (unsigned long long)t->wait_addr, *u32p(t->wait_addr));
             if (t->wait_kind == WAIT_CONDVAR) fprintf(stderr, " (mutex %llx = %#x)", (unsigned long long)t->wait_mutex, *u32p(t->wait_mutex));
         }
+        if (t->wait_since_ms) fprintf(stderr, " [since %llu]", (unsigned long long)t->wait_since_ms);
         fputc('\n', stderr);
     }
     if (locked) {
@@ -570,6 +572,16 @@ void kernel_dump_threads(void) {
                 if (e->addr == mt->wait_addr || e->addr == mt->wait_mutex)
                     fprintf(stderr, "  %llu t%u %c %llx arg %d woken %d\n", (unsigned long long)e->ms, e->tid, e->op, (unsigned long long)e->addr, e->arg, e->woken);
             }
+        }
+        fprintf(stderr, "last 40 events of the main game thread (t80), any key:\n");
+        {
+            uint64_t start = n, cnt = 0;
+            while (start > from && cnt < 40) { start--; if (g_kev[start & 16383].tid == 80) cnt++; }
+            for (uint64_t i = start; i < n; i++) {
+                KEv *e = &g_kev[i & 16383];
+                if (e->tid == 80) fprintf(stderr, "  %llu t80 %c %llx arg %d woken %d\n", (unsigned long long)e->ms, e->op, (unsigned long long)e->addr, e->arg, e->woken);
+            }
+            fprintf(stderr, "ring spans %llu..%llu ms\n", (unsigned long long)g_kev[from & 16383].ms, (unsigned long long)g_kev[(n - 1) & 16383].ms);
         }
         fprintf(stderr, "last events of keys that are not floods:\n");
         uint64_t start = n, cnt = 0;
