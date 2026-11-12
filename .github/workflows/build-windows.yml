@@ -64,6 +64,16 @@ jobs:
           tools/windows/fetch_deps.sh
           tools/windows/build.sh RELEASE=1  # sem console: o log vai para eowrecomp.log, ao lado do .exe
 
+      - name: Símbolos do .exe para ler o log do watchdog (diagnóstico)
+        continue-on-error: true
+        run: |
+          # eowrecomp.log traz frames "eowrecomp+<rva>": aqui cada rva vira função/linha (o .exe tem DWARF, sem tabela COFF)
+          IB=$(objdump -p build/win/eowrecomp.exe | awk '/^ImageBase/{print $2}')
+          for r in ${{ vars.WATCHDOG_RVAS || '12cd08 12eeaa 12f38f 130bc9 1322b6 13289e 132dbc 132f21 168ec3 168fe2 1690cb 1b0ca 1b9d 1cca4 444b7 499ed 58e47 61647 7b2c 883b 9836 9c24 9c31 a895 a900 bb7c' }}; do
+            printf 'rva %s: ' "$r"
+            addr2line -f -C -e build/win/eowrecomp.exe "$(printf '0x%x' $((0x$IB + 0x$r - 1)))" | tr '\n' ' '; echo
+          done
+
       - name: Separar o que o pacote usa
         run: |
           mkdir stage
