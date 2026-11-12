@@ -310,6 +310,7 @@ static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS *ep) {
 // would deadlock). The frames show which wait the game is stuck in (a fence, a mutex, a driver call, a guest function).
 uint64_t renderer_present_count(void);  // runtime/nvn/vulkan/device.c
 void kernel_dump_threads(void);         // runtime/kernel.c
+void kernel_unstick(void);              // runtime/kernel.c
 
 // Function names of our own executable: the PE's COFF symbol table (lld keeps it next to the DWARF), read once from
 // the file on the first dump. Without it the frames stay "eowrecomp+offset".
