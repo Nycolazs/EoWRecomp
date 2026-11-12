@@ -455,6 +455,7 @@ static DWORD WINAPI watchdog_main(LPVOID unused) {
         if (!seen_frame) continue;  // startup / shader warm-up: not a hang
         still++;
         if (still == 10 || still == 40) watchdog_dump(still);  // a long level load also lands here, harmlessly
+        if (still == 12 && getenv("EOWRECOMP_UNSTICK")) kernel_unstick();  // experiment: see kernel_unstick()
     }
     return 0;
 }

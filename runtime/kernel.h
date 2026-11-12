@@ -63,5 +63,6 @@ uint32_t kernel_new_handle(KObject *o);
 void kernel_signal(KObject *o);  // caller holds g_klock
 KEvent *kernel_create_event_pair(uint32_t *writable, uint32_t *readable);
 KThread *kernel_current_thread(void);
+void kernel_unstick(void);       // EOWRECOMP_UNSTICK=1 experiment: spurious wake-up of every condvar waiter
 void kernel_dump_threads(void);  // hang watchdog: every guest thread's wait state to stderr
 uint64_t kernel_heap_size(void);  // bytes from HEAP_BASE set by SetHeapSize

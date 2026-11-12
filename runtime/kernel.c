@@ -522,6 +522,29 @@ out:
     return r;
 }
 
+// Experiment for the freeze (log 16e64c7c: the main thread waits for a job's condvar, every worker idle): wake every
+// condvar waiter as if it had been signalled. A condvar user must tolerate spurious wake-ups (it re-checks its
+// predicate), so: if the game then resumes, the predicate was true and a wake-up had been lost; if everything goes back to
+// sleep, the state itself says "nothing to do" (a job never queued / a counter wrong). Only with EOWRECOMP_UNSTICK=1.
+void kernel_unstick(void) {
+    pthread_mutex_lock(&g_klock);
+    int n = 0;
+    for (KThread *t = g_waitlist; t; t = t->wnext) {
+        if (t->wait_kind != WAIT_CONDVAR) continue;
+        n++;
+        t->wait_result = R_OK;
+        if (mutex_acquire_or_mark(t->wait_mutex, t->wait_tag)) {
+            t->wait_kind = WAIT_NONE;
+            wake(t);
+        } else {
+            t->wait_kind = WAIT_MUTEX;
+            t->wait_addr = t->wait_mutex;
+        }
+    }
+    fprintf(stderr, "*** unstick: %d condvar waiters woken spuriously\n", n);
+    pthread_mutex_unlock(&g_klock);
+}
+
 // Hang watchdog (runtime/platform/windows.c): who waits for what. A mutex word is owner handle | WAITERS_BIT, so a
 // WAIT_MUTEX / WAIT_CONDVAR line shows the thread that must release it; g_klock held for good would mean a thread died
 // or stuck inside the kernel itself.
