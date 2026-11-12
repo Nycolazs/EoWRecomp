@@ -301,6 +301,47 @@ void vk_full_barrier(VkCommandBuffer cb) {
 static void ring_retire(void);
 void vc_flush(void);
 
+// ---- EOWRECOMP_DRAW_PROBE=1 (with F9 / EOWRECOMP_DEBUG_FRAME): an occlusion query around every draw of the captured
+// frame; the next frame logs "[probe]" rows with the pixels each draw wrote (after depth / stencil / discard).
+// Invisible geometry that the game does draw (trees, grass) shows as big meshes with 0 samples.
+extern bool g_host_query_reset;
+enum { PROBE_MAX = 4096 };
+static VkQueryPool pb_qp;
+static int pb_n, pb_on = -1;
+static struct { uint64_t vs, fs, fsh; uint32_t count, inst; bool indexed; int vp[4]; } pb_row[PROBE_MAX];
+static bool probe_begin(VkCommandBuffer cb, uint64_t vs, uint64_t fs, uint32_t count, uint32_t inst, bool indexed, const float *vp) {
+    if (pb_on < 0) pb_on = getenv("EOWRECOMP_DRAW_PROBE") && g_host_query_reset;
+    if (!pb_on || !g_debug_frame || pb_n >= PROBE_MAX) return false;
+    if (!pb_qp) {
+        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION, .queryCount = PROBE_MAX};
+        if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &pb_qp) != VK_SUCCESS) { pb_on = 0; return false; }
+        vkResetQueryPool(g_vk.dev, pb_qp, 0, PROBE_MAX);
+    }
+    pb_row[pb_n].vs = vs; pb_row[pb_n].fs = fs; pb_row[pb_n].count = count; pb_row[pb_n].inst = inst; pb_row[pb_n].indexed = indexed;
+    for (int i = 0; i < 4; i++) pb_row[pb_n].vp[i] = (int)vp[i];
+    vkCmdBeginQuery(cb, pb_qp, (uint32_t)pb_n, VK_QUERY_CONTROL_PRECISE_BIT);
+    return true;
+}
+static void probe_end(VkCommandBuffer cb) { vkCmdEndQuery(cb, pb_qp, (uint32_t)pb_n); pb_n++; }
+void renderer_flush(void);
+void vk_probe_report(void) {
+    if (!pb_n) return;
+    renderer_flush();
+    static uint64_t res[PROBE_MAX];
+    if (vkGetQueryPoolResults(g_vk.dev, pb_qp, 0, (uint32_t)pb_n, sizeof res, res, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+        int zero = 0, big0 = 0;
+        for (int i = 0; i < pb_n; i++) {
+            LOG("[probe] #%d %s vs=%llx fs=%llx count %u inst %u vp %d %d %d %d -> %llu pixels\n", i, pb_row[i].indexed ? "e" : "a",
+                (unsigned long long)pb_row[i].vs, (unsigned long long)pb_row[i].fs, pb_row[i].count, pb_row[i].inst,
+                pb_row[i].vp[0], pb_row[i].vp[1], pb_row[i].vp[2], pb_row[i].vp[3], (unsigned long long)res[i]);
+            if (!res[i]) { zero++; if (pb_row[i].count >= 300) big0++; }
+        }
+        LOG("[probe] %d draws, %d wrote no pixel, %d of those with >= 300 vertices/indices\n", pb_n, zero, big0);
+    }
+    vkResetQueryPool(g_vk.dev, pb_qp, 0, PROBE_MAX);
+    pb_n = 0;
+}
+
 // ---- EOWRECOMP_GPUPROF_AT=<frame>: GPU time per pass / dispatch / copy of that frame, logged as "[gpuprof]".
 // A timestamp (ALL_COMMANDS: after everything before it) at each mark; a row = the work since the previous mark.
 bool g_gpuprof_frame;
@@ -3180,6 +3221,8 @@ static void draw_(CmdRec *r, bool indexed) {
     bool run_gold[MAX_RUNS];
     int nruns = 0;
     if (!nruns) { run_at[0] = 0; run_n[0] = inst; nruns = 1; run_gold[0] = false; }
+    float pvp[4] = {vp[0] * vp_sx + vp_ox, vp[1] * vp_sy + vp_oy, vp[2] * vp_sx, vp[3] * vp_sy};
+    bool probing = probe_begin(cb, st.program->stages[0].code_addr, st.program->stages[1].code_addr, (uint32_t)(use_index ? icount : count), inst, use_index, pvp);
     for (int ri = 0; ri < nruns; ri++) {
         if (nruns > 1 || run_gold[0]) {  // this run's tint: a fragment set of its own
             float rtint[8] = {0};
@@ -3189,6 +3232,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (!use_index) vkCmdDraw(cb, count, run_n[ri], first, base_inst + run_at[ri]);
         else vkCmdDrawIndexed(cb, icount, run_n[ri], 0, base_vertex, base_inst + run_at[ri]);
     }
+    if (probing) probe_end(cb);
     stat_draws++;
     cum_draws++;
     if (g_gpuprof_frame && gp_n) {
