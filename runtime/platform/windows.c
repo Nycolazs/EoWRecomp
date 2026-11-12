@@ -9,6 +9,7 @@
 #include <string.h>
 #include <shellapi.h>
 #include <timeapi.h>
+#include <tlhelp32.h>
 #include <io.h>
 
 #include "../platform.h"
@@ -302,12 +303,91 @@ static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS *ep) {
     rt_fault_report(what, fa, ep->ContextRecord->Rip, lr);
 }
 
+// ---- hang watchdog
+// 2026-11-11 (RX 580 report): the game froze "out of nowhere" with the music still playing (audio thread alive, game/render
+// thread stuck) and the log had nothing. When no frame is presented for a while, print every thread's host stack
+// (suspend all, copy the contexts, resume, then unwind: printing with a suspended thread that holds the stderr/heap lock
+// would deadlock). The frames show which wait the game is stuck in (a fence, a mutex, a driver call, a guest function).
+uint64_t renderer_present_count(void);  // runtime/nvn/vulkan/device.c
+
+static void print_frame(int i, uint64_t pc, uint64_t exe) {
+    uint64_t off = 0;
+    const char *s = plat_symbol(pc, &off);
+    if (!s) s = rt_host_fn_name(pc, &off);
+    if (s) fprintf(stderr, "  #%-2d %016llx %s+%llx\n", i, (unsigned long long)pc, s, (unsigned long long)off);
+    else fprintf(stderr, "  #%-2d %016llx eowrecomp+%llx\n", i, (unsigned long long)pc, (unsigned long long)(pc - exe));
+}
+
+static void watchdog_dump(unsigned secs) {
+    DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    enum { MAXT = 64 };
+    DWORD tids[MAXT];
+    CONTEXT ctx[MAXT];
+    int n = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te = {.dwSize = sizeof te};
+    for (BOOL ok = Thread32First(snap, &te); ok && n < MAXT; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+        HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!th) continue;
+        if (SuspendThread(th) != (DWORD)-1) {
+            memset(&ctx[n], 0, sizeof ctx[n]);
+            ctx[n].ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            if (GetThreadContext(th, &ctx[n])) tids[n++] = te.th32ThreadID;
+            ResumeThread(th);
+        }
+        CloseHandle(th);
+    }
+    CloseHandle(snap);
+    uint64_t exe = (uint64_t)(uintptr_t)GetModuleHandleA(NULL);
+    fprintf(stderr, "\n*** watchdog: no frame presented for %us, %d threads (frame %llu)\n", secs, n,
+            (unsigned long long)renderer_present_count());
+    for (int t = 0; t < n; t++) {
+        fprintf(stderr, "--- thread %lu\n", (unsigned long)tids[t]);
+        CONTEXT *c = &ctx[t];
+        for (int i = 0; i < 32 && c->Rip; i++) {
+            print_frame(i, c->Rip, exe);
+            DWORD64 base;
+            PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c->Rip, &base, NULL);
+            if (rf) {
+                PVOID hd = NULL;
+                DWORD64 ef = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c->Rip, rf, c, &hd, &ef, NULL);
+            } else {  // leaf function without unwind info: the return address is on top of the stack
+                MEMORY_BASIC_INFORMATION mi;
+                if (!VirtualQuery((void *)(uintptr_t)c->Rsp, &mi, sizeof mi) || mi.State != MEM_COMMIT) break;
+                c->Rip = *(DWORD64 *)(uintptr_t)c->Rsp;
+                c->Rsp += 8;
+            }
+        }
+    }
+    fflush(stderr);
+}
+
+static DWORD WINAPI watchdog_main(LPVOID unused) {
+    (void)unused;
+    uint64_t last = 0;
+    unsigned still = 0;
+    bool seen_frame = false;
+    for (;;) {
+        Sleep(1000);
+        uint64_t f = renderer_present_count();
+        if (f != last) { last = f; still = 0; seen_frame |= f > 0; continue; }
+        if (!seen_frame) continue;  // startup / shader warm-up: not a hang
+        still++;
+        if (still == 10 || still == 40) watchdog_dump(still);  // a long level load also lands here, harmlessly
+    }
+    return 0;
+}
+
 void plat_crash_handler_install(void) {
     ULONG guarantee = 64 << 10;  // room for the report after a stack overflow
     SetThreadStackGuarantee(&guarantee);
     if (g_report_crashes) return;
     g_report_crashes = true;
     SetUnhandledExceptionFilter(unhandled_filter);
+    if (!getenv("EOWRECOMP_NO_WATCHDOG")) CreateThread(NULL, 0, watchdog_main, NULL, 0, NULL);
 }
 
 // ---- POSIX shims (win_compat.h)
