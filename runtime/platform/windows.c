@@ -309,13 +309,89 @@ static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS *ep) {
 // (suspend all, copy the contexts, resume, then unwind: printing with a suspended thread that holds the stderr/heap lock
 // would deadlock). The frames show which wait the game is stuck in (a fence, a mutex, a driver call, a guest function).
 uint64_t renderer_present_count(void);  // runtime/nvn/vulkan/device.c
+void kernel_dump_threads(void);         // runtime/kernel.c
+
+// Function names of our own executable: the PE's COFF symbol table (lld keeps it next to the DWARF), read once from
+// the file on the first dump. Without it the frames stay "eowrecomp+offset".
+typedef struct { uint32_t rva; char name[56]; } CSym;
+static CSym *csyms;
+static size_t ncsyms;
+
+static int csym_cmp(const void *a, const void *b) {
+    uint32_t x = ((const CSym *)a)->rva, y = ((const CSym *)b)->rva;
+    return x < y ? -1 : x > y;
+}
+
+static void load_coff_syms(void) {
+    char path[MAX_PATH];
+    if (!GetModuleFileNameA(NULL, path, sizeof path)) return;
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    uint8_t hdr[24];
+    uint32_t pe = 0;
+    fseek(f, 0x3c, SEEK_SET);
+    if (fread(&pe, 4, 1, f) != 1 || fseek(f, pe, SEEK_SET) || fread(hdr, 1, 24, f) != 24 || memcmp(hdr, "PE\0\0", 4)) goto out;
+    uint16_t nsec, optsz;
+    uint32_t symptr, nsym;
+    memcpy(&nsec, hdr + 6, 2); memcpy(&symptr, hdr + 12, 4); memcpy(&nsym, hdr + 16, 4); memcpy(&optsz, hdr + 20, 2);
+    if (!symptr || !nsym || nsec > 96) goto out;
+    uint32_t secrva[96], secchar[96];
+    fseek(f, (long)pe + 24 + optsz, SEEK_SET);
+    for (int i = 0; i < nsec; i++) {
+        uint8_t sh[40];
+        if (fread(sh, 1, 40, f) != 40) goto out;
+        memcpy(&secrva[i], sh + 12, 4); memcpy(&secchar[i], sh + 36, 4);
+    }
+    uint8_t *syms = malloc((size_t)nsym * 18);
+    if (!syms) goto out;
+    fseek(f, (long)symptr, SEEK_SET);
+    if (fread(syms, 18, nsym, f) != nsym) { free(syms); goto out; }
+    uint32_t strsz = 0;
+    char *strs = NULL;
+    if (fread(&strsz, 4, 1, f) == 1 && strsz > 4 && strsz < (64u << 20)) {
+        strs = malloc(strsz);
+        if (strs) { memcpy(strs, &strsz, 4); if (fread(strs + 4, 1, strsz - 4, f) != strsz - 4) { free(strs); strs = NULL; } }
+    }
+    csyms = malloc(sizeof(CSym) * (nsym / 1 + 1));
+    for (uint32_t i = 0; csyms && i < nsym; i += 1 + syms[i * 18 + 17]) {
+        uint8_t *s = syms + (size_t)i * 18;
+        int16_t sec;
+        uint32_t val;
+        memcpy(&sec, s + 12, 2); memcpy(&val, s + 8, 4);
+        if (sec <= 0 || sec > nsec || !(secchar[sec - 1] & 0x20) || (s[16] != 2 && s[16] != 3)) continue;  // code symbols only
+        CSym *c = &csyms[ncsyms];
+        const char *nm = NULL;
+        char tmp[9] = {0};
+        if (!*(uint32_t *)s) { uint32_t off; memcpy(&off, s + 4, 4); if (strs && off < strsz) nm = strs + off; }
+        else { memcpy(tmp, s, 8); nm = tmp; }
+        if (!nm || nm[0] == '.') continue;
+        c->rva = secrva[sec - 1] + val;
+        snprintf(c->name, sizeof c->name, "%s", nm);
+        ncsyms++;
+    }
+    qsort(csyms, ncsyms, sizeof(CSym), csym_cmp);
+    free(strs);
+    free(syms);
+out:
+    fclose(f);
+}
+
+static const CSym *csym_find(uint32_t rva) {
+    size_t lo = 0, hi = ncsyms;
+    while (lo < hi) { size_t m = (lo + hi) / 2; if (csyms[m].rva <= rva) lo = m + 1; else hi = m; }
+    return lo ? &csyms[lo - 1] : NULL;
+}
 
 static void print_frame(int i, uint64_t pc, uint64_t exe) {
     uint64_t off = 0;
     const char *s = plat_symbol(pc, &off);
     if (!s) s = rt_host_fn_name(pc, &off);
     if (s) fprintf(stderr, "  #%-2d %016llx %s+%llx\n", i, (unsigned long long)pc, s, (unsigned long long)off);
-    else fprintf(stderr, "  #%-2d %016llx eowrecomp+%llx\n", i, (unsigned long long)pc, (unsigned long long)(pc - exe));
+    else {
+        const CSym *c = pc >= exe && pc - exe < 0x10000000 ? csym_find((uint32_t)(pc - exe)) : NULL;
+        if (c) fprintf(stderr, "  #%-2d %016llx %s+%x (eowrecomp+%llx)\n", i, (unsigned long long)pc, c->name, (unsigned)(pc - exe - c->rva), (unsigned long long)(pc - exe));
+        else fprintf(stderr, "  #%-2d %016llx eowrecomp+%llx\n", i, (unsigned long long)pc, (unsigned long long)(pc - exe));
+    }
 }
 
 static void watchdog_dump(unsigned secs) {
@@ -341,8 +417,10 @@ static void watchdog_dump(unsigned secs) {
     }
     CloseHandle(snap);
     uint64_t exe = (uint64_t)(uintptr_t)GetModuleHandleA(NULL);
+    if (!csyms) load_coff_syms();
     fprintf(stderr, "\n*** watchdog: no frame presented for %us, %d threads (frame %llu)\n", secs, n,
             (unsigned long long)renderer_present_count());
+    kernel_dump_threads();
     for (int t = 0; t < n; t++) {
         fprintf(stderr, "--- thread %lu\n", (unsigned long)tids[t]);
         CONTEXT *c = &ctx[t];

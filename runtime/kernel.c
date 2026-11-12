@@ -486,6 +486,9 @@ static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, in
         if (g_rt_unwind) { r = R_CANCELLED; goto out; }
         if (timeout == 0) { r = R_TIMEOUT; goto out; }
         t->in_sync_wait = true;
+        t->sync_n = count < 4 ? count : 4;
+        for (int i = 0; i < t->sync_n; i++) t->sync_h[i] = hs[i];
+        t->sync_timeout = timeout;
         t->snext = g_syncwaiters;
         g_syncwaiters = t;
         bool ok = kwait(timeout < 0 ? -1 : timeout, &ts);
@@ -497,6 +500,33 @@ static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, in
 out:
     pthread_mutex_unlock(&g_klock);
     return r;
+}
+
+// Hang watchdog (runtime/platform/windows.c): who waits for what. A mutex word is owner handle | WAITERS_BIT, so a
+// WAIT_MUTEX / WAIT_CONDVAR line shows the thread that must release it; g_klock held for good would mean a thread died
+// or stuck inside the kernel itself.
+void kernel_dump_threads(void) {
+    bool locked = false;
+    for (int i = 0; i < 200 && !locked; i++) {
+        locked = pthread_mutex_trylock(&g_klock) == 0;
+        if (!locked) plat_sleep_until_ns(plat_now_ns() + 5000000);
+    }
+    fprintf(stderr, "--- kernel threads (g_klock %s)\n", locked ? "free" : "HELD for 1s: a thread is stuck inside the kernel");
+    static const char *kinds[] = {"-", "MUTEX", "CONDVAR", "ARBITER"};
+    for (KThread *t = g_threads; t; t = t->anext) {
+        if (!t->started || t->finished) continue;
+        fprintf(stderr, "  thread id %llu handle %#x prio %d entry %llx: %s", (unsigned long long)t->id, t->handle, t->prio,
+                (unsigned long long)t->entry, t->in_sync_wait ? "WaitSynchronization" : kinds[t->wait_kind]);
+        if (t->in_sync_wait) {
+            fprintf(stderr, " timeout %lld handles", (long long)t->sync_timeout);
+            for (int i = 0; i < t->sync_n; i++) fprintf(stderr, " %#x", t->sync_h[i]);
+        } else if (t->wait_kind != WAIT_NONE) {
+            fprintf(stderr, " addr %llx = %#x", (unsigned long long)t->wait_addr, *u32p(t->wait_addr));
+            if (t->wait_kind == WAIT_CONDVAR) fprintf(stderr, " (mutex %llx = %#x)", (unsigned long long)t->wait_mutex, *u32p(t->wait_mutex));
+        }
+        fputc('\n', stderr);
+    }
+    if (locked) pthread_mutex_unlock(&g_klock);
 }
 
 // ------------------------------------------------------------------ debug output

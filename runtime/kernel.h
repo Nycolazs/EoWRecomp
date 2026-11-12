@@ -26,6 +26,7 @@ struct KThread {
     uint32_t handle;
     int prio, core;
     bool cancel, in_sync_wait;
+    uint32_t sync_h[4]; int sync_n; int64_t sync_timeout;  // WaitSynchronization in progress (watchdog dump)
     // wait state (protected by g_klock)
     WaitKind wait_kind;
     uint64_t wait_addr, wait_mutex;
@@ -61,4 +62,5 @@ uint32_t kernel_new_handle(KObject *o);
 void kernel_signal(KObject *o);  // caller holds g_klock
 KEvent *kernel_create_event_pair(uint32_t *writable, uint32_t *readable);
 KThread *kernel_current_thread(void);
+void kernel_dump_threads(void);  // hang watchdog: every guest thread's wait state to stderr
 uint64_t kernel_heap_size(void);  // bytes from HEAP_BASE set by SetHeapSize
