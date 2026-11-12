@@ -384,8 +384,8 @@ static const CSym *csym_find(uint32_t rva) {
 
 static void print_frame(int i, uint64_t pc, uint64_t exe) {
     uint64_t off = 0;
-    const char *s = plat_symbol(pc, &off);
-    if (!s) s = rt_host_fn_name(pc, &off);
+    const char *s = rt_host_fn_name(pc, &off);  // game functions first (f_<guest addr>): they live in eowgame.dll
+    if (!s) s = plat_symbol(pc, &off);
     if (s) fprintf(stderr, "  #%-2d %016llx %s+%llx\n", i, (unsigned long long)pc, s, (unsigned long long)off);
     else {
         const CSym *c = pc >= exe && pc - exe < 0x10000000 ? csym_find((uint32_t)(pc - exe)) : NULL;

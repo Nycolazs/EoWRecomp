@@ -325,6 +325,19 @@ static uint32_t block_current(int64_t timeout_ns) {
     return t->wait_result;
 }
 
+// Ring of the last mutex / condvar kernel events (caller holds g_klock), printed by the hang watchdog: the order of
+// WaitProcessWideKey / SignalProcessWideKey around a stuck wait shows a lost wake-up (a signal that found no waiter just
+// before the waiter arrived, a signal that woke the wrong thread, ...).
+typedef struct { uint64_t ms; uint32_t tid; char op; int32_t arg; uint64_t addr; int woken; } KEv;
+static KEv g_kev[512];
+static uint64_t g_kev_n;
+static void kev_add(char op, uint64_t addr, int32_t arg, int woken) {
+    KEv *e = &g_kev[g_kev_n++ & 511];
+    e->ms = plat_now_ns() / 1000000;
+    e->tid = t_cur ? (uint32_t)t_cur->id : 0;
+    e->op = op; e->addr = addr; e->arg = arg; e->woken = woken;
+}
+
 static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) {
     pthread_mutex_lock(&g_klock);
     uint32_t v = __atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
@@ -336,7 +349,9 @@ static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) 
     t->wait_kind = WAIT_MUTEX;
     t->wait_addr = addr;
     t->wait_tag = tag;
+    kev_add('L', addr, (int32_t)v, 0);
     uint32_t r = block_current(-1);
+    kev_add('l', addr, (int32_t)r, 0);
     pthread_mutex_unlock(&g_klock);
     return r == R_CANCELLED ? R_OK : r;
 }
@@ -344,6 +359,7 @@ static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) 
 static uint32_t svc_arbitrate_unlock(uint64_t addr) {
     pthread_mutex_lock(&g_klock);
     mutex_release(addr);
+    kev_add('U', addr, (int32_t)*u32p(addr), 0);
     pthread_mutex_unlock(&g_klock);
     return R_OK;
 }
@@ -357,7 +373,9 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
     t->wait_mutex = mutex;
     t->wait_tag = tag;
     __atomic_store_n(u32p(key), 1, __ATOMIC_SEQ_CST);
+    kev_add('W', key, (int32_t)(timeout < 0 ? -1 : timeout / 1000000), 0);
     uint32_t r = block_current(timeout);
+    kev_add('w', key, (int32_t)r, 0);
     // Timed out / cancelled: the mutex is NOT held - as on Horizon (Atmosphere KConditionVariable::Wait; libnx
     // condvarWaitTimeout: "On timeout, we need to acquire it manually"). The SDK takes it again itself
     // (nn::os InternalConditionVariableImplByHorizon::TimedWait -> InternalCriticalSection::Enter). Taking it here
@@ -391,6 +409,7 @@ static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
     for (KThread *t = g_waitlist; t; t = t->wnext)
         if (t->wait_kind == WAIT_CONDVAR && t->wait_addr == key) any_left = true;
     if (!any_left) __atomic_store_n(u32p(key), 0, __ATOMIC_SEQ_CST);
+    kev_add('S', key, count, woken);
     pthread_mutex_unlock(&g_klock);
 }
 
@@ -525,6 +544,14 @@ void kernel_dump_threads(void) {
             if (t->wait_kind == WAIT_CONDVAR) fprintf(stderr, " (mutex %llx = %#x)", (unsigned long long)t->wait_mutex, *u32p(t->wait_mutex));
         }
         fputc('\n', stderr);
+    }
+    if (locked) {
+        fprintf(stderr, "--- last kernel mutex/condvar events (W/w wait enter/return, S signal key count -> woken, L/l lock wait, U unlock; ms)\n");
+        uint64_t n = g_kev_n, from = n > 160 ? n - 160 : 0;
+        for (uint64_t i = from; i < n; i++) {
+            KEv *e = &g_kev[i & 511];
+            fprintf(stderr, "  %llu t%u %c %llx arg %d woken %d\n", (unsigned long long)e->ms, e->tid, e->op, (unsigned long long)e->addr, e->arg, e->woken);
+        }
     }
     if (locked) pthread_mutex_unlock(&g_klock);
 }
