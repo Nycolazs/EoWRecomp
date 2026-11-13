@@ -31,50 +31,41 @@ EoWRecomp translates the game's ARM64 machine code into C ahead of time and reco
 ## Windows progress
 
 <details open>
-<summary><b>Verified on Windows — Radeon RX 580</b></summary>
+<summary><b>Windows x64 — Radeon RX 580 / Vulkan</b></summary>
 
-The Windows build has moved beyond simply opening the application. The game code is generated and compiled locally, the runtime loads the game modules, reads the RomFS directly from the XCI package, initializes Vulkan and audio, and reaches in-game rendering.
+The Windows build now reaches in-game rendering. The game code is generated and compiled locally, the runtime loads the game modules, reads RomFS directly from the user's XCI package, and initializes Vulkan and audio.
 
 | Area | Current result |
 |---|---|
-| Windows x64 build | Build and packaging workflow available through GitHub Actions |
-| Game setup | XCI and `prod.keys` detected successfully |
-| Game code | 4 modules generated; 296,677 functions compiled into `eowgame.dll` |
+| Windows x64 | GitHub Actions build and ZIP packaging available |
+| Game setup | XCI and user's `prod.keys` detected |
+| Game code | 4 modules; 296,677 functions compiled into `eowgame.dll` |
 | Runtime | All 4 modules load; SDK boot succeeds |
 | Game data | RomFS read directly from XCI — 10,963 files |
-| Graphics | Vulkan swapchain at 1280×720 |
-| Performance | **52 FPS** in the user capture, in **Hyrule Castle Town** (Windows 10, RX 580) |
-| Compute shaders | **SUST storage-image path working; 0 compute dispatches skipped** in the latest test |
-| Audio and input | Audren initializes; XInput detected |
+| Graphics | Vulkan; tested swapchain at 1280×720 |
+| Performance | **52 FPS** in the available Windows capture at **Hyrule Castle Town** (Xeon E5-2650 v4, RX 580 8 GB, 16 GB RAM). This is a test observation, not a guaranteed benchmark. |
+| Compute | SUST storage-image support and compute dispatch handling have been implemented; continued validation is in progress. |
 
-### Graphics work completed
+### Recent graphics and runtime progress
 
-- Fixed a Windows/Radeon pipeline-build bottleneck caused by BRX shader translation generating an unnecessarily large GLSL dispatcher. The translator now labels only actual jump-table targets.
-- Added support for Maxwell **SUST** compute image stores and Vulkan storage-image binding.
-- Corrected SUST image-handle lookup for driver handle tables in constant-buffer banks 0 and 2.
-- Updated storage-image views to respect each handle's mip level and array layer.
-- Fixed Windows screenshot/debug output so the destination directory is created when it does not exist.
-- Added diagnostics for vertex streams and vertex-shader constant buffers to investigate remaining character-skinning issues.
+- Implemented `nvnCommandBufferClearBuffer` using Vulkan buffer clearing for guest heap buffers. This addresses GPU-culling counters/indirect arguments that were not being reset between frames.
+- Added execution of `DrawElementsIndirect`, `DrawArraysIndirect` and `DispatchComputeIndirect`, which the game uses for GPU-driven vegetation such as trees and grass.
+- Added periodic diagnostics for indirect draw/dispatch counts, zero-instance draws and flushes.
+- Corrected Maxwell lane operations for AMD wave64 GPUs: real lane IDs and lane masks, with ballot/vote/shuffle operations kept in 32-lane groups to match the Switch GPU's warp behavior. This is particularly relevant to the RX 580 (GCN).
+- Improved the Windows watchdog and kernel synchronization handling to help diagnose and mitigate intermittent stalls.
 
-### Known issues
+**Validation note:** GitHub Actions runs for these recent changes completed successfully, but that confirms compilation and automated checks only. Vegetation rendering, frame pacing and freeze behavior still require confirmation in a real game session on Windows/Radeon.
 
-- Link and Zelda can still appear stretched during gameplay; some cutscenes render normally.
-- Heart containers and some HUD elements still have incorrect colors/alpha.
-- Some visual effects and rendering details remain unfinished.
-- The latest SUST view change and some diagnostic paths still need further validation in-game.
+### Known issues and work in progress
 
-These results are being tracked in the detailed [development status](docs/STATUS.md), including test observations, logs, open bugs and next steps.
+- Character skinning and some models can still appear stretched.
+- Some HUD elements, heart transparency/colors and visual effects may still be incorrect.
+- GPU-driven vegetation and the latest indirect-draw path need in-game verification.
+- Intermittent stalls are being investigated; the watchdog is a mitigation, not a confirmed root-cause fix.
+
+See [docs/STATUS.md](docs/STATUS.md) for the detailed technical log, test observations, logs, open bugs and next steps.
 
 </details>
-
-## Screenshots
-
-The screenshots currently in the repository document earlier Linux/Vulkan test sessions; they are not presented as captures of the latest Windows build.
-
-| | |
-|---|---|
-| ![Opening scene](docs/screenshots/01_prologue.jpg) | ![Opening fight](docs/screenshots/02_prologue_fight.jpg) |
-| ![First controllable scene](docs/screenshots/03_corridor_hud.jpg) | ![Input and button prompts](docs/screenshots/04_room_prompts.jpg) |
 
 ## Windows build
 
@@ -95,6 +86,16 @@ For build details, see the scripts under `tools/windows/` and the workflow at `.
 - **Graphics**: reimplements NVN on Vulkan and translates Maxwell GPU shaders to GLSL.
 - **Game package reader** (`runtime/nxpkg.c`): reads NSP/XCI/NCA packages using the user's keys. The RomFS can be read directly from the package instead of requiring a second multi-gigabyte copy.
 
+## Latest development updates
+
+The latest Windows/Vulkan work focuses on restoring GPU-driven vegetation and improving AMD compatibility:
+
+- **Indirect GPU commands:** clear-buffer, indirect draw and indirect compute command handling.
+- **AMD wave64 compatibility:** lane ID/mask and 32-lane ballot/vote/shuffle semantics for GCN GPUs.
+- **Diagnostics and stability:** indirect-draw statistics and watchdog improvements for intermittent stalls.
+
+The corresponding GitHub Actions builds (#62–#66) completed successfully. These results do not replace in-game testing; the rendering and stability changes are still awaiting confirmation on the target PC.
+
 ## Development status
 
 See **[docs/STATUS.md](docs/STATUS.md)** for the detailed technical log:
@@ -105,7 +106,8 @@ See **[docs/STATUS.md](docs/STATUS.md)** for the detailed technical log:
 
 ## Credits
 
-- **[EoWRecomp original project](https://github.com/Nycolazs/EoWRecomp)** by **Nycolazs** — original project and foundation this fork builds upon.\n- **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai and contributors — the foundation for the recompiler, runtime, NVN implementation, Maxwell shader translator and Vulkan renderer.
+- **[EoWRecomp original project](https://github.com/Nycolazs/EoWRecomp)** by **Nycolazs** — original project and foundation this fork builds upon.
+- **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai and contributors — the foundation for the recompiler, runtime, NVN implementation, Maxwell shader translator and Vulkan renderer.
 - [SDL 3](https://libsdl.org), [FFmpeg](https://ffmpeg.org), [Dear ImGui](https://github.com/ocornut/imgui), [Vulkan](https://www.vulkan.org), [volk](https://github.com/zeux/volk), [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator), [shaderc](https://github.com/google/shaderc), [SMAA](https://github.com/iryoku/smaa) and [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR).
 - Documentation and research references: [Switchbrew](https://switchbrew.org), [envytools](https://github.com/envytools/envytools), and the instruction decoders of Ryujinx and yuzu.
 
