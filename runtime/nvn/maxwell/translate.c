@@ -1437,7 +1437,26 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         case 0x25: set_reg(c, d, "ctaid.x"); break;
         case 0x26: set_reg(c, d, "ctaid.y"); break;
         case 0x27: set_reg(c, d, "ctaid.z"); break;
-        case 0x00: set_reg(c, d, "0u"); break;
+        // lane id and lane masks: the game's compaction idiom (ballot, elect the highest active lane, atomicAdd the count,
+        // shuffle it back, popcount(lanemask_lt & ballot) as the lane's slot) needs them real - with 0 the leader never
+        // matched, the counter stayed 0 and every culled vegetation draw got instanceCount 0 (trees vanished).
+        // The game's warps are 32 lanes; Vulkan wave64 GPUs (GCN) are handled by the mw_* helpers of the prelude.
+        case 0x00: case 0x38: case 0x39: case 0x3a: case 0x3b: case 0x3c:
+            if (c->stage == STAGE_VERTEX) { set_reg(c, d, "0u"); break; }  // (no SIMD-group functions in vertex functions)
+            if (!c->glsl) c->uses_lane = true;
+            {
+                const char *L = c->glsl ? "mw_lane()" : "lane";
+                switch (sr) {
+                case 0x00: strcpy(t, L); break;
+                case 0x38: sprintf(t, "(1u << %s)", L); break;
+                case 0x39: sprintf(t, "((1u << %s) - 1u)", L); break;
+                case 0x3a: sprintf(t, "((2u << %s) - 1u)", L); break;
+                case 0x3b: sprintf(t, "(~((2u << %s) - 1u))", L); break;
+                default: sprintf(t, "(~((1u << %s) - 1u))", L);
+                }
+            }
+            set_reg(c, d, t);
+            break;
         default: sprintf(t, "0u /* sr %#x */", sr); set_reg(c, d, t);
         }
     } else if (OPM(0x5c30000000000000ull, 0xfff8000000000000ull) || OPM(0x4c30000000000000ull, 0xfff8000000000000ull) ||
@@ -1670,7 +1689,10 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             set_reg(c, d, R(a));  // no SIMD-group functions in vertex functions: lane-local value
         } else if (c->glsl) {  // a quad xor (lane mask < 4) is the subgroup xor within the quad
             static const char *const fn[] = {"subgroupShuffle", "subgroupShuffleUp", "subgroupShuffleDown", "subgroupShuffleXor"};
-            sprintf(t, "%s(%s, uint(%s))", fn[mode], R(a), bv);
+            // (shfl, up, down, bfly) within the 32-lane half of the subgroup: wave64 GPUs run two warps per subgroup
+            static const char *const h[] = {"mw_shfl", "mw_shfl_up", "mw_shfl_down", "mw_shfl_xor"};
+            (void)fn;
+            sprintf(t, "%s(%s, uint(%s))", h[mode], R(a), bv);
             set_reg(c, d, t);
         } else if (mode == 3) {
             bool quad = bits(w, 28, 1) && bits(w, 20, 5) < 4;
@@ -1696,13 +1718,14 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         // Echoes of Wisdom's 50d9e3800007000e: VOTE.ANY R14, PT, PT (R14 = the active lanes).
         int mode = (int)bits(w, 48, 2), vp = (int)bits(w, 45, 3);
         if (mode > 2) fail(c, "vote mode %d", mode);
-        static const char *const gl[] = {"subgroupAll(vp_)", "subgroupAny(vp_)", "subgroupAllEqual(vp_)"};
+        static const char *const gl[] = {"(mw_ballot(vp_) == mw_ballot(true))", "(mw_ballot(vp_) != 0u)",
+                                            "(mw_ballot(vp_) == 0u || mw_ballot(vp_) == mw_ballot(true))"};
         static const char *const ms[] = {"simd_all(vp_)", "simd_any(vp_)", "(simd_all(vp_) || !simd_any(vp_))"};
         bool lane = c->stage == STAGE_VERTEX;  // (no subgroup operations in vertex functions: this lane's own vote)
         sp(&c->body, "    { bool vp_ = %s;\n", P((int)bits(w, 39, 3), bits(w, 42, 1)));
         if (d != RZ) {
             c->reg_used[d] = 1;
-            sp(&c->body, "      r%d = %s;\n", d, lane ? "(vp_ ? 1u : 0u)" : c->glsl ? "subgroupBallot(vp_).x" : "uint(uint64_t(simd_ballot(vp_)))");
+            sp(&c->body, "      r%d = %s;\n", d, lane ? "(vp_ ? 1u : 0u)" : c->glsl ? "mw_ballot(vp_)" : "uint(uint64_t(simd_ballot(vp_)))");
         }
         if (vp != PT) {
             c->pred_used[vp] = 1;
@@ -2026,6 +2049,15 @@ static const char glsl_prelude[] =
     "float mw_fmin(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : min(a, b)); }\n"
     "float mw_fmax(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : max(a, b)); }\n"
     "uint mw_clz(uint v) { return v == 0u ? 32u : uint(31 - findMSB(v)); }\n"
+    // Maxwell warps are 32 lanes; on a wave64 GPU (GCN) a subgroup holds two of them: lane id, ballots and shuffles
+    // stay inside this lane's 32-lane half
+    "uint mw_lane() { return gl_SubgroupInvocationID & 31u; }\n"
+    "uint mw_ballot(bool b) { uvec4 v = subgroupBallot(b); return gl_SubgroupInvocationID >= 32u ? v.y : v.x; }\n"
+    "uint mw_base() { return gl_SubgroupInvocationID & ~31u; }\n"
+    "uint mw_shfl(uint v, uint i) { return subgroupShuffle(v, mw_base() + (i & 31u)); }\n"
+    "uint mw_shfl_xor(uint v, uint m) { return subgroupShuffle(v, gl_SubgroupInvocationID ^ (m & 31u)); }\n"
+    "uint mw_shfl_up(uint v, uint d) { uint l = mw_lane(); return subgroupShuffle(v, l >= d ? gl_SubgroupInvocationID - d : gl_SubgroupInvocationID); }\n"
+    "uint mw_shfl_down(uint v, uint d) { uint l = mw_lane(); return subgroupShuffle(v, l + d < 32u ? gl_SubgroupInvocationID + d : gl_SubgroupInvocationID); }\n"
     "uint mw_popcount(uint v) { return uint(bitCount(v)); }\n"
     "uint mw_mulhi(uint a, uint b) { uint hi, lo; umulExtended(a, b, hi, lo); return hi; }\n"
     "int mw_mulhi(int a, int b) { int hi, lo; imulExtended(a, b, hi, lo); return hi; }\n"
