@@ -2699,6 +2699,13 @@ static CsProg *compute_program(NvnProgram *np) {
     return cp;
 }
 
+static uint64_t ind_n, ind_zero, ind_inst, ind_idx, ind_flushes;  // indirect draws since the last stat line (vk_indirect_stats)
+static bool ind_flush_pending;
+void vk_indirect_stats(char *buf, size_t size) {
+    snprintf(buf, size, "indirect: %llu draws, %llu with 0 instances, %llu instances, %llu indices, %llu flushes", (unsigned long long)ind_n,
+             (unsigned long long)ind_zero, (unsigned long long)ind_inst, (unsigned long long)ind_idx, (unsigned long long)ind_flushes);
+    ind_n = ind_zero = ind_inst = ind_idx = ind_flushes = 0;
+}
 static bool ind_dirty;  // a compute dispatch was recorded since the last flush: indirect arguments may still be unwritten
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
@@ -4143,8 +4150,13 @@ static void exec_list(uint64_t handle, int depth) {
             // wrote them is done (a flush only if a dispatch ran since the last one), then this is an ordinary draw.
             uint64_t ia = r->op == CMD_DRAW_ELEMENTS_INDIRECT ? r->x[3] : r->op == CMD_DRAW_ARRAYS_INDIRECT ? r->x[1] : r->x[0];
             if (!ia) break;
-            if (ind_dirty) { wait_why = "indirect draw arguments"; renderer_flush(); ind_dirty = false; }
+            if (ind_dirty) { wait_why = "indirect draw arguments"; renderer_flush(); ind_dirty = false; ind_flush_pending = true; }
             const uint32_t *a = (const uint32_t *)(uintptr_t)ia;
+            ind_n++;
+            if (r->op != CMD_DISPATCH_INDIRECT) {
+                if (!a[1]) ind_zero++; else { ind_inst += a[1]; ind_idx += (uint64_t)a[0] * a[1]; }
+                if (ind_flush_pending) { ind_flushes++; ind_flush_pending = false; }
+            }
             static unsigned n_ind;
             if (n_ind++ < 4) LOG("[nvn] indirect %s: args %u %u %u %u %u\n", r->op == CMD_DRAW_ELEMENTS_INDIRECT ? "elements" : r->op == CMD_DRAW_ARRAYS_INDIRECT ? "arrays" : "dispatch", a[0], a[1], a[2], a[3], a[4]);
             if (r->op == CMD_DISPATCH_INDIRECT) { dispatch_compute(a[0], a[1], a[2]); break; }

@@ -736,6 +736,7 @@ void backend_present(NvnTexture *t) {
         if (last_fps_time > 0)
             LOG("[vk] t=%.1f frame %llu %.1f fps max %.0fms level %s (%s)\n", now, (unsigned long long)total_frames,
                 frames / (now - last_fps_time), max_gap * 1000.0, game_level_name(), renderer_stats());
+        if (last_fps_time > 0) { extern void vk_indirect_stats(char *buf, size_t size); char is[200]; vk_indirect_stats(is, sizeof is); LOG("[vk] %s\n", is); }
         {   // (every ~10 s: what the shader translator and the compile workers are doing: a stuck one shows its busy time)
             extern void vk_jobs_status(char *buf, size_t size);
             static int jobs_n;
