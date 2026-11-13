@@ -473,7 +473,17 @@ static DWORD WINAPI watchdog_main(LPVOID unused) {
         if (!seen_frame) continue;  // startup / shader warm-up: not a hang
         still++;
         if (still == 10 || still == 40) watchdog_dump(still);  // a long level load also lands here, harmlessly
-        if (still == 12 && getenv("EOWRECOMP_UNSTICK")) kernel_unstick();  // experiment: see kernel_unstick()
+        // The random freeze (every dump: the game's main thread waits on a condvar, the pool workers woke, found no work and
+        // went back to sleep) ends as soon as every condvar waiter is woken once - 17 of 17 times in log 48fa140d. Until the
+        // cause is found (the kernel's wake order was not it), do that automatically after 3 s without a frame, then every
+        // 3 s while it lasts. A correct guest re-checks its condition after a wait, so a stray wake is harmless; a long load
+        // or a shader compile stall just gets one too. EOWRECOMP_NO_UNSTICK=1 turns it off.
+        static int no_unstick = -1;
+        if (no_unstick < 0) no_unstick = getenv("EOWRECOMP_NO_UNSTICK") != NULL;
+        if (!no_unstick && still >= 3 && still % 3 == 0) {
+            if (still == 3) kernel_dump_threads();  // the wait state of every guest thread, for the log
+            kernel_unstick();
+        }
     }
     return 0;
 }
