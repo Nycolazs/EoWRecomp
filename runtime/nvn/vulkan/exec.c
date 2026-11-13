@@ -4116,6 +4116,27 @@ static void exec_list(uint64_t handle, int depth) {
             }
             break;
         case CMD_DISPATCH: ind_dirty = true; dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
+        case CMD_CLEAR_BUFFER: {  // nvnCommandBufferClearBuffer(addr, size, value): the GPU-culling counters / draw arguments
+            // are zeroed with it before the compute shaders fill them. Never executed before: the counters kept growing, so
+            // the vegetation showed on the first frame and then vanished.
+            uint64_t a = r->x[0], n = r->x[1];
+            uint32_t v = (uint32_t)r->x[2];
+            if (!a || !n) break;
+            VkBuffer gb; VkDeviceSize go;
+            if (!(a & 3) && !(n & 3) && guest_live(a, n, &gb, &go)) {
+                vk_end_pass();
+                VkCommandBuffer cb = vk_cmd();
+                vk_full_barrier(cb);
+                vkCmdFillBuffer(cb, gb, go, n, v);
+                vk_full_barrier(cb);
+                if (a - HEAP_BASE < HEAP_MAX) vc_mark_gpu(a - HEAP_BASE, a - HEAP_BASE + n);
+            } else {
+                wait_why = "ClearBuffer (unaligned / not in the heap)";
+                renderer_flush();
+                for (uint64_t i = 0; i < n; i++) ((uint8_t *)(uintptr_t)a)[i] = (uint8_t)(v >> ((i & 3) * 8));
+            }
+            break;
+        }
         case CMD_DRAW_ARRAYS_INDIRECT: case CMD_DRAW_ELEMENTS_INDIRECT: case CMD_DISPATCH_INDIRECT: {
             // The GPU decides what is drawn: the arguments sit in a buffer a compute shader fills (the game's vegetation:
             // trees and grass are GPU-culled instance lists). The arguments are read on the CPU once the GPU work that
