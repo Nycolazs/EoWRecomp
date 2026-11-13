@@ -4115,6 +4115,19 @@ static void exec_list(uint64_t handle, int depth) {
             }
             break;
         case CMD_DISPATCH: dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
+        case CMD_DRAW_ARRAYS_INDIRECT: case CMD_DRAW_ELEMENTS_INDIRECT: case CMD_DISPATCH_INDIRECT: {
+            // Not implemented: the draw / dispatch is dropped. Logged (first uses, then every 500th) to see whether the game
+            // depends on it (GPU-driven vegetation would vanish exactly like the missing trees and grass).
+            static unsigned n_ind[3];
+            int k = r->op == CMD_DRAW_ARRAYS_INDIRECT ? 0 : r->op == CMD_DRAW_ELEMENTS_INDIRECT ? 1 : 2;
+            if (n_ind[k]++ < 8 || n_ind[k] % 500 == 0)
+                LOG("[nvn] IGNORED %s #%u: x0 %#llx x1 %#llx x2 %#llx x3 %#llx x4 %#llx (rt %dx%d)\n",
+                    k == 0 ? "DrawArraysIndirect" : k == 1 ? "DrawElementsIndirect" : "DispatchComputeIndirect", n_ind[k],
+                    (unsigned long long)r->x[0], (unsigned long long)r->x[1], (unsigned long long)r->x[2], (unsigned long long)r->x[3],
+                    (unsigned long long)r->x[4], st.rt.ncolor && st.rt.color[0] ? (int)st.rt.color[0]->width : 0,
+                    st.rt.ncolor && st.rt.color[0] ? (int)st.rt.color[0]->height : 0);
+            break;
+        }
         case CMD_DRAW_ARRAYS: draw(r, false); break;
         case CMD_DRAW_ELEMENTS: draw(r, true); break;
         case CMD_UPDATE_UNIFORM_BUFFER:
