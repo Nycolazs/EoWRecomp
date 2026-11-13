@@ -32,8 +32,17 @@ static bool lazy_commit(uint64_t a) {
 
 static bool g_report_crashes;
 
+// The hang watchdog walks other threads' stacks from copied contexts (watchdog_dump); one stopped inside generated code
+// or mid-syscall can have unwind data that RtlVirtualUnwind chokes on (log 48fa140d: c0000005 at 0x107c0 inside ntdll,
+// on the watchdog thread, ended the whole process). A fault while g_wd_walk is set aborts just that thread's walk.
+#include <setjmp.h>
+static jmp_buf g_wd_jmp;
+static volatile LONG g_wd_walk;
+static volatile DWORD g_wd_tid;
+
 static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *ep) {
     EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (g_wd_walk && GetCurrentThreadId() == g_wd_tid && er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) longjmp(g_wd_jmp, 1);
     if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
     uint64_t fa = er->ExceptionInformation[1];
     if (lazy_commit(fa)) return EXCEPTION_CONTINUE_EXECUTION;
@@ -425,6 +434,13 @@ static void watchdog_dump(unsigned secs) {
     for (int t = 0; t < n; t++) {
         fprintf(stderr, "--- thread %lu\n", (unsigned long)tids[t]);
         CONTEXT *c = &ctx[t];
+        g_wd_tid = GetCurrentThreadId();
+        if (setjmp(g_wd_jmp)) {  // the walk faulted (see vectored_handler): this thread's trace ends here
+            g_wd_walk = 0;
+            fprintf(stderr, "  (stack walk aborted: fault in the unwinder)\n");
+            continue;
+        }
+        g_wd_walk = 1;
         for (int i = 0; i < 32 && c->Rip; i++) {
             print_frame(i, c->Rip, exe);
             DWORD64 base;
@@ -440,6 +456,7 @@ static void watchdog_dump(unsigned secs) {
                 c->Rsp += 8;
             }
         }
+        g_wd_walk = 0;
     }
     fflush(stderr);
 }
