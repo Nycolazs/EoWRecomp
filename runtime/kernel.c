@@ -275,7 +275,7 @@ static void mutex_release(uint64_t addr) {
     int count = 0;
     for (KThread *t = g_waitlist; t; t = t->wnext) {
         if (t->wait_kind == WAIT_MUTEX && t->wait_addr == addr) {
-            if (!next || t->prio < next->prio) next = t;
+            if (!next || t->prio <= next->prio) next = t;  // g_waitlist is newest-first: <= settles ties on the oldest waiter (FIFO)
             count++;
         }
     }
@@ -392,8 +392,13 @@ static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
     for (;;) {
         if (count > 0 && woken >= count) break;
         KThread *best = NULL;
+        // Horizon wakes by priority and, among equal priorities, the longest waiter first (Atmosphere keeps the waiters in
+        // a tree ordered by priority then arrival). g_waitlist is newest-first, so <= settles ties on the oldest. The
+        // newest-first pick woke the same two pool workers over and over (they found no work and went back to sleep)
+        // while the one the job was meant for starved - the game's main thread then waited for a job that never ran
+        // (the random freeze: EOWRECOMP_UNSTICK=1 woke every waiter and got the game going again).
         for (KThread *t = g_waitlist; t; t = t->wnext)
-            if (t->wait_kind == WAIT_CONDVAR && t->wait_addr == key && (!best || t->prio < best->prio)) best = t;
+            if (t->wait_kind == WAIT_CONDVAR && t->wait_addr == key && (!best || t->prio <= best->prio)) best = t;
         if (!best) break;
         woken++;
         // the woken thread must reacquire its mutex
@@ -439,14 +444,16 @@ static uint32_t svc_wait_for_address(uint64_t addr, uint32_t type, int32_t value
 
 static int arbiter_wake(uint64_t addr, int32_t count) {
     int woken = 0;
-    for (KThread *t = g_waitlist; t; t = t->wnext) {
+    for (;;) {  // by priority, then the longest waiter first (see svc_signal_process_wide_key)
         if (count > 0 && woken >= count) break;
-        if (t->wait_kind == WAIT_ARBITER && t->wait_addr == addr) {
-            t->wait_kind = WAIT_NONE;
-            t->wait_result = R_OK;
-            wake(t);
-            woken++;
-        }
+        KThread *best = NULL;
+        for (KThread *t = g_waitlist; t; t = t->wnext)
+            if (t->wait_kind == WAIT_ARBITER && t->wait_addr == addr && (!best || t->prio <= best->prio)) best = t;
+        if (!best) break;
+        best->wait_kind = WAIT_NONE;
+        best->wait_result = R_OK;
+        wake(best);
+        woken++;
     }
     return woken;
 }
