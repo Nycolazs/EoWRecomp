@@ -2864,6 +2864,19 @@ static void draw_(CmdRec *r, bool indexed) {
             }
         }
         for (int i = 0; i < nvskip; i++) if (last_vhash == vskip[i]) { SKIP(SKIP_LIST); return; }
+        // EOWRECOMP_SKIP_VSPROG=a1,a2,...: skip by vertex-shader address (the [draw] lines' "vs=..."). The hash above covers only the
+        // first 0x200 bytes, so every variant of the depth pre-pass shares one hash and the hunt for the pre-pass draw that writes
+        // the wrong depth around the rift portal (2026-11-13) cannot tell them apart.
+        static uint64_t pskip[32];
+        static int npskip = -1;
+        if (npskip < 0) {
+            npskip = 0;
+            for (const char *p = getenv("EOWRECOMP_SKIP_VSPROG"); p && *p && npskip < 32;) {
+                pskip[npskip++] = strtoull(p, (char **)&p, 16);
+                while (*p == ',') p++;
+            }
+        }
+        for (int i = 0; i < npskip; i++) if (vs == pskip[i]) { SKIP(SKIP_LIST); return; }
         g_cur_vs_hash = last_vhash;
         if (g_debug_frame && getenv("EOWRECOMP_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
