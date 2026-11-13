@@ -2699,6 +2699,7 @@ static CsProg *compute_program(NvnProgram *np) {
     return cp;
 }
 
+static bool ind_dirty;  // a compute dispatch was recorded since the last flush: indirect arguments may still be unwritten
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
@@ -4114,18 +4115,30 @@ static void exec_list(uint64_t handle, int depth) {
                 clear(-1, 0, NULL, 0, r->x[0] != 0, r->f[0], has_stencil && r->x[2] != 0, (uint32_t)r->x[1], (uint32_t)r->x[2]);
             }
             break;
-        case CMD_DISPATCH: dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
+        case CMD_DISPATCH: ind_dirty = true; dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
         case CMD_DRAW_ARRAYS_INDIRECT: case CMD_DRAW_ELEMENTS_INDIRECT: case CMD_DISPATCH_INDIRECT: {
-            // Not implemented: the draw / dispatch is dropped. Logged (first uses, then every 500th) to see whether the game
-            // depends on it (GPU-driven vegetation would vanish exactly like the missing trees and grass).
-            static unsigned n_ind[3];
-            int k = r->op == CMD_DRAW_ARRAYS_INDIRECT ? 0 : r->op == CMD_DRAW_ELEMENTS_INDIRECT ? 1 : 2;
-            if (n_ind[k]++ < 8 || n_ind[k] % 500 == 0)
-                LOG("[nvn] IGNORED %s #%u: x0 %#llx x1 %#llx x2 %#llx x3 %#llx x4 %#llx (rt %dx%d)\n",
-                    k == 0 ? "DrawArraysIndirect" : k == 1 ? "DrawElementsIndirect" : "DispatchComputeIndirect", n_ind[k],
-                    (unsigned long long)r->x[0], (unsigned long long)r->x[1], (unsigned long long)r->x[2], (unsigned long long)r->x[3],
-                    (unsigned long long)r->x[4], st.rt.ncolor && st.rt.color[0] ? (int)st.rt.color[0]->width : 0,
-                    st.rt.ncolor && st.rt.color[0] ? (int)st.rt.color[0]->height : 0);
+            // The GPU decides what is drawn: the arguments sit in a buffer a compute shader fills (the game's vegetation:
+            // trees and grass are GPU-culled instance lists). The arguments are read on the CPU once the GPU work that
+            // wrote them is done (a flush only if a dispatch ran since the last one), then this is an ordinary draw.
+            uint64_t ia = r->op == CMD_DRAW_ELEMENTS_INDIRECT ? r->x[3] : r->op == CMD_DRAW_ARRAYS_INDIRECT ? r->x[1] : r->x[0];
+            if (!ia) break;
+            if (ind_dirty) { wait_why = "indirect draw arguments"; renderer_flush(); ind_dirty = false; }
+            const uint32_t *a = (const uint32_t *)(uintptr_t)ia;
+            static unsigned n_ind;
+            if (n_ind++ < 4) LOG("[nvn] indirect %s: args %u %u %u %u %u\n", r->op == CMD_DRAW_ELEMENTS_INDIRECT ? "elements" : r->op == CMD_DRAW_ARRAYS_INDIRECT ? "arrays" : "dispatch", a[0], a[1], a[2], a[3], a[4]);
+            if (r->op == CMD_DISPATCH_INDIRECT) { dispatch_compute(a[0], a[1], a[2]); break; }
+            CmdRec d = *r;  // (draw() reads only the header fields)
+            if (r->op == CMD_DRAW_ELEMENTS_INDIRECT) {  // {count, instanceCount, firstIndex, baseVertex, baseInstance}
+                if (!a[0] || !a[1] || a[0] > (1u << 24) || a[1] > (1u << 20)) break;
+                uint32_t isz = r->x[1] == 0 ? 1 : r->x[1] == 1 ? 2 : 4;
+                d.x[2] = a[0]; d.x[3] = r->x[2] + (uint64_t)a[2] * isz; d.x[4] = (uint64_t)(int64_t)(int32_t)a[3];
+                d.x[5] = a[4]; d.x[6] = a[1];
+                draw(&d, true);
+            } else {  // {count, instanceCount, first, baseInstance}
+                if (!a[0] || !a[1] || a[0] > (1u << 24) || a[1] > (1u << 20)) break;
+                d.x[1] = a[2]; d.x[2] = a[0]; d.x[3] = a[3]; d.x[4] = a[1];
+                draw(&d, false);
+            }
             break;
         }
         case CMD_DRAW_ARRAYS: draw(r, false); break;
