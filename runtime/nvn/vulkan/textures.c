@@ -4,6 +4,7 @@
 #include <float.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -32,6 +33,15 @@ static VkFormat depth24_stencil8(void) {
         LOG("[vk] depth24 stencil8: %s\n", ok ? "D24_UNORM_S8_UINT" : "D32_SFLOAT_S8_UINT");
     }
     return f;
+}
+
+// NVN RGB565 (0x3A/0x3C) has R in the LOW bits, i.e. Vulkan B5G6R5. Found 2026-11-10 on the HUD hearts (fs 72d9aafe00): their
+// alpha is the R channel of a 38x38 RGB565 texture, and with R5G6B5 the hearts were an opaque rectangle; the user confirmed
+// EOWRECOMP_RGB565_BGR=1 fixed them. Now the default; EOWRECOMP_RGB565_RGB=1 restores the old order.
+static VkFormat rgb565_vk(void) {
+    static int rgb = -1;
+    if (rgb < 0) rgb = getenv("EOWRECOMP_RGB565_RGB") != NULL;
+    return rgb ? VK_FORMAT_R5G6B5_UNORM_PACK16 : VK_FORMAT_B5G6R5_UNORM_PACK16;
 }
 
 static VkFmt fmt_of(uint32_t f) {
@@ -82,9 +92,9 @@ static VkFmt fmt_of(uint32_t f) {
     case 0x37: return (VkFmt){VK_FORMAT_R8G8B8A8_SRGB, 0, 1};
     case 0x38: return (VkFmt){VK_FORMAT_R8G8B8A8_SRGB};
     case 0x39: return (VkFmt){VK_FORMAT_R4G4B4A4_UNORM_PACK16};   // Metal ABGR4Unorm
-    case 0x3A: return (VkFmt){VK_FORMAT_R5G6B5_UNORM_PACK16};     // Metal B5G6R5Unorm
+    case 0x3A: return (VkFmt){rgb565_vk()};                      // Metal B5G6R5Unorm
     case 0x3B: return (VkFmt){VK_FORMAT_R5G5B5A1_UNORM_PACK16};   // Metal A1BGR5Unorm
-    case 0x3C: return (VkFmt){VK_FORMAT_R5G6B5_UNORM_PACK16};
+    case 0x3C: return (VkFmt){rgb565_vk()};
     case 0x3D: return (VkFmt){VK_FORMAT_A2B10G10R10_UNORM_PACK32};
     case 0x3E: return (VkFmt){VK_FORMAT_A2B10G10R10_UINT_PACK32};
     case 0x3F: return (VkFmt){VK_FORMAT_B10G11R11_UFLOAT_PACK32};
@@ -172,7 +182,12 @@ uint64_t renderer_present_count(void);
 
 static bool tex_scalable(const NvnTexture *t) {
     if (getenv("EOWRECOMP_NO_SCALE")) return false;
-    if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < 32 || t->height < 16) return false;
+    // 2026-11-11: the light-cone pass (vs 72a46e1000) renders into a 128x72 RGBA8 map that later passes read as data; it is 16:9 and
+    // used to be scaled 2/3 like a screen buffer (85x48), and the bisect showed the stretched orange / blue "beams" come from it.
+    // Tiny maps are not screen buffers: only targets of at least EOWRECOMP_SCALE_MIN_W (default 160) pixels width are scaled.
+    static int min_w = -1;
+    if (min_w < 0) { const char *e = getenv("EOWRECOMP_SCALE_MIN_W"); min_w = e ? atoi(e) : 160; }
+    if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < (uint32_t)min_w || t->height < 16) return false;
     float a = (float)t->width / (float)t->height;
     return a > 1.74f && a < 1.81f;
 }
@@ -307,6 +322,10 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (depthfmt) usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     else if (format_supports(vf, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    // NVN_TEXTURE_FLAGS_IMAGE_BIT (0x4): the game uses it as a shader image (compute SUST). Only those get STORAGE usage:
+    // it costs compression (DCC) on AMD, so not every texture.
+    bool storage = !depthfmt && samples == 1 && (t->flags & 4) && format_supports(vf, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+    if (storage) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     VkImageCreateFlags flags = 0;
     if (!depthfmt) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // format views (NVN texture views, raw sRGB views)
     if (type == VK_IMAGE_TYPE_2D && layers >= 6 && tw == th && samples == 1) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
@@ -325,6 +344,7 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL));
         depthfmt = false;
     }
+    b->storage = storage && (ci.usage & VK_IMAGE_USAGE_STORAGE_BIT);  // (the fallback creation above drops it)
     b->format = vf;
     b->width = tw; b->height = th; b->depth = depth; b->layers = layers; b->levels = levels; b->samples = samples;
     b->aspect = depthfmt ? aspect_of(t->format) : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -547,6 +567,39 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, blocks, l.w, l.h, l.wb * 16);
                 VkSpan s = vk_transient((uint64_t)l.w * l.h * 4, 16);
                 astc_decode_ldr(blocks, l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb, s.ptr);
+                if (lv == 0 && layer == 0 && getenv("EOWRECOMP_DEBUG_DATA")) {
+                    // 2026-11-10: the HUD hearts (ASTC 4x4 sRGB, 0x87) show an opaque red background. Is the alpha already wrong in the
+                    // decoded texture (decoder), or right here and lost later (blend / fragment shader)? Alpha stats for every
+                    // CPU-decoded texture, plus a PNG of the first few 4x4 sRGB ones (RGB as decoded; alpha in the _alpha.png copy).
+                    static int nlog, ndump;
+                    const uint8_t *px = (const uint8_t *)s.ptr;
+                    uint64_t npx = (uint64_t)l.w * l.h, translucent = 0, clear = 0;
+                    uint8_t amin = 255, amax = 0;
+                    for (uint64_t i = 0; i < npx; i++) {
+                        uint8_t al = px[i * 4 + 3];
+                        if (al < amin) amin = al;
+                        if (al > amax) amax = al;
+                        if (al < 255) translucent++;
+                        if (al == 0) clear++;
+                    }
+                    if (nlog++ < 300)
+                        LOG("[astc] nvn fmt %#x %ux%u block %ux%u srgb %d: alpha min %u max %u, %llu of %llu texels < 255 (%llu fully clear)\n", t->format,
+                            l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb ? 1 : 0, amin, amax, (unsigned long long)translucent,
+                            (unsigned long long)npx, (unsigned long long)clear);
+                    if (t->format == 0x87 && l.w <= 1024 && l.h <= 1024 && ndump < 12) {
+                        char path[128];
+                        snprintf(path, sizeof path, "build/astc_%x_%ux%u_%d.png", t->format, l.w, l.h, ndump);
+                        vk_save_png(path, px, l.w, l.h);
+                        uint8_t *am = malloc(npx * 4);
+                        if (am) {  // alpha as grey, fully opaque, so it can be seen on its own
+                            for (uint64_t i = 0; i < npx; i++) am[i * 4] = am[i * 4 + 1] = am[i * 4 + 2] = px[i * 4 + 3], am[i * 4 + 3] = 255;
+                            snprintf(path, sizeof path, "build/astc_%x_%ux%u_%d_alpha.png", t->format, l.w, l.h, ndump);
+                            vk_save_png(path, am, l.w, l.h);
+                            free(am);
+                        }
+                        ndump++;
+                    }
+                }
                 free(blocks);
                 VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.w, .bufferImageHeight = l.h,
                                         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
@@ -680,6 +733,11 @@ static VkImageViewType view_type_for(int textype) {
 static const VkComponentMapping IDENTITY = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
                                             VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
 
+bool vk_samples_stencil(const NvnTexture *t, const NvnTextureView *v, bool has_view) {
+    uint32_t mode = has_view && v && (v->setmask & 16) ? v->ds_mode : t->ds_mode;  // NVN: 0 depth, 1 stencil
+    return mode == 1 && renderer_format_has_stencil(t->format);
+}
+
 // render: attachment view (one level, one layer). Otherwise a sampled view of type want_textype (TEXTYPE_*),
 // with the NVN component swizzle, converting between compatible types the way renderer.m does.
 VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render, int want_textype) {
@@ -704,6 +762,7 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
         return vk_image_view(b, type, fmt, lv0, 1, ly0, 1, IDENTITY, b->aspect);
     }
     VkImageAspectFlags aspect = b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : b->aspect;
+    if ((b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) && vk_samples_stencil(t, v, has_view)) aspect = VK_IMAGE_ASPECT_STENCIL_BIT;
     VkComponentMapping sw = IDENTITY;
     if (!(b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) && b->samples == 1) {
         const uint8_t *s = v && (v->setmask & 8) ? v->swizzle : t->swizzle;
@@ -738,6 +797,18 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
     if (nlog++ < 30) LOG("[tex] type mismatch: want %d have %d (%ux%ux%u target %u fmt %#x layers %u)\n", want, have, t->width,
                          t->height, t->depth, t->target, t->format, b->layers);
     return vk_dummy_view(want_textype);
+}
+
+// Storage-image view of one SUST handle: the texture view's base mip level / layer (setmask 1 / 2), exactly one of each,
+// no swizzle (a storage image needs the identity one). The log of 2026-11-09 had 6 handles of one texture (mip chain
+// outputs): a view of level 0 for all of them wrote every output over the first level.
+VkImageView vk_storage_view(NvnTexture *t, const NvnTextureView *v) {
+    TexBackend *b = vk_tex(t, true);
+    if (!b->storage || b->samples != 1) return VK_NULL_HANDLE;
+    uint32_t lv = v && (v->setmask & 1) ? v->base_level : 0, ly = v && (v->setmask & 2) ? v->min_layer : 0;
+    if (lv >= b->levels) lv = 0;
+    if (ly >= b->layers) ly = 0;
+    return vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, lv, 1, ly, 1, IDENTITY, VK_IMAGE_ASPECT_COLOR_BIT);
 }
 
 // 1x1 black textures for unbound slots, per type

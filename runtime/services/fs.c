@@ -355,6 +355,25 @@ const char *romfs_file_at(uint64_t off) {
     return NULL;
 }
 
+// A RomFS file by path ("region_common/movie/x.webm") read through the image: the movie player's fallback when the file
+// isn't extracted on disk (RomFS straight from the game package: the title's video never opened, the title never ended).
+bool fs_rom_file(const char *rel, uint64_t *size) {
+    while (rel && *rel == '/') rel++;
+    for (int i = 0; rel && i < rom_nfiles; i++)
+        if (!strcmp(rom_files[i].path, rel)) { *size = rom_files[i].size; return romfs_fd >= 0; }
+    return false;
+}
+ssize_t fs_rom_read(const char *rel, void *dst, size_t n, uint64_t off) {
+    while (rel && *rel == '/') rel++;
+    for (int i = 0; rel && i < rom_nfiles; i++) {
+        if (strcmp(rom_files[i].path, rel)) continue;
+        if (off >= rom_files[i].size) return 0;
+        if (n > rom_files[i].size - off) n = rom_files[i].size - off;
+        return romfs_read(romfs_fd, dst, n, rom_files[i].off + off);
+    }
+    return -1;
+}
+
 // ------------------------------------------------------------------ IStorage (raw RomFS image)
 typedef struct { int fd; uint64_t size; } Storage;
 

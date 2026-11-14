@@ -1,0 +1,160 @@
+name: Build Windows
+
+# Pacote do Windows (x86-64), em três jobs:
+#   exe     - eowrecomp.exe + DLLs, cross-compilados do Linux (tools/windows/build.sh), e a biblioteca de importação
+#             que o código do jogo usa para falar com o .exe (eowrecomp.lib)
+#   helper  - eowgen.exe, o gerador do código do jogo (PyInstaller: só roda no Windows)
+#   package - junta tudo com o zig (compilador) e os headers em gamelib-src/, como o runtime espera
+#             (runtime/gamebuild.c find_tools): a tela inicial recompila o jogo na máquina do usuário.
+# Não há arquivos do jogo nem código gerado nele: isso vem dos arquivos do próprio usuário.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - runtime/**
+      - tools/**
+      - third_party/**
+      - fonts/**
+      - Makefile
+      - .github/workflows/build-windows.yml
+
+permissions:
+  contents: read
+
+jobs:
+  exe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pacotes do sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends make zstd unzip xz-utils curl zip
+
+      - name: Zig 0.17.0 (cache)
+        id: zig-cache
+        uses: actions/cache@v4
+        with:
+          path: build/zig-full
+          key: zig-0.17.0-x86_64-linux
+
+      - name: Zig 0.17.0 (download)
+        if: steps.zig-cache.outputs.cache-hit != 'true'
+        run: |
+          N=zig-x86_64-linux-0.17.0
+          mkdir -p build/zig-dl
+          curl -fsSL --proto '=https' -o build/zig-dl/$N.tar.xz https://ziglang.org/download/0.17.0/$N.tar.xz
+          echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  build/zig-dl/$N.tar.xz" | sha256sum -c
+          tar -xJf build/zig-dl/$N.tar.xz -C build/zig-dl
+          mv build/zig-dl/$N build/zig-full
+
+      - name: Dependências do Windows (MSYS2 UCRT64 + FFmpeg)
+        uses: actions/cache@v4
+        with:
+          path: build/win/dl
+          key: win-deps-${{ hashFiles('tools/windows/fetch_deps.sh') }}
+
+      - name: Build
+        run: |
+          chmod +x tools/windows/*.sh
+          tools/windows/fetch_deps.sh
+          tools/windows/build.sh RELEASE=1  # sem console: o log vai para eowrecomp.log, ao lado do .exe
+
+      - name: Símbolos do .exe para ler o log do watchdog (diagnóstico)
+        continue-on-error: true
+        run: |
+          # eowrecomp.log traz frames "eowrecomp+<rva>": aqui cada rva vira função/linha (o .exe tem DWARF, sem tabela COFF)
+          IB=$(objdump -p build/win/eowrecomp.exe | awk '/^ImageBase/{print $2}')
+          for r in ${{ vars.WATCHDOG_RVAS || '12cd08 12eeaa 12f38f 130bc9 1322b6 13289e 132dbc 132f21 168ec3 168fe2 1690cb 1b0ca 1b9d 1cca4 444b7 499ed 58e47 61647 7b2c 883b 9836 9c24 9c31 a895 a900 bb7c' }}; do
+            printf 'rva %s: ' "$r"
+            addr2line -f -C -e build/win/eowrecomp.exe "$(printf '0x%x' $((0x$IB + 0x$r - 1)))" | tr '\n' ' '; echo
+          done
+
+      - name: Separar o que o pacote usa
+        run: |
+          mkdir stage
+          cp -r build/win/dist/EoWRecomp stage/EoWRecomp
+          # a biblioteca de importação do .exe (o Makefile só a gera junto com o eowgame.dll, que aqui não existe):
+          # o mesmo comando da regra $(IMPLIB)
+          build/zig-full/zig dlltool -m i386:x86-64 -D eowrecomp.exe -d tools/windows/eowrecomp.def -l stage/eowrecomp.lib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exe-dist
+          path: stage
+          if-no-files-found: error
+
+  helper:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: eowgen (PyInstaller)
+        shell: bash
+        run: |
+          python -m pip install capstone==5.0.9 unicorn==2.1.4 lz4==4.4.5 pyinstaller==6.22.3
+          python -m PyInstaller --noconfirm --clean --log-level WARN --distpath build/helper --workpath build/pyinstaller tools/eowgen.spec
+          python tools/pe_no_cfg.py build/helper/eowgen/eowgen.exe
+          du -sh build/helper/eowgen
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eowgen-helper
+          path: build/helper/eowgen
+          if-no-files-found: error
+
+  package:
+    needs: [exe, helper]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: exe-dist
+          path: pkg-in/exe
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: eowgen-helper
+          path: pkg-in/eowgen
+
+      - name: Zig para Windows (o compilador da tela inicial)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends unzip curl zip
+          ZIG_TARGET=x86_64-windows tools/fetch_zig.sh
+
+      - name: Montar o pacote
+        run: |
+          mkdir dist
+          OUT=dist/EoWRecomp
+          cp -r pkg-in/exe/EoWRecomp "$OUT"
+          cp pkg-in/exe/eowrecomp.lib "$OUT/eowrecomp.dll.a"  # (a biblioteca de importação, com o nome que gamebuild.c procura)
+          cp -r pkg-in/eowgen "$OUT/eowgen"
+          cp -r build/zig "$OUT/zig"
+          mkdir "$OUT/gamelib-src"
+          cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h runtime/modules.h tools/gamelib_entry.c \
+             runtime/hle/hle_symbols.txt "$OUT/gamelib-src/"
+          for f in eowrecomp.exe eowrecomp.dll.a eowgen/eowgen.exe zig/zig.exe gamelib-src/cpu.h gamelib-src/hle_symbols.txt; do
+            [ -f "$OUT/$f" ] || { echo "falta $OUT/$f"; exit 1; }
+          done
+          du -sh "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          # the folder itself, not a .zip inside the artifact's own .zip: one download, one extract, and the files are in an
+          # EoWRecomp/ folder (the artifact root is dist/, so the folder name is kept)
+          name: EoWRecomp-windows-x64
+          path: dist
+          if-no-files-found: error

@@ -411,10 +411,12 @@ NVN(nvnCommandBufferDrawElementsBaseVertex) {
 NVN(nvnCommandBufferDrawElementsInstanced) { trace_draw(c, c->x[3]); Snap s = snap(c); record(c, CMD_DRAW_ELEMENTS, 0, &s); }
 PLAIN(nvnCommandBufferDrawArraysIndirect, CMD_DRAW_ARRAYS_INDIRECT)
 PLAIN(nvnCommandBufferDrawElementsIndirect, CMD_DRAW_ELEMENTS_INDIRECT)
-NVN(nvnCommandBufferMultiDrawArraysIndirectCount) { (void)c; }
-NVN(nvnCommandBufferMultiDrawElementsIndirectCount) { (void)c; }
-NVN(nvnCommandBufferDrawTransformFeedback) { (void)c; }
-NVN(nvnCommandBufferDrawTexture) { (void)c; }
+// Not implemented (dropped): each is logged once per kind so a game that needs one shows up in the log.
+#define UNIMPL_ONCE(name) NVN(name) { static int seen; if (!seen++) LOG("[nvn] IGNORED call to " #name "\n"); (void)c; }
+UNIMPL_ONCE(nvnCommandBufferMultiDrawArraysIndirectCount)
+UNIMPL_ONCE(nvnCommandBufferMultiDrawElementsIndirectCount)
+UNIMPL_ONCE(nvnCommandBufferDrawTransformFeedback)
+UNIMPL_ONCE(nvnCommandBufferDrawTexture)
 PLAIN(nvnCommandBufferDispatchCompute, CMD_DISPATCH)
 PLAIN(nvnCommandBufferDispatchComputeIndirect, CMD_DISPATCH_INDIRECT)
 NVN(nvnCommandBufferBeginTransformFeedback) { (void)c; }

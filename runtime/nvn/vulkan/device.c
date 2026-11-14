@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "../../paths.h"
+#include "../../platform.h"
 #include "../../settings.h"
 #include "../../ui/menu.h"
 #include "../../ui/touch.h"
@@ -121,6 +122,7 @@ static void pick_device(void) {
     LOG("[vk] using %s\n", g_vk.props.deviceName);
 }
 
+bool g_host_query_reset;
 static bool g_fault_ext;
 // After VK_ERROR_DEVICE_LOST: what the driver says faulted (VK_EXT_device_fault), into the log.
 void vk_device_fault_report(void) {
@@ -170,7 +172,10 @@ static void create_device(void) {
 
     // features the backend relies on (all present on current desktop drivers)
     VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    VkPhysicalDeviceVulkan12Features have12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    have.pNext = &have12;
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+    g_host_query_reset = have12.hostQueryReset && have.features.occlusionQueryPrecise;  // EOWRECOMP_DRAW_PROBE (exec.c)
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
         .vertexAttributeInstanceRateDivisor = VK_TRUE, .vertexAttributeInstanceRateZeroDivisor = VK_FALSE};
@@ -185,7 +190,7 @@ static void create_device(void) {
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                             .timelineSemaphore = VK_TRUE, .shaderInt8 = VK_TRUE, .samplerMirrorClampToEdge = VK_TRUE,
                                             .uniformAndStorageBuffer8BitAccess = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,
-                                            .scalarBlockLayout = VK_TRUE, .pNext = &f13};
+                                            .scalarBlockLayout = VK_TRUE, .hostQueryReset = have12.hostQueryReset, .pNext = &f13};
     VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
                                             .storageBuffer16BitAccess = VK_TRUE, .pNext = &f12};
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
@@ -198,6 +203,7 @@ static void create_device(void) {
     b->samplerAnisotropy = h->samplerAnisotropy;
     b->textureCompressionBC = h->textureCompressionBC;
     b->shaderInt64 = h->shaderInt64;
+    b->occlusionQueryPrecise = h->occlusionQueryPrecise;
     b->depthBiasClamp = h->depthBiasClamp;
     b->depthClamp = h->depthClamp;
     b->largePoints = h->largePoints;
@@ -208,6 +214,8 @@ static void create_device(void) {
     b->vertexPipelineStoresAndAtomics = h->vertexPipelineStoresAndAtomics;
     b->robustBufferAccess = h->robustBufferAccess;  // guest shaders index cbufs freely: keep OOB reads harmless
     b->shaderClipDistance = h->shaderClipDistance;
+    b->shaderStorageImageWriteWithoutFormat = h->shaderStorageImageWriteWithoutFormat;  // SUST: formatted stores to images (compute)
+    b->shaderStorageImageExtendedFormats = h->shaderStorageImageExtendedFormats;
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
@@ -239,7 +247,8 @@ static void create_device(void) {
     // pipeline cache: cache/vk_pipelines.bin (written by vk_pipeline_cache_save)
     size_t sz = 0;
     void *data = NULL;
-    FILE *fp = fopen("cache/vk_pipelines.bin", "rb");
+    // EOWRECOMP_NO_PIPELINE_CACHE=1: neither load nor save the cache (rules it out when pipeline builds take minutes)
+    FILE *fp = getenv("EOWRECOMP_NO_PIPELINE_CACHE") ? NULL : fopen("cache/vk_pipelines.bin", "rb");
     if (fp) {
         fseek(fp, 0, SEEK_END);
         sz = (size_t)ftell(fp);
@@ -258,6 +267,7 @@ static void create_device(void) {
 }
 
 void vk_pipeline_cache_save(void) {
+    if (getenv("EOWRECOMP_NO_PIPELINE_CACHE")) return;
     size_t sz = 0;
     if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz) return;
     void *data = malloc(sz);
@@ -564,6 +574,12 @@ void vk_frame_end(const char *shot_path) {
 }
 
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
+    // O diretório relativo "build/" não existe ao lado do exe no Windows (só no checkout de dev):
+    // sem criá-lo, DEBUG_FRAME/SHOT_AT falhavam com "caminho não encontrado".
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s", path);
+    for (char *c = dir; *c; c++)
+        if ((*c == '/' || *c == '\\') && c != dir) { char ch = *c; *c = 0; SDL_CreateDirectory(dir); *c = ch; }
     SDL_Surface *s = SDL_CreateSurfaceFrom((int)w, (int)h, SDL_PIXELFORMAT_ABGR8888, (void *)rgba, (int)w * 4);
     if (!s || !SDL_SavePNG(s, path)) LOG("[vk] saving %s failed: %s\n", path, SDL_GetError());
     else LOG("[vk] saved %s (%ux%u)\n", path, w, h);
@@ -674,6 +690,8 @@ void backend_present(NvnTexture *t) {
         extern bool g_gpuprof_frame;
         extern void vk_gpuprof_report(void);
         if (g_gpuprof_frame) { g_gpuprof_frame = false; vk_gpuprof_report(); }
+        extern void vk_probe_report(void);
+        if (!g_debug_frame) vk_probe_report();
         const char *e = getenv("EOWRECOMP_GPUPROF_AT");
         for (const char *p = e; p && *p;) {
             long at = strtol(p, (char **)&p, 10);
@@ -718,6 +736,20 @@ void backend_present(NvnTexture *t) {
         if (last_fps_time > 0)
             LOG("[vk] t=%.1f frame %llu %.1f fps max %.0fms level %s (%s)\n", now, (unsigned long long)total_frames,
                 frames / (now - last_fps_time), max_gap * 1000.0, game_level_name(), renderer_stats());
+        if (last_fps_time > 0) { extern void vk_indirect_stats(char *buf, size_t size); char is[200]; vk_indirect_stats(is, sizeof is); LOG("[vk] %s\n", is); }
+        {   // (every ~10 s: what the shader translator and the compile workers are doing: a stuck one shows its busy time)
+            extern void vk_jobs_status(char *buf, size_t size);
+            static int jobs_n;
+            char js[256];
+            if (jobs_n++ % 5 == 0) { vk_jobs_status(js, sizeof js); LOG("[vk] jobs: %s\n", js); }
+        }
+#ifdef _WIN32
+        // (every ~10 s: whether the RAM use grows, and how much of it is committed but not resident)
+        static int mem_n;
+        size_t ws, pv, pk;
+        if (mem_n++ % 5 == 0 && plat_mem_mb(&ws, &pv, &pk))
+            LOG("[mem] working set %zu MB, private %zu MB, peak working set %zu MB\n", ws, pv, pk);
+#endif
         max_gap = 0;
         frames = 0;
         last_fps_time = now;

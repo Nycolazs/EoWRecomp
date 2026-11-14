@@ -14,6 +14,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include "platform.h"  // (Windows: POSIX pread, mkdir(path, mode))
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #if defined(__linux__)

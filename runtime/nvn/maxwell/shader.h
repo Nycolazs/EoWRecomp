@@ -45,6 +45,9 @@ typedef struct {
                             // after flip_y: keys without it hash as before - shader caches stay valid.)
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
+    uint32_t stencil_tex;   // GLSL: bit n = the 2D texture in handle slot n ((handle_offset - 0x20) / 8) is read through
+                            // its STENCIL aspect (NVN depth-stencil mode STENCIL): a usampler2D whose raw value comes back
+                            // as bits (uintBitsToFloat), the way the game's R2P/LOP code on the register expects it
 } ShaderKey;
 
 typedef struct {
