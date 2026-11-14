@@ -984,6 +984,12 @@ static void vk_end_pass_at(int line) {
     if (prof && line < 4096) prof_end_line[line]++;
     vkCmdEndRendering(vk_cmd());
     in_pass = false;
+    // (debug) EOWRECOMP_FLUSH_PASSES=1: submit and wait after every pass, like an F9 frame does while saving the passes. The
+    // rift's void shows in the saved passes but not in normal frames: if this makes it show, the difference is ordering /
+    // guest memory read by the GPU after the game has moved on, not a shader or translation problem.
+    static int flush_passes = -1;
+    if (flush_passes < 0) flush_passes = getenv("EOWRECOMP_FLUSH_PASSES") != NULL;
+    if (flush_passes) renderer_flush();
     if (g_debug_frame && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
         char path[256];
         static uint64_t debug_pass_frame = ~0ull;
