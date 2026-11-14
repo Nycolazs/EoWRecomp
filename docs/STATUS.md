@@ -1,6 +1,55 @@
 # Status
 
-Atualizado: 2026-11-07 (sessão 4: Windows pelo GitHub Actions).
+Atualizado: 2026-11-14 (sessão 5: Windows/Vulkan — vegetação, corações, fenda; release beta_1).
+
+## Sessão 5 (2026-11-10 a 2026-11-14): Windows / Radeon RX 580 / Vulkan — vegetação, HUD, fenda do vazio; release beta_1
+
+Marco: M5 em andamento (jogo jogável no Windows; faltam efeitos e desempenho). Backend testado: **só Vulkan, no Windows**
+(Xeon E5-2650 v4, RX 580 8 GB). Metal, macOS e Android não foram tocados nem retestados.
+
+### O que funciona (visto em screenshot/log do usuário)
+- **Árvores e vegetação** (commit 0721dad): o jogo faz culling na GPU (compute 72a4711000/72a4715000: ballot + lane id +
+  `lanemask_lt`) e desenha com `DrawElementsIndirect`. Faltavam `ClearBuffer`, os desenhos indiretos e, na RX 580 (subgrupo
+  de 64), lane id/máscaras reais: S2R 0x00/0x38–0x3c agora saem de `mw_lane()` (`gl_SubgroupInvocationID & 31`) e
+  ballot/vote/shuffle ficam numa metade de 32 lanes. Teste: `tools/test_lane.sh`.
+- Corações do HUD (RGB565 com alfa no canal R), feixes esticados, ícone no `.exe` (via `windows_manifest.rc`, o runner não tem
+  `windres`), artefato do CI = uma pasta só (`EoWRecomp-windows-x64`).
+- **Leitura de stencil** (a1c0904): o shader da fenda (`72a71bb500`) amostra o *stencil* do D24S8 (`nvnTextureViewSetDepthStencilMode`
+  = STENCIL) e testa os bits 5/6 com `R2P`. Antes recebia profundidade em float. Agora `ShaderKey.stencil_tex` (bit por slot de
+  handle) faz o binding virar `usampler2D`, o texel volta como bits (`uintBitsToFloat`), a view usa o aspecto stencil com sampler
+  NEAREST e os snapshots de feedback têm view de stencil. Efeito visto: tracinhas viraram linha contínua brilhante.
+  Teste: `tools/test_stencil.sh` (TEXS e TLDS).
+- Launcher: versão `beta_1`.
+
+### O que ainda está quebrado
+- **Fenda do vazio (perto de Suthorn)**: a borda roxa aparece, mas o **preenchimento escuro não aparece em frames normais**. No
+  frame do F9 ele aparece (`pass_041.png`) e o stencil está certo (`fbstencil_*.pgm`: bit 6 em ~13 800 texels). Ou seja, a
+  diferença é entre um frame normal e um frame em que cada passe é esvaziado (flush). Hipóteses já descartadas: decal
+  (72a7db6000), quad iluminado (72a74ac500), precisão do EQUAL, discard do chão, prepass 72ee694000 sozinho, e **snapshot de
+  feedback velho** (ae46b3d invalida o snapshot em escrita de stencil; o usuário viu que não mudou, nem com
+  `EOWRECOMP_NO_SNAPSHOT_REUSE`). Suspeita atual: memória do guest lida pela GPU tarde demais (matrizes por instância do chão
+  vêm de gmem) ou ordenação dos passes.
+- Hachurado preto no G-buffer perto do portal (some ao pular todo o prepass `vs 8b62cd3f67cab37d`): pode ter a mesma causa.
+- Desempenho 39–56 fps: ~3 flushes por frame por causa da leitura, na CPU, dos argumentos dos desenhos indiretos.
+- Congelamentos intermitentes: provável wake perdido no kernel Horizon simulado; o auto-unstick é só mitigação.
+
+### Diagnóstico novo
+- `EOWRECOMP_SKIP_VSPROG=<endereço do VS,...>` (pula desenhos por endereço do VS; o hash de VS só cobre 0x200 bytes e os
+  prepasses dividem o mesmo hash).
+- `EOWRECOMP_FLUSH_PASSES=1`: submete e espera a GPU a cada passe (como o F9). `EOWRECOMP_VK_COPY_OPT=0`: desliga os aliases
+  de cópia. F9 agora loga o stencil de cada draw (`sten en/ops/ref/wm`) e salva `build/fbstencil_NNN_snap.pgm` com o histograma.
+- PowerShell mantém `$env:EOWRECOMP_*` na sessão: abrir outra janela (ou `Remove-Item Env:EOWRECOMP_*`) entre testes.
+
+### Próximo passo
+1. Rodar com `EOWRECOMP_FLUSH_PASSES=1` e com `EOWRECOMP_VK_COPY_OPT=0` perto do portal: se o vazio aparecer, achar a leitura de
+   memória/ordem que falta (bisect por passe); se não, voltar aos shaders 72a7143000/72a7144500 (preenchimento).
+2. Desenhos indiretos na GPU (`vkCmdDrawIndexedIndirect`) para tirar os flushes; depois a causa do freeze.
+3. Validar o backend Metal e os comandos `CMD_*` ainda sem tratamento.
+
+### O que o usuário deve testar e observar
+- Sem variáveis `EOWRECOMP_*`: fps e o portal de Suthorn (borda roxa sim; preenchimento escuro ainda não).
+- Os dois testes acima, dizendo só "apareceu / não apareceu"; se aparecer, print.
+- Se travar: mandar `eowrecomp.log` (o watchdog registra os frames).
 
 ## Sessão 4 (2026-11-07): pacote do Windows pelo GitHub Actions
 
