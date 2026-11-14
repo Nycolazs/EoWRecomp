@@ -1785,6 +1785,32 @@ static void debug_save_depth(TexBackend *b, const char *path) {
     LOG("[vk] saved %s (%ux%u depth %.6f..%.6f)\n", path, b->width, b->height, lo, hi);
 }
 
+// (debug frames) the stencil aspect as a PGM (value * 4, clamped) + a count of the values with bits 5 / 6 set: what the rift's
+// fragment shader (72a71bb500) reads through R2P
+static void debug_save_stencil(TexBackend *b, const char *path) {
+    if (!b || !b->image || !(b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) return;
+    uint64_t n = (uint64_t)b->width * b->height;
+    VkSpan out = vk_readback(n);
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkBufferImageCopy c = {.bufferOffset = out.off, .imageSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1},
+                           .imageExtent = {b->width, b->height, 1}};
+    vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
+    renderer_flush();
+    const uint8_t *d = out.ptr;
+    uint64_t hist[256] = {0}, b5 = 0, b6 = 0;
+    for (uint64_t i = 0; i < n; i++) { hist[d[i]]++; b5 += d[i] >> 5 & 1; b6 += d[i] >> 6 & 1; }
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P5 %u %u 255\n", b->width, b->height);
+        for (uint64_t i = 0; i < n; i++) fputc(d[i] * 4 > 255 ? 255 : d[i] * 4, f);
+        fclose(f);
+    }
+    LOG("[vk] saved %s (%ux%u stencil, bit5 %llu bit6 %llu texels; values:", path, b->width, b->height, (unsigned long long)b5, (unsigned long long)b6);
+    for (int v = 0; v < 256; v++) if (hist[v]) LOG(" %#x=%llu", v, (unsigned long long)hist[v]);
+    LOG(")\n");
+}
+
 // (debug) EOWRECOMP_COPY_TRACE=<frame>: draws' attachments / sampled textures, copies and snapshots of that frame ("[ct]")
 static bool ct_on(void) {
     static const char *e = (const char *)1;
@@ -2015,6 +2041,8 @@ static void resolve_feedback(Prog *pr) {
                 debug_save_depth(src, path);
                 snprintf(path, sizeof path, "build/fbdepth_%03d_snap.pgm", nd++);
                 debug_save_depth(dst, path);
+                snprintf(path, sizeof path, "build/fbstencil_%03d_snap.pgm", nd - 1);
+                debug_save_stencil(dst, path);
                 cb = vk_cmd();
             }
             feedback_tex[nfeedback] = t;
@@ -3311,9 +3339,9 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x@%llx", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format, (unsigned long long)st.rt.color[i]->addr);  // guest address too: does a shader read it as raw memory (gmem)?
     LOG(" gmem vs%d fs%d", pr->vi->uses_gmem, pr->fi->uses_gmem);
     if (st.rt.depth) LOG(" d%#x %p", st.rt.depth->format, (void *)st.rt.depth);
-    LOG(" | vs hash %016llx | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n",
+    LOG(" | vs hash %016llx | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x sten %d/%02x%02x%02x%02x ref %02x,%02x wm %02x,%02x poly %02x%02x chmask %08x\n",
         (unsigned long long)g_cur_vs_hash, st.viewport[0][0], st.viewport[0][1],
-        st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
+        st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.ds[3], st.ds[4], st.ds[5], st.ds[6], st.ds[7], st.stencil_ref[0], st.stencil_ref[1], st.stencil_mask[0], st.stencil_mask[1], st.poly[0], st.poly[1],
         st.channel_mask);
     if (getenv("EOWRECOMP_DEBUG_DATA")) {  // vertex streams and vertex / fragment cbufs: the first floats (and words)
         for (int s = 0; s < 16; s++) {  // (vbuf has 16 entries: the "vbuf16" lines of earlier logs were really ubuf[0][0])
