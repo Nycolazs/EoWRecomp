@@ -2983,7 +2983,11 @@ static void draw_(CmdRec *r, bool indexed) {
     alias_draw_check();
     resolve_feedback(pr);
     snap_reason = "draw-depthwrite";
-    if (st.rt.depth && st.ds[0] && st.ds[1]) snapshots_invalidate(st.rt.depth);
+    // a stencil write changes the snapshot too: the rift's void is stenciled (bit 6) by draws that don't write depth, and its
+    // ribbon shader reads that stencil back - a reused snapshot predating them showed the lines without the void (F9 frames
+    // flush more and got it right, which is why only the saved passes had the void)
+    bool sten_write = st.ds[3] && ((st.stencil_mask[0] | st.stencil_mask[1]) & 0xFF);
+    if (st.rt.depth && ((st.ds[0] && st.ds[1]) || sten_write)) snapshots_invalidate(st.rt.depth);
     snap_reason = "draw-colorwrite";
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i] && ((st.channel_mask >> (i * 4)) & 0xF)) snapshots_invalidate(st.rt.color[i]);
