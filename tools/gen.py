@@ -316,6 +316,11 @@ class Module:
                     return True
                 if (w & 0x9F000000) == 0x10000000:  # ADR
                     return True
+                if (w & 0xFFE00C00) == 0xF8600800:  # LDR Xt, [Xn, Xm{, extend}]: table of absolute case addresses
+                    # (a vtable/callback load is `ldr xt, [xn, #imm]`, which stays a plain dispatch). The
+                    # table isn't emulated, but the case targets lie in this function: the all-instruction
+                    # fallback reaches them instead of aborting with "no function at" (crash at 7001a65870).
+                    return True
                 return False
             a -= 4
         return False
@@ -483,11 +488,14 @@ class Module:
 from patches import PATCHES
 
 
-def adr_feeds_br(m, i, rd, window=6):
+def adr_feeds_br(m, i, rd, window=16):
     """ADR whose register reaches a `br` within a few instructions: the base of a compact jump table's cases
     (LLVM: adr xB, cases ; ldrb/ldrh wO, [table, idx] ; add xB, xB, xO, lsl #2 ; br xB), code inside the same
     function - not a callback. Treating it as a function start split the function at its cases, so its table
-    couldn't be resolved (main: 71 tables resolved, 1832 left to the all-instruction fallback)."""
+    couldn't be resolved (main: 71 tables resolved, 1832 left to the all-instruction fallback).
+    The window is 16 words: f_7001a657e0 (the crash after leaving the first room) has its br 7 words after the ADR, with
+    register moves scheduled in between; a window of 6 missed it, the cases became a separate function and the br's
+    target (7001a65870) was in neither piece: "no function at"."""
     regs = {rd}
     for k in range(i + 1, min(i + 1 + window, len(m.words))):
         w = m.words[k]
@@ -498,6 +506,15 @@ def adr_feeds_br(m, i, rd, window=6):
         elif (w & 31) in regs and (w & 0x7F200000) != 0x0B000000:
             regs.discard(w & 31)  # (overwritten by something else)
     return False
+
+
+def same_function(m, pc, target):
+    """A code address materialized inside the .eh_frame function it points into is a case/branch target of that
+    function, never a callback (a function pointer points at a function start, already a boundary). Backstop of
+    adr_feeds_br: the crash after the logo cutscene (no function at 7001810220, x10 = adr base + idx*4) was a compact
+    table whose ADR..br distance the window didn't cover; the cases became a function of their own."""
+    lo, hi = m.true_function(pc)
+    return lo < target < hi
 
 
 def write_if_changed(path, text):
@@ -557,7 +574,7 @@ def main():
             imm = ((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)
             if imm & (1 << 20):
                 imm -= 1 << 21
-            if m.in_text(pc + imm) and not adr_feeds_br(m, i, w & 31):
+            if m.in_text(pc + imm) and not adr_feeds_br(m, i, w & 31) and not same_function(m, pc, pc + imm):
                 start_set.add(pc + imm)
         elif (w & 0x9F000000) == 0x90000000:  # ADRP
             imm = ((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)
@@ -568,7 +585,7 @@ def main():
             rn, rd = (w >> 5) & 31, w & 31
             if rn in adrp_regs and i - adrp_regs[rn][1] <= 8:
                 t = adrp_regs[rn][0] + ((w >> 10) & 0xFFF)
-                if m.in_text(t):
+                if m.in_text(t) and not same_function(m, pc, t):
                     start_set.add(t)
     scanned = {}
     rounds = 0

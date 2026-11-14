@@ -275,7 +275,7 @@ static void mutex_release(uint64_t addr) {
     int count = 0;
     for (KThread *t = g_waitlist; t; t = t->wnext) {
         if (t->wait_kind == WAIT_MUTEX && t->wait_addr == addr) {
-            if (!next || t->prio < next->prio) next = t;
+            if (!next || t->prio <= next->prio) next = t;  // g_waitlist is newest-first: <= settles ties on the oldest waiter (FIFO)
             count++;
         }
     }
@@ -325,6 +325,20 @@ static uint32_t block_current(int64_t timeout_ns) {
     return t->wait_result;
 }
 
+// Ring of the last mutex / condvar kernel events (caller holds g_klock), printed by the hang watchdog: the order of
+// WaitProcessWideKey / SignalProcessWideKey around a stuck wait shows a lost wake-up (a signal that found no waiter just
+// before the waiter arrived, a signal that woke the wrong thread, ...).
+typedef struct { uint64_t ms; uint32_t tid; char op; int32_t arg; uint64_t addr; int woken; } KEv;
+static KEv g_kev[16384];
+static uint64_t g_kev_n;
+static void kev_add(char op, uint64_t addr, int32_t arg, int woken) {
+    KEv *e = &g_kev[g_kev_n++ & 16383];
+    e->ms = plat_now_ns() / 1000000;
+    e->tid = t_cur ? (uint32_t)t_cur->id : 0;
+    e->op = op; e->addr = addr; e->arg = arg; e->woken = woken;
+    if (t_cur && (op == 'W' || op == 'L')) t_cur->wait_since_ms = e->ms;
+}
+
 static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) {
     pthread_mutex_lock(&g_klock);
     uint32_t v = __atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
@@ -336,7 +350,9 @@ static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) 
     t->wait_kind = WAIT_MUTEX;
     t->wait_addr = addr;
     t->wait_tag = tag;
+    kev_add('L', addr, (int32_t)v, 0);
     uint32_t r = block_current(-1);
+    kev_add('l', addr, (int32_t)r, 0);
     pthread_mutex_unlock(&g_klock);
     return r == R_CANCELLED ? R_OK : r;
 }
@@ -344,6 +360,7 @@ static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) 
 static uint32_t svc_arbitrate_unlock(uint64_t addr) {
     pthread_mutex_lock(&g_klock);
     mutex_release(addr);
+    kev_add('U', addr, (int32_t)*u32p(addr), 0);
     pthread_mutex_unlock(&g_klock);
     return R_OK;
 }
@@ -357,7 +374,9 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
     t->wait_mutex = mutex;
     t->wait_tag = tag;
     __atomic_store_n(u32p(key), 1, __ATOMIC_SEQ_CST);
+    kev_add('W', key, (int32_t)(timeout < 0 ? -1 : timeout / 1000000), 0);
     uint32_t r = block_current(timeout);
+    kev_add('w', key, (int32_t)r, 0);
     // Timed out / cancelled: the mutex is NOT held - as on Horizon (Atmosphere KConditionVariable::Wait; libnx
     // condvarWaitTimeout: "On timeout, we need to acquire it manually"). The SDK takes it again itself
     // (nn::os InternalConditionVariableImplByHorizon::TimedWait -> InternalCriticalSection::Enter). Taking it here
@@ -373,8 +392,13 @@ static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
     for (;;) {
         if (count > 0 && woken >= count) break;
         KThread *best = NULL;
+        // Horizon wakes by priority and, among equal priorities, the longest waiter first (Atmosphere keeps the waiters in
+        // a tree ordered by priority then arrival). g_waitlist is newest-first, so <= settles ties on the oldest. The
+        // newest-first pick woke the same two pool workers over and over (they found no work and went back to sleep)
+        // while the one the job was meant for starved - the game's main thread then waited for a job that never ran
+        // (the random freeze: EOWRECOMP_UNSTICK=1 woke every waiter and got the game going again).
         for (KThread *t = g_waitlist; t; t = t->wnext)
-            if (t->wait_kind == WAIT_CONDVAR && t->wait_addr == key && (!best || t->prio < best->prio)) best = t;
+            if (t->wait_kind == WAIT_CONDVAR && t->wait_addr == key && (!best || t->prio <= best->prio)) best = t;
         if (!best) break;
         woken++;
         // the woken thread must reacquire its mutex
@@ -391,6 +415,7 @@ static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
     for (KThread *t = g_waitlist; t; t = t->wnext)
         if (t->wait_kind == WAIT_CONDVAR && t->wait_addr == key) any_left = true;
     if (!any_left) __atomic_store_n(u32p(key), 0, __ATOMIC_SEQ_CST);
+    kev_add('S', key, count, woken);
     pthread_mutex_unlock(&g_klock);
 }
 
@@ -419,14 +444,16 @@ static uint32_t svc_wait_for_address(uint64_t addr, uint32_t type, int32_t value
 
 static int arbiter_wake(uint64_t addr, int32_t count) {
     int woken = 0;
-    for (KThread *t = g_waitlist; t; t = t->wnext) {
+    for (;;) {  // by priority, then the longest waiter first (see svc_signal_process_wide_key)
         if (count > 0 && woken >= count) break;
-        if (t->wait_kind == WAIT_ARBITER && t->wait_addr == addr) {
-            t->wait_kind = WAIT_NONE;
-            t->wait_result = R_OK;
-            wake(t);
-            woken++;
-        }
+        KThread *best = NULL;
+        for (KThread *t = g_waitlist; t; t = t->wnext)
+            if (t->wait_kind == WAIT_ARBITER && t->wait_addr == addr && (!best || t->prio <= best->prio)) best = t;
+        if (!best) break;
+        best->wait_kind = WAIT_NONE;
+        best->wait_result = R_OK;
+        wake(best);
+        woken++;
     }
     return woken;
 }
@@ -486,6 +513,9 @@ static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, in
         if (g_rt_unwind) { r = R_CANCELLED; goto out; }
         if (timeout == 0) { r = R_TIMEOUT; goto out; }
         t->in_sync_wait = true;
+        t->sync_n = count < 4 ? count : 4;
+        for (int i = 0; i < t->sync_n; i++) t->sync_h[i] = hs[i];
+        t->sync_timeout = timeout;
         t->snext = g_syncwaiters;
         g_syncwaiters = t;
         bool ok = kwait(timeout < 0 ? -1 : timeout, &ts);
@@ -497,6 +527,110 @@ static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, in
 out:
     pthread_mutex_unlock(&g_klock);
     return r;
+}
+
+// Experiment for the freeze (log 16e64c7c: the main thread waits for a job's condvar, every worker idle): wake every
+// condvar waiter as if it had been signalled. A condvar user must tolerate spurious wake-ups (it re-checks its
+// predicate), so: if the game then resumes, the predicate was true and a wake-up had been lost; if everything goes back to
+// sleep, the state itself says "nothing to do" (a job never queued / a counter wrong). Only with EOWRECOMP_UNSTICK=1.
+void kernel_unstick(void) {
+    pthread_mutex_lock(&g_klock);
+    int n = 0;
+    for (KThread *t = g_waitlist; t; t = t->wnext) {
+        if (t->wait_kind != WAIT_CONDVAR) continue;
+        n++;
+        t->wait_result = R_OK;
+        if (mutex_acquire_or_mark(t->wait_mutex, t->wait_tag)) {
+            t->wait_kind = WAIT_NONE;
+            wake(t);
+        } else {
+            t->wait_kind = WAIT_MUTEX;
+            t->wait_addr = t->wait_mutex;
+        }
+    }
+    fprintf(stderr, "*** unstick: %d condvar waiters woken spuriously\n", n);
+    pthread_mutex_unlock(&g_klock);
+}
+
+// Hang watchdog (runtime/platform/windows.c): who waits for what. A mutex word is owner handle | WAITERS_BIT, so a
+// WAIT_MUTEX / WAIT_CONDVAR line shows the thread that must release it; g_klock held for good would mean a thread died
+// or stuck inside the kernel itself.
+void kernel_dump_threads(void) {
+    bool locked = false;
+    for (int i = 0; i < 200 && !locked; i++) {
+        locked = pthread_mutex_trylock(&g_klock) == 0;
+        if (!locked) plat_sleep_until_ns(plat_now_ns() + 5000000);
+    }
+    fprintf(stderr, "--- kernel threads (g_klock %s)\n", locked ? "free" : "HELD for 1s: a thread is stuck inside the kernel");
+    static const char *kinds[] = {"-", "MUTEX", "CONDVAR", "ARBITER"};
+    for (KThread *t = g_threads; t; t = t->anext) {
+        if (!t->started || t->finished) continue;
+        fprintf(stderr, "  thread id %llu handle %#x prio %d entry %llx: %s", (unsigned long long)t->id, t->handle, t->prio,
+                (unsigned long long)t->entry, t->in_sync_wait ? "WaitSynchronization" : kinds[t->wait_kind]);
+        if (t->in_sync_wait) {
+            fprintf(stderr, " timeout %lld handles", (long long)t->sync_timeout);
+            for (int i = 0; i < t->sync_n; i++) fprintf(stderr, " %#x", t->sync_h[i]);
+        } else if (t->wait_kind != WAIT_NONE) {
+            fprintf(stderr, " addr %llx = %#x", (unsigned long long)t->wait_addr, *u32p(t->wait_addr));
+            if (t->wait_kind == WAIT_CONDVAR) fprintf(stderr, " (mutex %llx = %#x)", (unsigned long long)t->wait_mutex, *u32p(t->wait_mutex));
+        }
+        if (t->wait_since_ms) fprintf(stderr, " [since %llu]", (unsigned long long)t->wait_since_ms);
+        fputc('\n', stderr);
+    }
+    if (locked) {
+        // a ticker thread (a 15 ms timed wait on its own key) fills the ring in seconds, so keys with a flood of events are
+        // left out of the tail, and the main game thread's own condvar + mutex are printed separately
+        uint64_t n = g_kev_n, from = n > 16384 ? n - 16384 : 0;
+        static struct { uint64_t addr; unsigned cnt; } keys[1024];  // (64 hid every key after the first 64: the tail missed most events)
+        memset(keys, 0, sizeof keys);
+        int nk = 0;
+        for (uint64_t i = from; i < n; i++) {
+            uint64_t a = g_kev[i & 16383].addr;
+            int k = 0;
+            while (k < nk && keys[k].addr != a) k++;
+            if (k == nk && nk < 1024) keys[nk++].addr = a;
+            if (k < nk) keys[k].cnt++;
+        }
+        KThread *mt = NULL;
+        for (KThread *t = g_threads; t; t = t->anext) if (t->id == 80) mt = t;
+        fprintf(stderr, "--- kernel events (ms, thread, W/w wait enter/return, S signal key count -> woken, L/l lock wait/return, U unlock), %llu in the ring\n", (unsigned long long)(n - from));
+        if (mt && mt->wait_kind != WAIT_NONE) {
+            fprintf(stderr, "main game thread (t80) condvar %llx / mutex %llx, last events on them:\n", (unsigned long long)mt->wait_addr, (unsigned long long)mt->wait_mutex);
+            uint64_t start = n, cnt = 0;
+            while (start > from && cnt < 60) { start--; KEv *e = &g_kev[start & 16383]; if (e->addr == mt->wait_addr || e->addr == mt->wait_mutex) cnt++; }
+            for (uint64_t i = start; i < n; i++) {
+                KEv *e = &g_kev[i & 16383];
+                if (e->addr == mt->wait_addr || e->addr == mt->wait_mutex)
+                    fprintf(stderr, "  %llu t%u %c %llx arg %d woken %d\n", (unsigned long long)e->ms, e->tid, e->op, (unsigned long long)e->addr, e->arg, e->woken);
+            }
+        }
+        fprintf(stderr, "last 40 events of the main game thread (t80), any key:\n");
+        {
+            uint64_t start = n, cnt = 0;
+            while (start > from && cnt < 40) { start--; if (g_kev[start & 16383].tid == 80) cnt++; }
+            for (uint64_t i = start; i < n; i++) {
+                KEv *e = &g_kev[i & 16383];
+                if (e->tid == 80) fprintf(stderr, "  %llu t80 %c %llx arg %d woken %d\n", (unsigned long long)e->ms, e->op, (unsigned long long)e->addr, e->arg, e->woken);
+            }
+            fprintf(stderr, "ring spans %llu..%llu ms\n", (unsigned long long)g_kev[from & 16383].ms, (unsigned long long)g_kev[(n - 1) & 16383].ms);
+        }
+        fprintf(stderr, "last events of keys that are not floods:\n");
+        uint64_t start = n, cnt = 0;
+        while (start > from && cnt < 150) {
+            start--;
+            KEv *e = &g_kev[start & 16383];
+            for (int k = 0; k < nk; k++) if (keys[k].addr == e->addr && keys[k].cnt < 2000) { cnt++; break; }
+        }
+        for (uint64_t i = start; i < n; i++) {
+            KEv *e = &g_kev[i & 16383];
+            for (int k = 0; k < nk; k++)
+                if (keys[k].addr == e->addr && keys[k].cnt < 2000) {
+                    fprintf(stderr, "  %llu t%u %c %llx arg %d woken %d\n", (unsigned long long)e->ms, e->tid, e->op, (unsigned long long)e->addr, e->arg, e->woken);
+                    break;
+                }
+        }
+    }
+    if (locked) pthread_mutex_unlock(&g_klock);
 }
 
 // ------------------------------------------------------------------ debug output

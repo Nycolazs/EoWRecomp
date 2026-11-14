@@ -11,6 +11,7 @@
 #endif
 #include <SDL3/SDL.h>
 #include <ctype.h>
+#include <errno.h>
 #include <dirent.h>
 #include <pthread.h>
 #include <string>
@@ -256,7 +257,10 @@ static void find_game(const std::string &dir, int depth, std::string &exefs, std
         for (auto &ch : lower) ch = (char)tolower((unsigned char)ch);
         std::string ext = lower.size() > 4 ? lower.substr(lower.size() - 4) : "";
         struct stat st;
-        if (stat((dir + "/" + n).c_str(), &st)) continue;
+        if (stat((dir + "/" + n).c_str(), &st)) {  // (logged: a package that can't be stat'ed is skipped, and that looks like "no game files")
+            fprintf(stderr, "[launcher] find_game: stat failed for %s/%s (errno %d)\n", dir.c_str(), n.c_str(), errno);
+            continue;
+        }
         if (ext == ".nsz" || ext == ".xcz") unusable = true;  // (compressed packages: decompress them first)
         if ((ext == ".xci" || ext == ".nsp" || ext == ".nca") && !S_ISDIR(st.st_mode) && (uint64_t)st.st_size > best &&
             package.empty()) {
@@ -374,6 +378,8 @@ static void *extract_thread(void *) {
     } else
 #endif
     find_game(src, 0, exefs, romfs, package, keys, unusable);
+    fprintf(stderr, "[launcher] find_game in '%s': package='%s' keys='%s' exefs='%s' romfs='%s' compressed=%d\n", src.c_str(),
+            package.c_str(), keys.c_str(), exefs.c_str(), romfs.c_str(), (int)unusable);
     if ((exefs.empty() || romfs.empty()) && !package.empty()) {  // the game package: ExeFS out, RomFS read in place
         if (keys.empty()) {
             set_job("No prod.keys beside the game package", true, "Put the keys file from your own Switch (prod.keys) in "

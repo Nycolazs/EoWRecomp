@@ -301,6 +301,47 @@ void vk_full_barrier(VkCommandBuffer cb) {
 static void ring_retire(void);
 void vc_flush(void);
 
+// ---- EOWRECOMP_DRAW_PROBE=1 (with F9 / EOWRECOMP_DEBUG_FRAME): an occlusion query around every draw of the captured
+// frame; the next frame logs "[probe]" rows with the pixels each draw wrote (after depth / stencil / discard).
+// Invisible geometry that the game does draw (trees, grass) shows as big meshes with 0 samples.
+extern bool g_host_query_reset;
+enum { PROBE_MAX = 4096 };
+static VkQueryPool pb_qp;
+static int pb_n, pb_on = -1;
+static struct { uint64_t vs, fs, fsh; uint32_t count, inst; bool indexed; int vp[4]; } pb_row[PROBE_MAX];
+static bool probe_begin(VkCommandBuffer cb, uint64_t vs, uint64_t fs, uint32_t count, uint32_t inst, bool indexed, const float *vp) {
+    if (pb_on < 0) pb_on = getenv("EOWRECOMP_DRAW_PROBE") && g_host_query_reset;
+    if (!pb_on || !g_debug_frame || pb_n >= PROBE_MAX) return false;
+    if (!pb_qp) {
+        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION, .queryCount = PROBE_MAX};
+        if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &pb_qp) != VK_SUCCESS) { pb_on = 0; return false; }
+        vkResetQueryPool(g_vk.dev, pb_qp, 0, PROBE_MAX);
+    }
+    pb_row[pb_n].vs = vs; pb_row[pb_n].fs = fs; pb_row[pb_n].count = count; pb_row[pb_n].inst = inst; pb_row[pb_n].indexed = indexed;
+    for (int i = 0; i < 4; i++) pb_row[pb_n].vp[i] = (int)vp[i];
+    vkCmdBeginQuery(cb, pb_qp, (uint32_t)pb_n, VK_QUERY_CONTROL_PRECISE_BIT);
+    return true;
+}
+static void probe_end(VkCommandBuffer cb) { vkCmdEndQuery(cb, pb_qp, (uint32_t)pb_n); pb_n++; }
+void renderer_flush(void);
+void vk_probe_report(void) {
+    if (!pb_n) return;
+    renderer_flush();
+    static uint64_t res[PROBE_MAX];
+    if (vkGetQueryPoolResults(g_vk.dev, pb_qp, 0, (uint32_t)pb_n, sizeof res, res, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+        int zero = 0, big0 = 0;
+        for (int i = 0; i < pb_n; i++) {
+            LOG("[probe] #%d %s vs=%llx fs=%llx count %u inst %u vp %d %d %d %d -> %llu pixels\n", i, pb_row[i].indexed ? "e" : "a",
+                (unsigned long long)pb_row[i].vs, (unsigned long long)pb_row[i].fs, pb_row[i].count, pb_row[i].inst,
+                pb_row[i].vp[0], pb_row[i].vp[1], pb_row[i].vp[2], pb_row[i].vp[3], (unsigned long long)res[i]);
+            if (!res[i]) { zero++; if (pb_row[i].count >= 300) big0++; }
+        }
+        LOG("[probe] %d draws, %d wrote no pixel, %d of those with >= 300 vertices/indices\n", pb_n, zero, big0);
+    }
+    vkResetQueryPool(g_vk.dev, pb_qp, 0, PROBE_MAX);
+    pb_n = 0;
+}
+
 // ---- EOWRECOMP_GPUPROF_AT=<frame>: GPU time per pass / dispatch / copy of that frame, logged as "[gpuprof]".
 // A timestamp (ALL_COMMANDS: after everything before it) at each mark; a row = the work since the previous mark.
 bool g_gpuprof_frame;
@@ -443,9 +484,10 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
             if (s->npools == 16) FATAL("descriptor pools exhausted\n");
             VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
                                             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
-                                            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024}};
+                                            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},
+                                            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256}};
             VkDescriptorPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 8192,
-                                             .poolSizeCount = 5, .pPoolSizes = sizes};
+                                             .poolSizeCount = 6, .pPoolSizes = sizes};
             VK_CHECK(vkCreateDescriptorPool(g_vk.dev, &ci, NULL, &s->pools[s->npools++]));
         }
         VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -578,8 +620,26 @@ static Job *jobs_head, *jobs_tail;
 static pthread_mutex_t jobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
+// What the build threads are doing now (vk_jobs_status, logged every ~10 s): when the translator / each worker began its
+// current job (0 = idle) and how many jobs wait. A build that never finishes shows up here, not in the slow-build line.
+#define MAX_WORKERS 32
+static _Atomic uint64_t g_tr_start, g_wk_start[MAX_WORKERS];
+static _Atomic int g_nworkers, g_tq_len, g_jq_len;
+// ...and which job: kind (c compile_program, p build_pipeline, k build_compute), fragment code address, fragment GLSL size.
+static _Atomic uint64_t g_wk_code[MAX_WORKERS], g_wk_size[MAX_WORKERS], g_wk_vcode[MAX_WORKERS], g_wk_vsize[MAX_WORKERS];
+static _Atomic int g_wk_kind[MAX_WORKERS];
+static _Thread_local int tl_wk = -1;
+// (the vertex shader too: the 2026-11-08 log had a 4.8 KB fragment shader's pipeline running for 179 s, so the stuck part
+// may be the vertex shader or the pair)
+static void wk_label(int kind, uint64_t code, uint64_t size, uint64_t vcode, uint64_t vsize) {
+    if (tl_wk < 0) return;  // (blocking mode: no worker)
+    atomic_store(&g_wk_kind[tl_wk], kind); atomic_store(&g_wk_code[tl_wk], code); atomic_store(&g_wk_size[tl_wk], size);
+    atomic_store(&g_wk_vcode[tl_wk], vcode); atomic_store(&g_wk_vsize[tl_wk], vsize);
+}
+
 static void *worker(void *a) {
-    (void)a;
+    int id = (int)(intptr_t)a;
+    tl_wk = id;
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
@@ -587,10 +647,39 @@ static void *worker(void *a) {
         jobs_head = j->next;
         if (!jobs_head) jobs_tail = NULL;
         pthread_mutex_unlock(&jobs_lock);
+        atomic_fetch_sub(&g_jq_len, 1);
+        Uint64 t0 = SDL_GetTicks();
+        atomic_store(&g_wk_start[id], t0 ? t0 : 1);
         j->fn(j->arg);
+        atomic_store(&g_wk_start[id], 0);
+        // (a driver that takes seconds per pipeline leaves the draws that need it skipped for just as long)
+        if (SDL_GetTicks() - t0 >= 1500)
+            LOG("[vk] slow shader/pipeline build: %llu ms (worker) %c fs code %llx glsl %llu, vs code %llx glsl %llu\n",
+                (unsigned long long)(SDL_GetTicks() - t0), "?cpk"[atomic_load(&g_wk_kind[id]) & 3], (unsigned long long)atomic_load(&g_wk_code[id]),
+                (unsigned long long)atomic_load(&g_wk_size[id]), (unsigned long long)atomic_load(&g_wk_vcode[id]), (unsigned long long)atomic_load(&g_wk_vsize[id]));
         free(j);
     }
     return NULL;
+}
+
+void vk_jobs_status(char *buf, size_t size) {
+    Uint64 now = SDL_GetTicks();
+    uint64_t ts = atomic_load(&g_tr_start);
+    int n = atomic_load(&g_nworkers), busy = 0;
+    uint64_t longest = 0;
+    int lw = -1;
+    for (int i = 0; i < n; i++) {
+        uint64_t st = atomic_load(&g_wk_start[i]);
+        if (st) { busy++; if (now - st > longest) { longest = now - st; lw = i; } }
+    }
+    int l = snprintf(buf, size, "translator %s %llu ms, %d queued; compile workers busy %d of %d (longest %llu ms), %d queued",
+             ts ? "busy for" : "idle", (unsigned long long)(ts ? now - ts : 0), atomic_load(&g_tq_len), busy, n,
+             (unsigned long long)longest, atomic_load(&g_jq_len));
+    if (lw >= 0 && l > 0 && (size_t)l < size)
+        snprintf(buf + l, size - l, "; longest job: %c fs code %llx, glsl %llu bytes; vs code %llx, glsl %llu bytes",
+                 "?cpk"[atomic_load(&g_wk_kind[lw]) & 3], (unsigned long long)atomic_load(&g_wk_code[lw]),
+                 (unsigned long long)atomic_load(&g_wk_size[lw]), (unsigned long long)atomic_load(&g_wk_vcode[lw]),
+                 (unsigned long long)atomic_load(&g_wk_vsize[lw]));
 }
 
 static bool sync_shaders(void) {
@@ -614,18 +703,29 @@ static void *translator(void *a) {
         tjobs_head = j->next;
         if (!tjobs_head) tjobs_tail = NULL;
         pthread_mutex_unlock(&tjobs_lock);
+        atomic_fetch_sub(&g_tq_len, 1);
+        Uint64 t0 = SDL_GetTicks();
+        atomic_store(&g_tr_start, t0 ? t0 : 1);
         j->fn(j->arg);
+        atomic_store(&g_tr_start, 0);
+        if (SDL_GetTicks() - t0 >= 1500) LOG("[vk] slow shader translation: %llu ms\n", (unsigned long long)(SDL_GetTicks() - t0));
         free(j);
     }
     return NULL;
 }
 static bool sync_shaders(void);
 static void run_translate(void (*fn)(void *), void *arg) {
-    if (sync_shaders()) { fn(arg); return; }
+    if (sync_shaders()) {
+        Uint64 t0 = SDL_GetTicks();
+        fn(arg);
+        if (SDL_GetTicks() - t0 >= 1500) LOG("[vk] slow shader/pipeline build: %llu ms (blocking)\n", (unsigned long long)(SDL_GetTicks() - t0));
+        return;
+    }
     static bool started;
     if (!started) { started = true; pthread_t t; pthread_create(&t, NULL, translator, NULL); }
     Job *j = malloc(sizeof *j);
     j->fn = fn; j->arg = arg; j->next = NULL;
+    atomic_fetch_add(&g_tq_len, 1);
     pthread_mutex_lock(&tjobs_lock);
     if (tjobs_tail) tjobs_tail->next = j; else tjobs_head = j;
     tjobs_tail = j;
@@ -634,7 +734,12 @@ static void run_translate(void (*fn)(void *), void *arg) {
 }
 
 static void run_job(void (*fn)(void *), void *arg) {
-    if (sync_shaders()) { fn(arg); return; }
+    if (sync_shaders()) {
+        Uint64 t0 = SDL_GetTicks();
+        fn(arg);
+        if (SDL_GetTicks() - t0 >= 1500) LOG("[vk] slow shader/pipeline build: %llu ms (blocking)\n", (unsigned long long)(SDL_GetTicks() - t0));
+        return;
+    }
     static bool started;
     if (!started) {
         started = true;
@@ -642,10 +747,15 @@ static void run_job(void (*fn)(void *), void *arg) {
         int n = SDL_GetNumLogicalCPUCores() - 4;
         if (n < 4) n = 4;
         if (n > 16) n = 16;
-        for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, NULL); }
+        const char *e = getenv("EOWRECOMP_SHADER_THREADS");  // fewer: less CPU and RAM (each worker has its own compiler)
+        if (e && atoi(e) > 0) n = atoi(e) > MAX_WORKERS ? MAX_WORKERS : atoi(e);
+        LOG("[vk] %d shader/pipeline worker threads\n", n);
+        atomic_store(&g_nworkers, n);
+        for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, (void *)(intptr_t)i); }
     }
     Job *j = malloc(sizeof *j);
     j->fn = fn; j->arg = arg; j->next = NULL;
+    atomic_fetch_add(&g_jq_len, 1);
     pthread_mutex_lock(&jobs_lock);
     if (jobs_tail) jobs_tail->next = j; else jobs_head = j;
     jobs_tail = j;
@@ -1189,6 +1299,7 @@ static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, V
 
 static void save_glsl(const char *src, uint64_t addr, const char *suffix) {
     if (!getenv("EOWRECOMP_SAVE_MSL")) return;
+    mkdir("build", 0755);  // (Windows: next to the .exe there is no build/ - the log of 2026-11-08 found no .glsl)
     mkdir("build/glsl", 0755);
     char path[256];
     snprintf(path, sizeof path, "build/glsl/%llx_%s.glsl", (unsigned long long)addr, suffix);
@@ -1199,6 +1310,7 @@ static void save_glsl(const char *src, uint64_t addr, const char *suffix) {
 static void compile_program(void *arg) {
     Prog *p = arg;
     size_t nv = 0, nf = 0;
+    wk_label(1, p->code[1], strlen(p->fi->msl), p->code[0], strlen(p->vi->msl));
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
     uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
     if (!sv || !sf) { free(sv); free(sf); atomic_store(&p->state, 2); return; }
@@ -1244,6 +1356,28 @@ static void translate_program(void *arg) {
 #define PROG_TAB 4096
 static struct { uint64_t key; Prog *prog; } prog_tab[PROG_TAB];
 
+// Handle slots of a stage whose texture is read through the stencil aspect (ShaderKey.stencil_tex). The rift's ribbon shader
+// (72a71bb500) samples the depth-stencil buffer's stencil and tests bits 5/6 of it with R2P: a float depth sample gave it
+// garbage and the ribbon came out as thin dashes.
+extern uint32_t nvn_stencil_views;
+static NvnTexEntry *tex_entry(int stage, int slot) {
+    uint64_t h = st.tex[stage][slot];
+    uint32_t tic = h & 0xFFFFF;
+    if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
+    NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
+    return e->tex ? e : NULL;
+}
+
+static uint32_t stencil_slots(int stage) {
+    uint32_t m = 0;
+    if (!nvn_stencil_views) return 0;
+    for (int s = 0; s < 32; s++) {
+        NvnTexEntry *e = tex_entry(stage, s);
+        if (e && vk_samples_stencil(e->tex, &e->view, e->has_view)) m |= 1u << s;
+    }
+    return m;
+}
+
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
     uint64_t h = 0xcbf29ce484222325ull;
@@ -1251,6 +1385,7 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     const uint8_t *vb = (const uint8_t *)vkey;
     for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
+    for (int i = 0; i < 4; i++) { h ^= (fkey->stencil_tex >> (i * 8)) & 0xFF; h *= 0x100000001B3ull; }
     if (!h) h = 1;
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
@@ -1332,6 +1467,10 @@ static VkFormat vertex_format(uint32_t f) {
     case 0x2F: return VK_FORMAT_R32G32B32A32_UINT;
     case 0x30: return VK_FORMAT_R32G32B32A32_SINT;
     case 0x3D: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    // RGB10A2UI: attr_kind() already declares it uvec4 in the shader, but without this case it fell to the float4
+    // default below (16 bytes read per vertex instead of 4, so the 2nd/3rd components came from the next vertex).
+    // Skinned meshes pack bone indices like this (a 10-bit index in the low bits, the rest zero).
+    case 0x3E: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
     case 0x69: return VK_FORMAT_A2B10G10R10_SNORM_PACK32;
     case 0x3F: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     case 0x40: return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
@@ -1479,6 +1618,29 @@ static VkPrimitiveTopology topo_class_base(uint8_t c) {
 static void build_pipeline(void *arg) {
     Pipe *pp = arg;
     PipeKey *k = &pp->k;
+    wk_label(2, k->prog->code[1], strlen(k->prog->fi->msl), k->prog->code[0], strlen(k->prog->vi->msl));
+    {   // Windows log (Radeon RX 580, 2026-11-08): pipelines for a ~50 KB fragment shader (code 72a5c12e00) never finished -
+        // 186 s and counting, private memory up to 38 GB, every worker eventually stuck. EOWRECOMP_MAX_FS_GLSL=<bytes>
+        // fails those pipelines at once (their draws are skipped) so the rest can render.
+        static size_t lim = (size_t)-1;
+        if (lim == (size_t)-1) { const char *e = getenv("EOWRECOMP_MAX_FS_GLSL"); lim = e && atoi(e) > 0 ? (size_t)atoi(e) : 0; }
+        // EOWRECOMP_MAX_VS_GLSL=<bytes>: the same for the vertex shader (Windows log 2026-11-08: the pipeline that ran for
+        // minutes pairs a 75 KB fragment shader with a 108 KB vertex shader, code 72a5c0e100)
+        static size_t vlim = (size_t)-1;
+        if (vlim == (size_t)-1) { const char *e = getenv("EOWRECOMP_MAX_VS_GLSL"); vlim = e && atoi(e) > 0 ? (size_t)atoi(e) : 0; }
+        if (vlim && strlen(k->prog->vi->msl) > vlim) {
+            LOG("[vk] pipeline skipped: vs code %llx has %zu bytes of GLSL (EOWRECOMP_MAX_VS_GLSL=%zu)\n",
+                (unsigned long long)k->prog->code[0], strlen(k->prog->vi->msl), vlim);
+            atomic_store(&pp->state, 2);
+            return;
+        }
+        if (lim && strlen(k->prog->fi->msl) > lim) {
+            LOG("[vk] pipeline skipped: fs code %llx has %zu bytes of GLSL (EOWRECOMP_MAX_FS_GLSL=%zu)\n",
+                (unsigned long long)k->prog->code[1], strlen(k->prog->fi->msl), lim);
+            atomic_store(&pp->state, 2);
+            return;
+        }
+    }
     VkPipelineShaderStageCreateInfo stages[2] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = k->prog->vs, .pName = "main"},
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = k->prog->fs, .pName = "main"}};
@@ -1543,9 +1705,9 @@ static void build_pipeline(void *arg) {
 
 // ================================================================== feedback snapshots (renderer.m resolve_feedback)
 static NvnTexture *feedback_tex[4];
-static VkImageView feedback_view[4];
+static VkImageView feedback_view[4], feedback_view_s[4];  // depth / stencil aspect of the snapshot
 static int nfeedback;
-static uint64_t g_cur_fs_hash;
+static uint64_t g_cur_fs_hash, g_cur_vs_hash;
 static NvnTexture *snap_tex[8];
 static bool snap_ok[8];
 static const char *snap_why[8];
@@ -1621,6 +1783,32 @@ static void debug_save_depth(TexBackend *b, const char *path) {
     for (uint64_t i = 0; i < n; i++) fputc(hi > lo ? (int)((d[i] - lo) / (hi - lo) * 255.0f) : 0, f);
     fclose(f);
     LOG("[vk] saved %s (%ux%u depth %.6f..%.6f)\n", path, b->width, b->height, lo, hi);
+}
+
+// (debug frames) the stencil aspect as a PGM (value * 4, clamped) + a count of the values with bits 5 / 6 set: what the rift's
+// fragment shader (72a71bb500) reads through R2P
+static void debug_save_stencil(TexBackend *b, const char *path) {
+    if (!b || !b->image || !(b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) return;
+    uint64_t n = (uint64_t)b->width * b->height;
+    VkSpan out = vk_readback(n);
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkBufferImageCopy c = {.bufferOffset = out.off, .imageSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1},
+                           .imageExtent = {b->width, b->height, 1}};
+    vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
+    renderer_flush();
+    const uint8_t *d = out.ptr;
+    uint64_t hist[256] = {0}, b5 = 0, b6 = 0;
+    for (uint64_t i = 0; i < n; i++) { hist[d[i]]++; b5 += d[i] >> 5 & 1; b6 += d[i] >> 6 & 1; }
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P5 %u %u 255\n", b->width, b->height);
+        for (uint64_t i = 0; i < n; i++) fputc(d[i] * 4 > 255 ? 255 : d[i] * 4, f);
+        fclose(f);
+    }
+    LOG("[vk] saved %s (%ux%u stencil, bit5 %llu bit6 %llu texels; values:", path, b->width, b->height, (unsigned long long)b5, (unsigned long long)b6);
+    for (int v = 0; v < 256; v++) if (hist[v]) LOG(" %#x=%llu", v, (unsigned long long)hist[v]);
+    LOG(")\n");
 }
 
 // (debug) EOWRECOMP_COPY_TRACE=<frame>: draws' attachments / sampled textures, copies and snapshots of that frame ("[ct]")
@@ -1832,6 +2020,7 @@ static void resolve_feedback(Prog *pr) {
             static const VkComponentMapping id = {0};
             if (!nosnap && si >= 0 && (snap_ok[si] || self_write) && existing) {
                 feedback_tex[nfeedback] = t;
+                feedback_view_s[nfeedback] = (src->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? vk_image_view(&existing->copy, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_STENCIL_BIT) : VK_NULL_HANDLE;
                 feedback_view[nfeedback++] = vk_image_view(&existing->copy, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
                 continue;
             }
@@ -1852,9 +2041,12 @@ static void resolve_feedback(Prog *pr) {
                 debug_save_depth(src, path);
                 snprintf(path, sizeof path, "build/fbdepth_%03d_snap.pgm", nd++);
                 debug_save_depth(dst, path);
+                snprintf(path, sizeof path, "build/fbstencil_%03d_snap.pgm", nd - 1);
+                debug_save_stencil(dst, path);
                 cb = vk_cmd();
             }
             feedback_tex[nfeedback] = t;
+            feedback_view_s[nfeedback] = (src->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_STENCIL_BIT) : VK_NULL_HANDLE;
             feedback_view[nfeedback++] = vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
             if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
             snap_ok[si] = true;
@@ -1867,6 +2059,8 @@ static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
     uint64_t max = g_vk.props.limits.maxUniformBufferRange;
     return (VkDescriptorBufferInfo){s.buf, s.off, size > max ? max : size};
 }
+
+static bool guest_live(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off);
 
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
@@ -1910,6 +2104,21 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
     // and drops the shared copies).
+    // ...except a dynamically indexed one (a skinned character's bone palette): in the game the cloth / hood / sword bones
+    // are computed by compute dispatches of the same submission, and a copy taken now misses their results (2026-11-10: Link's
+    // hood stretched into a beam while controlled, fine in cutscenes where the CPU writes the palette). Read in place, like
+    // vertex data (guest_direct); the barrier before each pass makes the compute writes visible. EOWRECOMP_VK_LIVE_UBO=0: copy.
+    static int live = -1;
+    if (live < 0) { const char *e = getenv("EOWRECOMP_VK_LIVE_UBO"); live = !e || atoi(e) != 0; }
+    if (live && (si->cbuf_dynamic & (1u << k)) && stage != 5) {
+        VkBuffer lb;
+        VkDeviceSize lo;
+        uint64_t al = g_vk.props.limits.minUniformBufferOffsetAlignment;
+        if (guest_live(r.addr, size, &lb, &lo) && (!al || lo % al == 0)) {
+            uint64_t max = g_vk.props.limits.maxUniformBufferRange;
+            return (VkDescriptorBufferInfo){lb, lo, size > max ? max : size};
+        }
+    }
     return ubo_span(guest_copy(r.addr, size), size);
 }
 
@@ -1939,7 +2148,8 @@ static bool gmem_import(uint64_t size) {
                                            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = size,
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT};
+                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};  // (uniform: live bone palettes, cbuf_info)
     VkBuffer buf;
     if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) { vkFreeMemory(g_vk.dev, mem, NULL); return false; }
     vkBindBufferMemory(g_vk.dev, buf, mem, 0);
@@ -2290,6 +2500,16 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     return true;
 }
 
+// A range of the guest heap in place (no copy, no vertex cache): for data the GPU itself writes during the submission.
+static bool guest_live(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+    if (addr < HEAP_BASE) return false;
+    if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
+    if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
+    *buf = gmem_buf;
+    *off = addr - HEAP_BASE;
+    return true;
+}
+
 static int g_cs_n;  // (compute program table below)
 
 // In-place reboot (device.c backend_reset; GPU idle): drop what is keyed by guest addresses - programs by code
@@ -2324,6 +2544,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
     VkImageView view = VK_NULL_HANDLE;
     VkSampler smp = VK_NULL_HANDLE;
+    bool stencil_key = false;  // the shader declared this binding a usampler2D (tex_stencil in translate.c)
     uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
     sc[0] = sc[1] = 1;
     wh[0] = wh[1] = 0;
@@ -2349,18 +2570,59 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
                 memo[ms].type = (uint8_t)st_->type; memo[ms].has_view = e->has_view; memo[ms].view = view;
             }
             renderer_texture_scale(e->tex, &sc[0], &sc[1]);
+            stencil_key = st_->type == TEXTYPE_2D && !st_->shadow && !st_->is_image && !st_->bindless &&
+                          vk_samples_stencil(e->tex, &e->view, e->has_view);
             wh[0] = e->tex->width; wh[1] = e->tex->height;
             for (int k = 0; k < nfeedback; k++)
                 if (e->tex == feedback_tex[k] && (st_->type == TEXTYPE_2D || st_->type == TEXTYPE_2D_ARRAY)) {
-                    view = feedback_view[k];
+                    view = vk_samples_stencil(e->tex, &e->view, e->has_view) && feedback_view_s[k] ? feedback_view_s[k] : feedback_view[k];
                     if (st_->type == TEXTYPE_2D_ARRAY) view = vk_dummy_view(TEXTYPE_2D_ARRAY);  // (2D snapshot as array: rare)
                 }
         }
     }
     if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc]);
     if (!view) view = vk_dummy_view(st_->type);
+    if (stencil_key) smp = vk_default_sampler(false);  // integer texels can't be filtered
     if (!smp) smp = vk_default_sampler(true);
     *out = (VkDescriptorImageInfo){smp, view, VK_IMAGE_LAYOUT_GENERAL};
+}
+
+// A compute shader's SUST image ("c[bank][offset]" holds its 32-bit handle, tic | sampler << 20: translate.c emit_sust).
+// Banks 0 / 2 are the driver's own constants: texture handles from 0x20 (8 bytes each, st.tex), the image handles after them
+// (guess: 0x120 + 8 * index = st.img[stage][index], NVN's nvnCommandBufferBindImage); any other bank is the game's
+// uniform buffer (bank 3 + n = st.ubuf[stage][n]) and the handle is read from guest memory. The first resolutions are
+// logged: the guess and the texture's IMAGE flag are what this depends on.
+static VkDescriptorImageInfo cs_img_ii[64];
+
+static bool image_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out) {
+    ShaderTexture *t = &si->tex[i];
+    uint64_t h = 0;
+    const char *how = "?";
+    if (t->bindless_cbuf == 0 || t->bindless_cbuf == 2) {  // (the log of 2026-11-09: SUST's handle is c[2][0x120])
+        if (t->bindless_offset >= 0x20 && t->bindless_offset < 0x120) { h = st.tex[stage][(t->bindless_offset - 0x20) / 8]; how = "texture slot"; }
+        else if (t->bindless_offset >= 0x120 && t->bindless_offset < 0x160) { h = st.img[stage][(t->bindless_offset - 0x120) / 8]; how = "image slot"; }
+    } else {
+        int idx = (int)t->bindless_cbuf - 3;
+        Range r = (idx >= 0 && idx < 18) ? st.ubuf[stage][idx] : (Range){0, 0};
+        if (r.addr && t->bindless_offset + 4 <= r.size) { h = *(const uint32_t *)(uintptr_t)(r.addr + t->bindless_offset); how = "uniform buffer"; }
+    }
+    NvnTexture *tex = NULL;
+    const NvnTextureView *tv = NULL;
+    uint32_t tic = h & 0xFFFFF;
+    if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
+        NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
+        tex = e->tex;
+        if (e->has_view) tv = &e->view;
+    }
+    VkImageView v = tex ? vk_storage_view(tex, tv) : VK_NULL_HANDLE;
+    static int nlog;
+    if (nlog++ < 12)
+        LOG("[cs-img] c[%u][%#x] (%s): handle %#llx -> texture %p%s%s\n", t->bindless_cbuf, t->bindless_offset, how, (unsigned long long)h,
+            (void *)tex, tex ? "" : " (none)", tex ? (v ? " storage view ok" : " NOT writable (no IMAGE flag / format)") : "");
+    if (tex && !v && nlog < 40) LOG("[cs-img]   texture %ux%u fmt %#x flags %#x target %u\n", tex->width, tex->height, tex->format, tex->flags, tex->target);
+    if (!v) return false;
+    *out = (VkDescriptorImageInfo){VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_GENERAL};
+    return true;
 }
 
 // Writes the descriptor set of one stage. gx..gz: compute group counts (driver constants).
@@ -2391,6 +2653,9 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 tex_sc[sg][ti][0] = sc[0]; tex_sc[sg][ti][1] = sc[1];
                 tex_wh[sg][ti][0] = wh[0]; tex_wh[sg][ti][1] = wh[1];
             }
+            w[n].pImageInfo = &ii[n];
+        } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && b->binding >= 32 && b->binding - 32 < 64) {
+            ii[n] = cs_img_ii[b->binding - 32];  // (resolved by dispatch_compute)
             w[n].pImageInfo = &ii[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding < 17) {
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
@@ -2431,6 +2696,7 @@ typedef struct { Prog p; ShaderInfo *si; VkPipeline pipe; uint32_t local[3]; } C
 static void build_compute(void *arg) {
     CsProg *cp = arg;
     size_t n = 0;
+    wk_label(3, 0, strlen(cp->si->msl), 0, 0);
     uint32_t *spv = vk_glsl_to_spirv(cp->si->msl, STAGE_COMPUTE, "cs", &n);
     if (!spv) { atomic_store(&cp->p.state, 2); return; }
     cp->p.nbinds = vk_reflect(spv, n, cp->p.binds, MAX_BIND);
@@ -2490,6 +2756,14 @@ static CsProg *compute_program(NvnProgram *np) {
     return cp;
 }
 
+static uint64_t ind_n, ind_zero, ind_inst, ind_idx, ind_flushes;  // indirect draws since the last stat line (vk_indirect_stats)
+static bool ind_flush_pending;
+void vk_indirect_stats(char *buf, size_t size) {
+    snprintf(buf, size, "indirect: %llu draws, %llu with 0 instances, %llu instances, %llu indices, %llu flushes", (unsigned long long)ind_n,
+             (unsigned long long)ind_zero, (unsigned long long)ind_inst, (unsigned long long)ind_idx, (unsigned long long)ind_flushes);
+    ind_n = ind_zero = ind_inst = ind_idx = ind_flushes = 0;
+}
+static bool ind_dirty;  // a compute dispatch was recorded since the last flush: indirect arguments may still be unwritten
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
@@ -2499,6 +2773,23 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         static uint64_t skip = ~0ull;
         if (skip == ~0ull) { const char *e = getenv("EOWRECOMP_SKIP_CS"); skip = e ? strtoull(e, NULL, 16) : 0; }
         if (skip && st.program->stages[5].code_addr == skip) { SKIP(SKIP_LIST); return; }
+    }
+    if (g_debug_frame && getenv("EOWRECOMP_DEBUG_DATA")) {  // every dispatch of the captured frame: which buffers it can write
+        // (2026-11-10: does any compute shader write the bone palette (vcb6 of the skinned draws)? match these ranges against it)
+        LOG("[cs-frame] cs %llx %ux%ux%u store %d gmem %d | sbufs:", (unsigned long long)st.program->stages[5].code_addr, gx, gy, gz,
+            cp->si->uses_gmem_store, cp->si->uses_gmem);
+        for (int i = 0; i < 16; i++)
+            if (st.sbuf[5][i].addr) LOG(" sb%d %llx+%llx", i, (unsigned long long)st.sbuf[5][i].addr, (unsigned long long)st.sbuf[5][i].size);
+        LOG(" | ubufs:");
+        for (int i = 0; i < 18; i++)
+            if (st.ubuf[5][i].addr) LOG(" c%d %llx+%x", i + 3, (unsigned long long)st.ubuf[5][i].addr, (unsigned)st.ubuf[5][i].size);
+        LOG(" | tex:");  // (the light-cone map is 128x72: which compute reads it?)
+        for (int i = 0; i < cp->si->ntex && i < 64; i++) {
+            NvnTexture *t = shader_texture_object(5, &cp->si->tex[i]);
+            if (t) LOG(" %s%ux%u/f%#x", cp->si->tex[i].is_image ? "I:" : "", t->width, t->height, t->format);
+            else LOG(" none");
+        }
+        LOG("\n");
     }
     if (cp->si->uses_gmem && getenv("EOWRECOMP_LOG_CS_SBUF")) {  // (debug) the storage buffers bound to gmem dispatches
         static uint64_t seen_cs[16];
@@ -2528,6 +2819,12 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         }
         LOG("\n");
     }
+    bool writes_image = false;
+    for (int i = 0; i < cp->si->ntex && i < 64; i++) {
+        if (!cp->si->tex[i].is_image) continue;
+        if (!image_info(5, cp->si, i, &cs_img_ii[i])) { SKIP(SKIP_COMPUTE_PROG); return; }  // (no writable image bound: as before SUST)
+        writes_image = true;
+    }
     if (cp->si->uses_gmem_map) gfast_prepare(cb);
     VkDescriptorSet ds = stage_set(&cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
@@ -2535,6 +2832,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     vkCmdDispatch(cb, gx, gy, gz);
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
     if (cp->si->uses_gmem_store) vc_mark_sbufs(5);
+    if (writes_image) vk_full_barrier(cb);  // (the next pass samples what SUST wrote)
     stat_dispatches++;
 }
 
@@ -2587,6 +2885,8 @@ static void draw_(CmdRec *r, bool indexed) {
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
+    vkey.stencil_tex = stencil_slots(0);
+    fkey.stencil_tex = stencil_slots(1);
     Prog *pr = get_program(st.program, &vkey, &fkey);
     if (!pr || atomic_load(&pr->state) != 1) { SKIP(pr && atomic_load(&pr->state) == 0 ? SKIP_PROG_PENDING : SKIP_PROG_FAILED); return; }
     {   // fragment-shader hash: skip lists (EOWRECOMP_SKIP_FSHASH), debug logging
@@ -2606,8 +2906,77 @@ static void draw_(CmdRec *r, bool indexed) {
             }
         }
         for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { SKIP(SKIP_LIST); return; }
+        // Same for the vertex shader (EOWRECOMP_SKIP_VSHASH): the main characters share one fragment shader, so only the vertex
+        // shader tells the skinned meshes apart when hunting the stretched part (2026-11-10).
+        static uint64_t last_vs, last_vhash, vskip[16];
+        static int nvskip = -1;
+        uint64_t vs = st.program->stages[0].code_addr;
+        if (vs != last_vs) {
+            last_vs = vs;
+            last_vhash = vs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(vs + 0x30), 0x200) : 0;
+        }
+        if (nvskip < 0) {
+            nvskip = 0;
+            for (const char *p = getenv("EOWRECOMP_SKIP_VSHASH"); p && *p && nvskip < 16;) {
+                vskip[nvskip++] = strtoull(p, (char **)&p, 16);
+                while (*p == ',') p++;
+            }
+        }
+        for (int i = 0; i < nvskip; i++) if (last_vhash == vskip[i]) { SKIP(SKIP_LIST); return; }
+        // EOWRECOMP_SKIP_VSPROG=a1,a2,...: skip by vertex-shader address (the [draw] lines' "vs=..."). The hash above covers only the
+        // first 0x200 bytes, so every variant of the depth pre-pass shares one hash and the hunt for the pre-pass draw that writes
+        // the wrong depth around the rift portal (2026-11-13) cannot tell them apart.
+        static uint64_t pskip[32];
+        static int npskip = -1;
+        if (npskip < 0) {
+            npskip = 0;
+            for (const char *p = getenv("EOWRECOMP_SKIP_VSPROG"); p && *p && npskip < 32;) {
+                pskip[npskip++] = strtoull(p, (char **)&p, 16);
+                while (*p == ',') p++;
+            }
+        }
+        for (int i = 0; i < npskip; i++) if (vs == pskip[i]) { SKIP(SKIP_LIST); return; }
+        g_cur_vs_hash = last_vhash;
         if (g_debug_frame && getenv("EOWRECOMP_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
+    }
+    {   // Bisect for the draw that makes the stretched beam (2026-11-11). The F10 mesh-by-mesh stepper filled up with enemies and
+        // scenery before Link's meshes showed up and never found it, so: every distinct draw (vertex shader + index count) is a
+        // candidate, and the player halves the set. F10 = skip the first half of the candidates; F7 = "the beam is gone" (it is in
+        // that half); F8 = "the beam is still there" (it is in the other half). Down to one candidate, which stays skipped.
+        extern volatile int g_skin_skip_request, g_bisect_gone, g_bisect_still;
+        static uint64_t keys[2048];
+        static int nkeys, frozen, lo, hi, slo, shi, h_f10, h_gone, h_still;
+        uint64_t key = (st.program->stages[0].code_addr << 20) ^ (uint64_t)r->x[2];
+        if (!frozen && nkeys < 2048) {
+            int j = 0;
+            while (j < nkeys && keys[j] != key) j++;
+            if (j == nkeys) keys[nkeys++] = key;
+        }
+        if (g_skin_skip_request != h_f10) {  // start (freeze the candidate list) / re-test the current half
+            h_f10 = g_skin_skip_request;
+            if (!frozen) { frozen = 1; lo = 0; hi = nkeys; LOG("[bisect] %d candidate draws\n", nkeys); }
+            slo = lo; shi = lo + (hi - lo + 1) / 2;
+            LOG("[bisect] skipping candidates %d..%d of %d..%d\n", slo, shi - 1, lo, hi - 1);
+        }
+        if (frozen && (g_bisect_gone != h_gone || g_bisect_still != h_still)) {
+            if (g_bisect_gone != h_gone) hi = shi;  // beam vanished: it is among the skipped
+            else lo = shi;                          // beam stayed: it is among the others
+            h_gone = g_bisect_gone; h_still = g_bisect_still;
+            if (hi - lo <= 1) {
+                slo = lo; shi = hi;
+                LOG("[bisect] FOUND candidate %d: vs %llx, index count %llu (all other draws drawn)\n", lo,
+                    (unsigned long long)(keys[lo] >> 20), (unsigned long long)(keys[lo] & 0xFFFFF));
+            } else {
+                slo = lo; shi = lo + (hi - lo + 1) / 2;
+                LOG("[bisect] now %d..%d: skipping %d..%d", lo, hi - 1, slo, shi - 1);
+                if (hi - lo <= 12) for (int q = lo; q < hi; q++) LOG(" [%d vs %llx n %llu]", q, (unsigned long long)(keys[q] >> 20), (unsigned long long)(keys[q] & 0xFFFFF));
+                LOG("\n");
+            }
+        }
+        if (frozen && shi > slo) {
+            for (int q = slo; q < shi; q++) if (keys[q] == key) { SKIP(SKIP_LIST); return; }
+        }
     }
     if (g_debug_frame) debug_draw(pr, r, indexed);
     if (ct_on()) ct_draw(pr, "draw");
@@ -2932,6 +3301,8 @@ static void draw_(CmdRec *r, bool indexed) {
     bool run_gold[MAX_RUNS];
     int nruns = 0;
     if (!nruns) { run_at[0] = 0; run_n[0] = inst; nruns = 1; run_gold[0] = false; }
+    float pvp[4] = {vp[0] * vp_sx + vp_ox, vp[1] * vp_sy + vp_oy, vp[2] * vp_sx, vp[3] * vp_sy};
+    bool probing = probe_begin(cb, st.program->stages[0].code_addr, st.program->stages[1].code_addr, (uint32_t)(use_index ? icount : count), inst, use_index, pvp);
     for (int ri = 0; ri < nruns; ri++) {
         if (nruns > 1 || run_gold[0]) {  // this run's tint: a fragment set of its own
             float rtint[8] = {0};
@@ -2941,6 +3312,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (!use_index) vkCmdDraw(cb, count, run_n[ri], first, base_inst + run_at[ri]);
         else vkCmdDrawIndexed(cb, icount, run_n[ri], 0, base_vertex, base_inst + run_at[ri]);
     }
+    if (probing) probe_end(cb);
     stat_draws++;
     cum_draws++;
     if (g_gpuprof_frame && gp_n) {
@@ -2952,29 +3324,189 @@ static void draw_(CmdRec *r, bool indexed) {
     }
 }
 
+static float dbg_half(uint16_t h) {  // IEEE half -> float (skin-cpu: F16x4 positions)
+    uint32_t sgn = (uint32_t)(h & 0x8000) << 16, e = (h >> 10) & 0x1F, m = h & 0x3FF, u;
+    if (e == 0) { float d = (float)m * (1.0f / 16777216.0f); return sgn ? -d : d; }
+    u = e == 31 ? sgn | 0x7F800000u | (m << 13) : sgn | ((e + 112) << 23) | (m << 13);
+    float f; memcpy(&f, &u, 4); return f;
+}
+
 static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     LOG("[draw] %s inst %llu mode %llu count %llu prog vs=%llx fs=%llx | vs cb %#x fs cb %#x | rt %d", indexed ? "e" : "a",
         (unsigned long long)(indexed ? r->x[6] : r->x[4]), (unsigned long long)r->x[0], (unsigned long long)r->x[2],
         (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.program->stages[1].code_addr,
         pr->vi->cbuf_mask, pr->fi->cbuf_mask, st.rt.ncolor);
-    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format);
+    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x@%llx", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format, (unsigned long long)st.rt.color[i]->addr);  // guest address too: does a shader read it as raw memory (gmem)?
+    LOG(" gmem vs%d fs%d", pr->vi->uses_gmem, pr->fi->uses_gmem);
     if (st.rt.depth) LOG(" d%#x %p", st.rt.depth->format, (void *)st.rt.depth);
-    LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n", st.viewport[0][0], st.viewport[0][1],
-        st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
+    LOG(" | vs hash %016llx | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x sten %d/%02x%02x%02x%02x ref %02x,%02x wm %02x,%02x poly %02x%02x chmask %08x\n",
+        (unsigned long long)g_cur_vs_hash, st.viewport[0][0], st.viewport[0][1],
+        st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.ds[3], st.ds[4], st.ds[5], st.ds[6], st.ds[7], st.stencil_ref[0], st.stencil_ref[1], st.stencil_mask[0], st.stencil_mask[1], st.poly[0], st.poly[1],
         st.channel_mask);
-    if (getenv("EOWRECOMP_DEBUG_DATA")) {  // vertex streams 0-1 and fragment cbufs: the first floats
-        for (int s = 0; s < 2; s++) {
+    if (getenv("EOWRECOMP_DEBUG_DATA")) {  // vertex streams and vertex / fragment cbufs: the first floats (and words)
+        for (int s = 0; s < 16; s++) {  // (vbuf has 16 entries: the "vbuf16" lines of earlier logs were really ubuf[0][0])
             if (!st.vbuf[s].addr) continue;
             const float *v = (const float *)(uintptr_t)st.vbuf[s].addr;
             LOG("[draw]   vbuf%d %llx size %llu:", s, (unsigned long long)st.vbuf[s].addr, (unsigned long long)st.vbuf[s].size);
             for (int k = 0; k < 16; k++) LOG(" %.4g", v[k]);
+            LOG(" | words");
+            for (int k = 0; k < 8; k++) LOG(" %08x", ((const uint32_t *)v)[k]);
             LOG("\n");
         }
-        for (int c = 0; c < 18; c++) {
-            if (!((pr->fi->cbuf_mask >> c) & 1) || !st.ubuf[1][c].addr) continue;
-            const float *u = (const float *)(uintptr_t)st.ubuf[1][c].addr;
-            LOG("[draw]   fcb%d %llx size %u:", c, (unsigned long long)st.ubuf[1][c].addr, (unsigned)st.ubuf[1][c].size);
-            for (int k = 0; k < 96 && k * 4 < (int)st.ubuf[1][c].size; k++) LOG(" %.6g", u[k]);
+        // Each used vertex attribute: NVN format, stream, offset and whether the shader sees it as float / int / uint.
+        // The skinning bone index (a7) is the one to check: it must be a uint format, read with the right component count.
+        for (int i = 0; i < 32 && i < st.nattrib; i++) {
+            if (!(pr->vi->attr_mask & (1u << i))) continue;
+            uint32_t a = st.attrib[i], fmt = a & 0xFF;
+            LOG("[draw]   attr a%d fmt %#x stream %u off %u kind %d stride %u\n", i, fmt, (a >> 8) & 0x1F, a >> 13, attr_kind(fmt),
+                ((a >> 8) & 0x1F) < (uint32_t)st.nstream ? (unsigned)st.stream[(a >> 8) & 0x1F][0] : 0u);
+        }
+        // Blend state of every enabled colour target (raw NVN bytes, the ones blend_factor()/blend_op() translate):
+        // b[1] src colour, b[2] dst colour, b[3] src alpha, b[4] dst alpha, b[5] colour op, b[6] alpha op.
+        // 2026-11-10: the HUD hearts come out with an opaque red background (alpha ignored): is the blend what the game asked for?
+        for (int i = 0; i < st.rt.ncolor && i < 8; i++) {
+            if (!((st.color_state[0] >> i) & 1)) continue;
+            const uint8_t *bb = st.blend[i];
+            LOG("[draw]   blend rt%d on: colour src %u dst %u op %u | alpha src %u dst %u op %u | write mask %x | rt format %#x\n", i, bb[1], bb[2], bb[5],
+                bb[3], bb[4], bb[6], (st.channel_mask >> (i * 4)) & 0xF, st.rt.color[i] ? st.rt.color[i]->format : 0);
+        }
+        // Skinned draws (a7 = bone indices in stream 0): do the vertices' indices fit the bone palette that is bound, and is every
+        // palette matrix sane? (2026-11-10: parts of Link / Zelda stretch into beams; the first matrices looked fine.)
+        if (pr->vi->attr_mask & 0x80 && st.nattrib > 7 && st.vbuf[0].addr) {
+            uint32_t a7 = st.attrib[7], f7 = a7 & 0xFF, o7 = a7 >> 13, s7 = (a7 >> 8) & 0x1F;
+            uint32_t ncomp = f7 == 0x03 ? 1 : f7 == 0x0F ? 2 : f7 == 0x27 ? 4 : 0;
+            uint32_t stride = st.nstream > 0 ? (uint32_t)st.stream[0][0] : 0;
+            int pk = -1;
+            for (int c = 3; c < 18; c++) if (((pr->vi->cbuf_dynamic >> c) & 1) && st.ubuf[0][c - 3].addr) { pk = c; break; }
+            if (ncomp && s7 == 0 && stride && pk >= 0) {
+                const uint8_t *vb = (const uint8_t *)(uintptr_t)st.vbuf[0].addr;
+                uint32_t nv = (uint32_t)(st.vbuf[0].size / stride), pal = st.ubuf[0][pk - 3].size / 48, maxi = 0, over = 0, firstover = ~0u;
+                uint8_t used[256] = {0};
+                for (uint32_t v = 0; v < nv; v++)
+                    for (uint32_t c = 0; c < ncomp; c++) {
+                        uint32_t ix = vb[(uint64_t)v * stride + o7 + c];
+                        used[ix] = 1;
+                        if (ix > maxi) maxi = ix;
+                        if (ix >= pal) { over++; if (firstover == ~0u) firstover = v; }
+                    }
+                const float *m = (const float *)(uintptr_t)st.ubuf[0][pk - 3].addr;
+                uint32_t bad = 0, firstbad = ~0u;
+                for (uint32_t b = 0; b < pal; b++) {
+                    int ok = 1;
+                    for (int k = 0; k < 12; k++) { float x = m[b * 12 + k]; if (!(x == x) || x > 1e4f || x < -1e4f) ok = 0; }
+                    if (!ok) { bad++; if (firstbad == ~0u) firstbad = b; }
+                }
+                // A bone world matrix that is all zero or sits at the world origin (characters stand around x,z ~ 100-200) was
+                // never computed: vertices weighted to it collapse to the origin = a beam from the character to there.
+                LOG("[draw]   skin: bones used by vertices that look uncomputed (zero / near origin):");
+                int nlisted = 0;
+                for (uint32_t b = 0; b < pal && b < 256; b++) {
+                    const float *mm = m + b * 12;
+                    float t2 = mm[3] * mm[3] + mm[7] * mm[7] + mm[11] * mm[11], r2 = 0;
+                    for (int k = 0; k < 12; k++) r2 += mm[k] * mm[k];
+                    if (used[b] && (r2 == 0 || t2 < 1.0f) && nlisted++ < 16) LOG(" %u(|t|=%.3g,|m|=%.3g)", b, sqrtf(t2), sqrtf(r2));
+                }
+                LOG(" total %d\n", nlisted);
+                // Scale of every used bone matrix (norm of its three columns): physics-driven bones (hair, hood, cloth) that blow up
+                // look sane to the checks above but stretch the mesh along one axis. 2026-11-11: hair / hood / cloth are the stretched parts.
+                {
+                    float smin = FLT_MAX, smax = 0;
+                    int nl = 0;
+                    LOG("[draw]   skin: bone scales outside 0.5..2:");
+                    for (uint32_t b = 0; b < pal && b < 256; b++) {
+                        if (!used[b]) continue;
+                        const float *mm = m + b * 12;
+                        float sc[3];
+                        for (int c = 0; c < 3; c++) sc[c] = sqrtf(mm[c] * mm[c] + mm[4 + c] * mm[4 + c] + mm[8 + c] * mm[8 + c]);
+                        for (int c = 0; c < 3; c++) { if (sc[c] < smin) smin = sc[c]; if (sc[c] > smax) smax = sc[c]; }
+                        if ((sc[0] < 0.5f || sc[0] > 2 || sc[1] < 0.5f || sc[1] > 2 || sc[2] < 0.5f || sc[2] > 2) && nl++ < 12)
+                            LOG(" %u(%.3g %.3g %.3g)", b, sc[0], sc[1], sc[2]);
+                    }
+                    LOG(" total %d, overall scale %.3g..%.3g\n", nl, smin == FLT_MAX ? 0.f : smin, smax);
+                }
+                LOG("[draw]   skin: %u vertices, palette cb%d %u matrices, max bone index %u, %u indices out of range (first at vertex %d), "
+                    "%u unsane matrices (first %d)\n", nv, pk, pal, maxi, over, (int)firstover, bad, (int)firstbad);
+                // The same skinning done on the CPU with the data the GPU reads: p' = sum(w_c * M[idx_c] * (pos, 1)), M = 3x4 row-major
+                // (translation in column 3). 2026-11-10: indices, palette and attribute formats all checked out, yet parts still stretch.
+                // If a beam already shows up here (huge bbox, a vertex far from the rest) the bad pose is in the data (palette / weights);
+                // if the mesh is compact here but stretched on screen, the bug is on the GPU side (translated VS, attribute fetch).
+                uint32_t a0 = st.attrib[0], o0 = a0 >> 13, a8 = st.nattrib > 8 ? st.attrib[8] : 0, f8 = a8 & 0xFF, o8 = a8 >> 13;
+                uint32_t wn = (pr->vi->attr_mask & 0x100) && ((a8 >> 8) & 0x1F) == 0 ? (f8 == 0x2A || f8 == 0x25 ? 4 : f8 == 0x0D ? 2 : 0) : 0;
+                int f16pos = (a0 & 0xFF) == 0x29;  // 2026-11-11: the 2-bone draws with F16x4 positions were not modelled (hair / hood candidates)
+                float *sp = (pr->vi->attr_mask & 1) && ((a0 & 0xFF) == 0x22 || f16pos) && ((a0 >> 8) & 0x1F) == 0 && nv ? malloc((size_t)nv * 3 * sizeof(float)) : NULL;
+                if (sp) {
+                    double cen[3] = {0, 0, 0};
+                    float lo[3] = {FLT_MAX, FLT_MAX, FLT_MAX}, hi[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX}, rlo[3] = {FLT_MAX, FLT_MAX, FLT_MAX},
+                          rhi[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+                    uint32_t used = 0;
+                    for (uint32_t v = 0; v < nv; v++) {
+                        const uint8_t *vp = vb + (uint64_t)v * stride;
+                        float posf[3];
+                        if (f16pos) for (int q = 0; q < 3; q++) posf[q] = dbg_half(((const uint16_t *)(vp + o0))[q]);
+                        const float *pos = f16pos ? posf : (const float *)(vp + o0);
+                        float w[4] = {1, 0, 0, 0}, o[3] = {0, 0, 0};
+                        for (uint32_t c = 0; c < ncomp; c++)
+                            w[c] = wn > c ? (f8 == 0x2A ? ((const uint16_t *)(vp + o8))[c] / 65535.0f : vp[o8 + c] / 255.0f)
+                                          : (ncomp > 1 && !wn ? 1.0f / ncomp : (c == 0 ? 1.0f : 0.0f));
+                        for (uint32_t c = 0; c < ncomp; c++) {
+                            uint32_t ix = vp[o7 + c];
+                            if (ix >= pal) continue;
+                            const float *mm = m + ix * 12;
+                            for (int r = 0; r < 3; r++) o[r] += w[c] * (mm[r * 4] * pos[0] + mm[r * 4 + 1] * pos[1] + mm[r * 4 + 2] * pos[2] + mm[r * 4 + 3]);
+                        }
+                        for (int r = 0; r < 3; r++) {
+                            sp[v * 3 + r] = o[r];
+                            if (o[r] < lo[r]) lo[r] = o[r];
+                            if (o[r] > hi[r]) hi[r] = o[r];
+                            if (pos[r] < rlo[r]) rlo[r] = pos[r];
+                            if (pos[r] > rhi[r]) rhi[r] = pos[r];
+                            cen[r] += o[r];
+                        }
+                        used++;
+                    }
+                    for (int r = 0; r < 3; r++) cen[r] /= used;
+                    double sumd = 0, worstd = 0;
+                    uint32_t worst = 0;
+                    for (uint32_t v = 0; v < nv; v++) {
+                        double dx = sp[v * 3] - cen[0], dy = sp[v * 3 + 1] - cen[1], dz = sp[v * 3 + 2] - cen[2], d = sqrt(dx * dx + dy * dy + dz * dz);
+                        sumd += d;
+                        if (d > worstd) { worstd = d; worst = v; }
+                    }
+                    double meand = sumd / nv;
+                    uint32_t nfar = 0;
+                    for (uint32_t v = 0; v < nv; v++) {
+                        double dx = sp[v * 3] - cen[0], dy = sp[v * 3 + 1] - cen[1], dz = sp[v * 3 + 2] - cen[2];
+                        if (sqrt(dx * dx + dy * dy + dz * dz) > 8 * meand) nfar++;
+                    }
+                    const uint8_t *wp = vb + (uint64_t)worst * stride;
+                    LOG("[draw]   skin-cpu: %u verts, bind-pose size %.1f %.1f %.1f -> skinned size %.1f %.1f %.1f centre %.1f %.1f %.1f, mean dist %.2f, "
+                        "%u verts farther than 8x mean; worst v%u dist %.1f bones %u %u %u %u weights %.2f %.2f %.2f %.2f\n",
+                        nv, rhi[0] - rlo[0], rhi[1] - rlo[1], rhi[2] - rlo[2], hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2], cen[0], cen[1], cen[2],
+                        meand, nfar, worst, worstd, wp[o7], ncomp > 1 ? wp[o7 + 1] : 0, ncomp > 2 ? wp[o7 + 2] : 0, ncomp > 3 ? wp[o7 + 3] : 0,
+                        wn > 0 ? (f8 == 0x2A ? ((const uint16_t *)(wp + o8))[0] / 65535.0f : wp[o8] / 255.0f) : 1.0f,
+                        wn > 1 ? (f8 == 0x2A ? ((const uint16_t *)(wp + o8))[1] / 65535.0f : wp[o8 + 1] / 255.0f) : 0.0f,
+                        wn > 2 ? (f8 == 0x2A ? ((const uint16_t *)(wp + o8))[2] / 65535.0f : wp[o8 + 2] / 255.0f) : 0.0f,
+                        wn > 3 ? (f8 == 0x2A ? ((const uint16_t *)(wp + o8))[3] / 65535.0f : wp[o8 + 3] / 255.0f) : 0.0f);
+                    free(sp);
+                }
+            }
+        }
+        // The vertex stage's own cbufs: skinned characters read their bone matrices (3x4 floats, 0x30 bytes each, index * 0x30)
+        // from one of them (2026-11-10: Zelda's body is right but one part is stretched into a long beam: a wrong or
+        // out-of-range matrix?). Size = the range the game bound; the matrices after the first few are the interesting ones.
+        for (int c = 3; c < 18; c++) {
+            if (!((pr->vi->cbuf_mask >> (c)) & 1) || !st.ubuf[0][c - 3].addr) continue;
+            const float *u = (const float *)(uintptr_t)st.ubuf[0][c - 3].addr;
+            uint32_t sz = st.ubuf[0][c - 3].size, nf = sz / 4 < 144 ? sz / 4 : 144;
+            LOG("[draw]   vcb%d %llx size %u (shader declares %u):", c, (unsigned long long)st.ubuf[0][c - 3].addr, sz, (unsigned)pr->vi->cbuf_size[c]);
+            for (uint32_t k = 0; k < nf; k++) LOG(" %.5g", u[k]);
+            LOG("\n");
+        }
+        for (int c = 3; c < 18; c++) {  // same indexing as the vertex loop above: shader cbuf k lives in ubuf[stage][k-3]
+            if (!((pr->fi->cbuf_mask >> c) & 1) || !st.ubuf[1][c - 3].addr) continue;  // (it used ubuf[1][c], i.e. the wrong bank: 2026-11-10 hearts)
+            const float *u = (const float *)(uintptr_t)st.ubuf[1][c - 3].addr;
+            LOG("[draw]   fcb%d %llx size %u:", c, (unsigned long long)st.ubuf[1][c - 3].addr, (unsigned)st.ubuf[1][c - 3].size);
+            for (int k = 0; k < 96 && k * 4 < (int)st.ubuf[1][c - 3].size; k++) LOG(" %.6g", u[k]);
             LOG("\n");
         }
     }
@@ -3662,7 +4194,58 @@ static void exec_list(uint64_t handle, int depth) {
                 clear(-1, 0, NULL, 0, r->x[0] != 0, r->f[0], has_stencil && r->x[2] != 0, (uint32_t)r->x[1], (uint32_t)r->x[2]);
             }
             break;
-        case CMD_DISPATCH: dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
+        case CMD_DISPATCH: ind_dirty = true; dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
+        case CMD_CLEAR_BUFFER: {  // nvnCommandBufferClearBuffer(addr, size, value): the GPU-culling counters / draw arguments
+            // are zeroed with it before the compute shaders fill them. Never executed before: the counters kept growing, so
+            // the vegetation showed on the first frame and then vanished.
+            uint64_t a = r->x[0], n = r->x[1];
+            uint32_t v = (uint32_t)r->x[2];
+            if (!a || !n) break;
+            VkBuffer gb; VkDeviceSize go;
+            if (!(a & 3) && !(n & 3) && guest_live(a, n, &gb, &go)) {
+                vk_end_pass();
+                VkCommandBuffer cb = vk_cmd();
+                vk_full_barrier(cb);
+                vkCmdFillBuffer(cb, gb, go, n, v);
+                vk_full_barrier(cb);
+                if (a - HEAP_BASE < HEAP_MAX) vc_mark_gpu(a - HEAP_BASE, a - HEAP_BASE + n);
+            } else {
+                wait_why = "ClearBuffer (unaligned / not in the heap)";
+                renderer_flush();
+                for (uint64_t i = 0; i < n; i++) ((uint8_t *)(uintptr_t)a)[i] = (uint8_t)(v >> ((i & 3) * 8));
+            }
+            break;
+        }
+        case CMD_DRAW_ARRAYS_INDIRECT: case CMD_DRAW_ELEMENTS_INDIRECT: case CMD_DISPATCH_INDIRECT: {
+            // The GPU decides what is drawn: the arguments sit in a buffer a compute shader fills (the game's vegetation:
+            // trees and grass are GPU-culled instance lists). The arguments are read on the CPU once the GPU work that
+            // wrote them is done (a flush only if a dispatch ran since the last one), then this is an ordinary draw.
+            uint64_t ia = r->op == CMD_DRAW_ELEMENTS_INDIRECT ? r->x[3] : r->op == CMD_DRAW_ARRAYS_INDIRECT ? r->x[1] : r->x[0];
+            if (!ia) break;
+            if (ind_dirty) { wait_why = "indirect draw arguments"; renderer_flush(); ind_dirty = false; ind_flush_pending = true; }
+            const uint32_t *a = (const uint32_t *)(uintptr_t)ia;
+            ind_n++;
+            if (r->op != CMD_DISPATCH_INDIRECT) {
+                if (!a[1]) ind_zero++; else { ind_inst += a[1]; ind_idx += (uint64_t)a[0] * a[1]; }
+                if (ind_flush_pending) { ind_flushes++; ind_flush_pending = false; }
+            }
+            static unsigned n_ind;
+            if (n_ind++ < 4) LOG("[nvn] indirect %s: args %u %u %u %u %u\n", r->op == CMD_DRAW_ELEMENTS_INDIRECT ? "elements" : r->op == CMD_DRAW_ARRAYS_INDIRECT ? "arrays" : "dispatch", a[0], a[1], a[2], a[3], a[4]);
+            if (r->op == CMD_DISPATCH_INDIRECT) { dispatch_compute(a[0], a[1], a[2]); break; }
+            CmdRec d = *r;  // (draw() reads only the header fields)
+            if (r->op == CMD_DRAW_ELEMENTS_INDIRECT) {  // {count, instanceCount, firstIndex, baseVertex, baseInstance}
+                if (!a[0] || !a[1] || a[0] > (1u << 24) || a[1] > (1u << 20)) break;
+                uint32_t isz = r->x[1] == 0 ? 1 : r->x[1] == 1 ? 2 : 4;
+                d.x[2] = a[0]; d.x[3] = r->x[2] + (uint64_t)a[2] * isz; d.x[4] = (uint64_t)(int64_t)(int32_t)a[3];
+                d.x[5] = a[4]; d.x[6] = a[1];
+                draw(&d, true);
+            } else {  // {count, instanceCount, first, baseInstance}
+                if (!a[0] || !a[1] || a[0] > (1u << 24) || a[1] > (1u << 20)) break;
+                d.x[1] = a[2]; d.x[2] = a[0]; d.x[3] = a[3]; d.x[4] = a[1];
+                draw(&d, false);
+            }
+            break;
+        }
         case CMD_DRAW_ARRAYS: draw(r, false); break;
         case CMD_DRAW_ELEMENTS: draw(r, true); break;
         case CMD_UPDATE_UNIFORM_BUFFER:

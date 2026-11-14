@@ -43,6 +43,7 @@ ZIG      ?= build/zig-full/zig
 CC       := $(ZIG) cc -target x86_64-windows-gnu
 CXX      := $(ZIG) c++ -target x86_64-windows-gnu
 GENARCH  ?= -mcpu=x86_64_v3  # (zig's spelling of x86-64-v3)
+MANIFEST_RC := runtime/platform/windows_manifest.rc  # (UTF-8 paths; runtime/platform/eowrecomp.manifest)
 endif
 IMGUI    := third_party/imgui
 GENFLAGS := -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
@@ -125,7 +126,7 @@ LDFLAGS  := -fuse-ld=lld -Wl,--stack,16777216 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3
             $(if $(RELEASE),-Wl$(comma)--subsystem$(comma)windows)  # release: no console window (log -> eowrecomp.log)
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
-BACKEND_OBJ += $(if $(wildcard docs/icon/icon.ico),$(B)/rt/platform/windows_rc.o)  # the .exe's icon (none yet)
+BACKEND_OBJ += $(if $(WINCROSS),,$(if $(wildcard docs/icon/icon.ico),$(B)/rt/platform/windows_rc.o))  # the .exe's icon (native builds: windres; WINCROSS: zig compiles windows_manifest.rc, which carries the icon too - the runner has no windres)
 WINDRES  ?= windres
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
 UIFLAGS  := -x c++ $(OSFLAGS)  # the .mm UI sources are plain C++ apart from __APPLE__ blocks
@@ -148,7 +149,7 @@ RT_OBJ   := $(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC))
 RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -DEOW_RUNTIME -Iruntime -Iruntime/nvn $(DEPINC) $(OSFLAGS)
 CXXFLAGS := -O2 -g -std=c++17 -DEOW_RUNTIME -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime/nvn $(DEPINC)
 
-all: $(EXE) $(if $(GEN_SRC),$(GAMELIB))
+all: $(EXE) $(if $(strip $(GEN_SRC)),$(GAMELIB))
 
 $(B)/obj/%.o: $(GEN)/%.c runtime/cpu.h
 	@mkdir -p $(dir $@)
@@ -188,9 +189,9 @@ $(B)/rt/%.o: runtime/%.m $(RT_HDRS)
 # linked to a temp file, then renamed over: a copy of the game still running keeps its (old) file - relinking in
 # place gets running copies killed by macOS (code signature of the changed pages). The temp file keeps the real name
 # (in a folder of its own): on Windows the import library records the name the game code library loads it by.
-$(EXE): $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ) $(IMGUI_OBJ)
+$(EXE): $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ) $(IMGUI_OBJ) $(MANIFEST_RC) $(if $(MANIFEST_RC),runtime/platform/eowrecomp.manifest docs/icon/icon.ico)
 	@mkdir -p $(dir $@)link
-	$(CXX) -o $(dir $@)link/$(notdir $@) $^ $(LDFLAGS)
+	$(CXX) -o $(dir $@)link/$(notdir $@) $(filter-out %.manifest %.ico,$^) $(LDFLAGS)
 	mv -f $(dir $@)link/$(notdir $@) $@
 
 ifeq ($(PLATFORM),windows)

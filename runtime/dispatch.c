@@ -136,6 +136,42 @@ GuestFn dispatch_lookup(uint64_t addr) {
 #define DCACHE 4096
 static __thread struct { uint64_t addr; GuestFn fn; } dcache[DCACHE];
 
+// What an unresolved indirect branch needs to be diagnosed without the game files at hand: the br's register, and
+// the code of the function that did it. A tail `br` leaves lr alone, so the function running is the one the `bl`
+// before lr called (crash at 7001a65870: the br site wasn't known). Reads only the main module's text, never
+// unmapped memory (guarded by the 0x7000000000 module window).
+static bool guest_text(uint64_t a) { return a >= 0x7000000000ull && a < 0x7100000000ull && !(a & 3); }
+
+static void dispatch_dump_unresolved(const Cpu *c, uint64_t pc) {
+    fprintf(stderr, "[dispatch] unresolved indirect branch to %llx; x0-x30:\n", (unsigned long long)pc);
+    for (int i = 0; i < 31; i++)
+        fprintf(stderr, "  x%-2d=%016llx%s", i, (unsigned long long)c->x[i], i % 4 == 3 ? "\n" : "");
+    fprintf(stderr, "\n");
+    uint64_t lr = c->x[30];
+    // the code just before the target: a compact jump table's br sits right before its cases (ADR base .. br x10), so the
+    // cause shows even when the callee isn't a plain `bl` (crash at 7001810220: lr-4 was a blr)
+    if (guest_text(pc) && guest_text(pc - 0x150)) {
+        fprintf(stderr, "[dispatch] code before the target:\n");
+        for (int i = 0; i < 0x150 / 4; i++) {
+            uint64_t a = pc - 0x150 + 4 * i;
+            fprintf(stderr, "  %llx: %08x%s", (unsigned long long)a, *(const uint32_t *)a, i % 4 == 3 ? "\n" : "");
+        }
+        fprintf(stderr, "\n");
+    }
+    if (!guest_text(lr) || !guest_text(lr - 4)) return;
+    uint32_t w = *(const uint32_t *)(lr - 4);
+    if ((w & 0xFC000000) != 0x94000000) return;  // not a BL
+    int64_t imm = (int64_t)(w & 0x03FFFFFF);
+    if (imm & 0x02000000) imm -= 0x04000000;
+    uint64_t callee = (lr - 4) + (uint64_t)(imm * 4);
+    fprintf(stderr, "[dispatch] lr-4 is `bl %llx`; its code (word offsets from the callee):\n", (unsigned long long)callee);
+    for (int i = 0; i < 96 && guest_text(callee + 4 * i); i++) {
+        uint32_t x = *(const uint32_t *)(callee + 4 * i);
+        fprintf(stderr, "  %llx: %08x%s", (unsigned long long)(callee + 4 * i), x, i % 4 == 3 ? "\n" : "");
+        if ((x & 0xFFFFFC1F) == 0xD61F0000 && i > 0) { fprintf(stderr, "\n  (first br at +%x)\n", 4 * i); break; }
+    }
+}
+
 static GuestFn dispatch_slow(Cpu *c) {
     uint64_t pc = c->pc;
     if (pc >= HLE_BASE && pc < HLE_BASE + HLE_SIZE) {
@@ -153,6 +189,7 @@ static GuestFn dispatch_slow(Cpu *c) {
     if (!f) {
         uint64_t off;
         const char *s = loader_symbol_at(c->x[30], &off);
+        dispatch_dump_unresolved(c, pc);
         FATAL("no function at %llx (lr=%llx %s+%llx)\n", pc, c->x[30], s ? s : "?", off);
     }
     unsigned h = (unsigned)(pc >> 2) & (DCACHE - 1);

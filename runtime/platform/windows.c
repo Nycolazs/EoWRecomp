@@ -1,5 +1,7 @@
 // Windows host layer (runtime/platform.h).
+#define PSAPI_VERSION 2  // (K32GetProcessMemoryInfo from kernel32.dll: no psapi.lib to link)
 #include <windows.h>
+#include <psapi.h>
 #include "cpu_check.h"
 #include <fcntl.h>
 #include <stdio.h>
@@ -7,6 +9,7 @@
 #include <string.h>
 #include <shellapi.h>
 #include <timeapi.h>
+#include <tlhelp32.h>
 #include <io.h>
 
 #include "../platform.h"
@@ -29,8 +32,17 @@ static bool lazy_commit(uint64_t a) {
 
 static bool g_report_crashes;
 
+// The hang watchdog walks other threads' stacks from copied contexts (watchdog_dump); one stopped inside generated code
+// or mid-syscall can have unwind data that RtlVirtualUnwind chokes on (log 48fa140d: c0000005 at 0x107c0 inside ntdll,
+// on the watchdog thread, ended the whole process). A fault while g_wd_walk is set aborts just that thread's walk.
+#include <setjmp.h>
+static jmp_buf g_wd_jmp;
+static volatile LONG g_wd_walk;
+static volatile DWORD g_wd_tid;
+
 static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *ep) {
     EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (g_wd_walk && GetCurrentThreadId() == g_wd_tid && er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) longjmp(g_wd_jmp, 1);
     if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
     uint64_t fa = er->ExceptionInformation[1];
     if (lazy_commit(fa)) return EXCEPTION_CONTINUE_EXECUTION;
@@ -198,6 +210,15 @@ void plat_init(void) {
     SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof pt);
 }
 
+bool plat_mem_mb(size_t *working, size_t *priv, size_t *peak) {
+    PROCESS_MEMORY_COUNTERS_EX pmc = {sizeof pmc};
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof pmc)) return false;
+    *working = pmc.WorkingSetSize >> 20;
+    *priv = pmc.PrivateUsage >> 20;
+    *peak = pmc.PeakWorkingSetSize >> 20;
+    return true;
+}
+
 bool plat_exe_path(char *buf, size_t size) {
     DWORD n = GetModuleFileNameA(NULL, buf, (DWORD)size);
     return n > 0 && n < size;
@@ -291,12 +312,189 @@ static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS *ep) {
     rt_fault_report(what, fa, ep->ContextRecord->Rip, lr);
 }
 
+// ---- hang watchdog
+// 2026-11-11 (RX 580 report): the game froze "out of nowhere" with the music still playing (audio thread alive, game/render
+// thread stuck) and the log had nothing. When no frame is presented for a while, print every thread's host stack
+// (suspend all, copy the contexts, resume, then unwind: printing with a suspended thread that holds the stderr/heap lock
+// would deadlock). The frames show which wait the game is stuck in (a fence, a mutex, a driver call, a guest function).
+uint64_t renderer_present_count(void);  // runtime/nvn/vulkan/device.c
+void kernel_dump_threads(void);         // runtime/kernel.c
+void kernel_unstick(void);              // runtime/kernel.c
+
+// Function names of our own executable: the PE's COFF symbol table (lld keeps it next to the DWARF), read once from
+// the file on the first dump. Without it the frames stay "eowrecomp+offset".
+typedef struct { uint32_t rva; char name[56]; } CSym;
+static CSym *csyms;
+static size_t ncsyms;
+
+static int csym_cmp(const void *a, const void *b) {
+    uint32_t x = ((const CSym *)a)->rva, y = ((const CSym *)b)->rva;
+    return x < y ? -1 : x > y;
+}
+
+static void load_coff_syms(void) {
+    char path[MAX_PATH];
+    if (!GetModuleFileNameA(NULL, path, sizeof path)) return;
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    uint8_t hdr[24];
+    uint32_t pe = 0;
+    fseek(f, 0x3c, SEEK_SET);
+    if (fread(&pe, 4, 1, f) != 1 || fseek(f, pe, SEEK_SET) || fread(hdr, 1, 24, f) != 24 || memcmp(hdr, "PE\0\0", 4)) goto out;
+    uint16_t nsec, optsz;
+    uint32_t symptr, nsym;
+    memcpy(&nsec, hdr + 6, 2); memcpy(&symptr, hdr + 12, 4); memcpy(&nsym, hdr + 16, 4); memcpy(&optsz, hdr + 20, 2);
+    if (!symptr || !nsym || nsec > 96) goto out;
+    uint32_t secrva[96], secchar[96];
+    fseek(f, (long)pe + 24 + optsz, SEEK_SET);
+    for (int i = 0; i < nsec; i++) {
+        uint8_t sh[40];
+        if (fread(sh, 1, 40, f) != 40) goto out;
+        memcpy(&secrva[i], sh + 12, 4); memcpy(&secchar[i], sh + 36, 4);
+    }
+    uint8_t *syms = malloc((size_t)nsym * 18);
+    if (!syms) goto out;
+    fseek(f, (long)symptr, SEEK_SET);
+    if (fread(syms, 18, nsym, f) != nsym) { free(syms); goto out; }
+    uint32_t strsz = 0;
+    char *strs = NULL;
+    if (fread(&strsz, 4, 1, f) == 1 && strsz > 4 && strsz < (64u << 20)) {
+        strs = malloc(strsz);
+        if (strs) { memcpy(strs, &strsz, 4); if (fread(strs + 4, 1, strsz - 4, f) != strsz - 4) { free(strs); strs = NULL; } }
+    }
+    csyms = malloc(sizeof(CSym) * (nsym / 1 + 1));
+    for (uint32_t i = 0; csyms && i < nsym; i += 1 + syms[i * 18 + 17]) {
+        uint8_t *s = syms + (size_t)i * 18;
+        int16_t sec;
+        uint32_t val;
+        memcpy(&sec, s + 12, 2); memcpy(&val, s + 8, 4);
+        if (sec <= 0 || sec > nsec || !(secchar[sec - 1] & 0x20) || (s[16] != 2 && s[16] != 3)) continue;  // code symbols only
+        CSym *c = &csyms[ncsyms];
+        const char *nm = NULL;
+        char tmp[9] = {0};
+        if (!*(uint32_t *)s) { uint32_t off; memcpy(&off, s + 4, 4); if (strs && off < strsz) nm = strs + off; }
+        else { memcpy(tmp, s, 8); nm = tmp; }
+        if (!nm || nm[0] == '.') continue;
+        c->rva = secrva[sec - 1] + val;
+        snprintf(c->name, sizeof c->name, "%s", nm);
+        ncsyms++;
+    }
+    qsort(csyms, ncsyms, sizeof(CSym), csym_cmp);
+    free(strs);
+    free(syms);
+out:
+    fclose(f);
+}
+
+static const CSym *csym_find(uint32_t rva) {
+    size_t lo = 0, hi = ncsyms;
+    while (lo < hi) { size_t m = (lo + hi) / 2; if (csyms[m].rva <= rva) lo = m + 1; else hi = m; }
+    return lo ? &csyms[lo - 1] : NULL;
+}
+
+static void print_frame(int i, uint64_t pc, uint64_t exe) {
+    uint64_t off = 0;
+    const char *s = rt_host_fn_name(pc, &off);  // game functions first (f_<guest addr>): they live in eowgame.dll
+    if (!s) s = plat_symbol(pc, &off);
+    if (s) fprintf(stderr, "  #%-2d %016llx %s+%llx\n", i, (unsigned long long)pc, s, (unsigned long long)off);
+    else {
+        const CSym *c = pc >= exe && pc - exe < 0x10000000 ? csym_find((uint32_t)(pc - exe)) : NULL;
+        if (c) fprintf(stderr, "  #%-2d %016llx %s+%x (eowrecomp+%llx)\n", i, (unsigned long long)pc, c->name, (unsigned)(pc - exe - c->rva), (unsigned long long)(pc - exe));
+        else fprintf(stderr, "  #%-2d %016llx eowrecomp+%llx\n", i, (unsigned long long)pc, (unsigned long long)(pc - exe));
+    }
+}
+
+static void watchdog_dump(unsigned secs) {
+    DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    enum { MAXT = 64 };
+    DWORD tids[MAXT];
+    CONTEXT ctx[MAXT];
+    int n = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te = {.dwSize = sizeof te};
+    for (BOOL ok = Thread32First(snap, &te); ok && n < MAXT; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+        HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!th) continue;
+        if (SuspendThread(th) != (DWORD)-1) {
+            memset(&ctx[n], 0, sizeof ctx[n]);
+            ctx[n].ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            if (GetThreadContext(th, &ctx[n])) tids[n++] = te.th32ThreadID;
+            ResumeThread(th);
+        }
+        CloseHandle(th);
+    }
+    CloseHandle(snap);
+    uint64_t exe = (uint64_t)(uintptr_t)GetModuleHandleA(NULL);
+    if (!csyms) load_coff_syms();
+    fprintf(stderr, "\n*** watchdog: no frame presented for %us, %d threads (frame %llu)\n", secs, n,
+            (unsigned long long)renderer_present_count());
+    kernel_dump_threads();
+    for (int t = 0; t < n; t++) {
+        fprintf(stderr, "--- thread %lu\n", (unsigned long)tids[t]);
+        CONTEXT *c = &ctx[t];
+        g_wd_tid = GetCurrentThreadId();
+        if (setjmp(g_wd_jmp)) {  // the walk faulted (see vectored_handler): this thread's trace ends here
+            g_wd_walk = 0;
+            fprintf(stderr, "  (stack walk aborted: fault in the unwinder)\n");
+            continue;
+        }
+        g_wd_walk = 1;
+        for (int i = 0; i < 32 && c->Rip; i++) {
+            print_frame(i, c->Rip, exe);
+            DWORD64 base;
+            PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c->Rip, &base, NULL);
+            if (rf) {
+                PVOID hd = NULL;
+                DWORD64 ef = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c->Rip, rf, c, &hd, &ef, NULL);
+            } else {  // leaf function without unwind info: the return address is on top of the stack
+                MEMORY_BASIC_INFORMATION mi;
+                if (!VirtualQuery((void *)(uintptr_t)c->Rsp, &mi, sizeof mi) || mi.State != MEM_COMMIT) break;
+                c->Rip = *(DWORD64 *)(uintptr_t)c->Rsp;
+                c->Rsp += 8;
+            }
+        }
+        g_wd_walk = 0;
+    }
+    fflush(stderr);
+}
+
+static DWORD WINAPI watchdog_main(LPVOID unused) {
+    (void)unused;
+    uint64_t last = 0;
+    unsigned still = 0;
+    bool seen_frame = false;
+    for (;;) {
+        Sleep(1000);
+        uint64_t f = renderer_present_count();
+        if (f != last) { last = f; still = 0; seen_frame |= f > 0; continue; }
+        if (!seen_frame) continue;  // startup / shader warm-up: not a hang
+        still++;
+        if (still == 10 || still == 40) watchdog_dump(still);  // a long level load also lands here, harmlessly
+        // The random freeze (every dump: the game's main thread waits on a condvar, the pool workers woke, found no work and
+        // went back to sleep) ends as soon as every condvar waiter is woken once - 17 of 17 times in log 48fa140d. Until the
+        // cause is found (the kernel's wake order was not it), do that automatically after 3 s without a frame, then every
+        // 3 s while it lasts. A correct guest re-checks its condition after a wait, so a stray wake is harmless; a long load
+        // or a shader compile stall just gets one too. EOWRECOMP_NO_UNSTICK=1 turns it off.
+        static int no_unstick = -1;
+        if (no_unstick < 0) no_unstick = getenv("EOWRECOMP_NO_UNSTICK") != NULL;
+        if (!no_unstick && still >= 3 && still % 3 == 0) {
+            if (still == 3) kernel_dump_threads();  // the wait state of every guest thread, for the log
+            kernel_unstick();
+        }
+    }
+    return 0;
+}
+
 void plat_crash_handler_install(void) {
     ULONG guarantee = 64 << 10;  // room for the report after a stack overflow
     SetThreadStackGuarantee(&guarantee);
     if (g_report_crashes) return;
     g_report_crashes = true;
     SetUnhandledExceptionFilter(unhandled_filter);
+    if (!getenv("EOWRECOMP_NO_WATCHDOG")) CreateThread(NULL, 0, watchdog_main, NULL, 0, NULL);
 }
 
 // ---- POSIX shims (win_compat.h)

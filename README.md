@@ -1,3 +1,5 @@
+# EoWRecomp
+
 <p align="center">
   <img src="docs/icon/icon_1024.png" width="128" alt="EoWRecomp icon">
 </p>
@@ -5,171 +7,116 @@
 <h1 align="center">EoWRecomp</h1>
 
 <p align="center">
-  <b>A static recompilation of <i>The Legend of Zelda: Echoes of Wisdom</i> (Nintendo Switch, 2024)</b><br>
-  native code for macOS (Apple Silicon), Linux, Windows and Android - not an emulator
+  <b>Static recompilation of <i>The Legend of Zelda: Echoes of Wisdom</i> (Nintendo Switch, 2024)</b><br>
+  <b>Current development focus: Windows x64 + Vulkan</b>
 </p>
 
 <p align="center">
-  <img alt="status" src="https://img.shields.io/badge/status-early%20development-orange">
-  <a href="https://github.com/Nycolazs/EoWRecomp/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/Nycolazs/EoWRecomp?include_prereleases&label=release"></a>
-  <img alt="platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows%20%7C%20Android-blue">
-  <img alt="renderer" src="https://img.shields.io/badge/renderer-Vulkan%20(MoltenVK%20on%20macOS)-red">
+  <img alt="status" src="https://img.shields.io/badge/status-active%20development-orange">
+  <img alt="platform" src="https://img.shields.io/badge/target-Windows%20x64-blue">
+  <img alt="graphics" src="https://img.shields.io/badge/graphics-Vulkan-red">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
 </p>
 
 ---
 
-The game's ARM64 machine code is translated to C **ahead of time** and compiled for the machine it runs on; a runtime
-replaces the Switch's operating system (Horizon) and its graphics API (NVN), drawing with Vulkan. Built on
-[LAS Recomp](https://github.com/peiikai/LASRecomp), the same kind of project for *Link's Awakening* (also by Grezzo),
-and on its Android port [LASRecomp-Android-Plus](https://github.com/Nycolazs/LASRecomp-Android-Plus).
-
-> [!WARNING]
-> **Early development - not fully playable yet.** The game boots, plays its opening and the first controllable scene
-> with working input (Linux / Vulkan). The macOS and Android builds start, set the game up from your own package and
-> are tested without the game; running the game on them is the next step. See [docs/STATUS.md](docs/STATUS.md).
+EoWRecomp translates the game's ARM64 machine code into C ahead of time and recompiles it for the host PC. Its runtime replaces the Switch operating-system services used by the game and implements the NVN graphics API on top of Vulkan. It is based on [LAS Recomp](https://github.com/peiikai/LASRecomp).
 
 > [!IMPORTANT]
-> **No game files are included**, and none ever will be - not in this repository, not in any build. EoWRecomp needs
-> your own legally obtained copy of *Echoes of Wisdom* **v1.0.0** (title `01008CF01BAAC000`, no update) and the
-> `prod.keys` of your own console. Instructions on how to obtain them will **not** be provided.
+> **Windows is the active testing and optimization target.** The results below come from testing on Windows 10 with a Xeon E5-2650 v4, Radeon RX 580 8 GB, 16 GB RAM and Vulkan. The project is still in development: some character rendering and visual effects remain incorrect.
 
-## Screenshots
+> [!WARNING]
+> **No game files are included.** You must provide your own legally obtained copy of *The Legend of Zelda: Echoes of Wisdom* v1.0.0 (title ID `01008CF01BAAC000`) and your own `prod.keys`. The repository does not provide game files, keys, or instructions for obtaining them.
 
-Frames of the recompiled game itself, captured by the runtime (native Linux build, Vulkan, 1280x720).
+## Windows progress
 
-| | |
+<details open>
+<summary><b>Windows x64 — Radeon RX 580 / Vulkan</b></summary>
+
+The Windows build now reaches in-game rendering. The game code is generated and compiled locally, the runtime loads the game modules, reads RomFS directly from the user's XCI package, and initializes Vulkan and audio.
+
+| Area | Current result |
 |---|---|
-| ![The opening: Link facing the Moblins in the dungeon](docs/screenshots/01_prologue.jpg) | ![The opening fight](docs/screenshots/02_prologue_fight.jpg) |
-| ![First controllable scene: the corridor, with the HUD](docs/screenshots/03_corridor_hud.jpg) | ![Walking and button prompts driven by input](docs/screenshots/04_room_prompts.jpg) |
+| Windows x64 | GitHub Actions build and ZIP packaging available |
+| Game setup | XCI and user's `prod.keys` detected |
+| Game code | 4 modules; 296,677 functions compiled into `eowgame.dll` |
+| Runtime | All 4 modules load; SDK boot succeeds |
+| Game data | RomFS read directly from XCI — 10,963 files |
+| Graphics | Vulkan; tested swapchain at 1280×720 |
+| Performance | **52 FPS** in the available Windows capture at **Hyrule Castle Town** (Xeon E5-2650 v4, RX 580 8 GB, 16 GB RAM). This is a test observation, not a guaranteed benchmark. |
+| Compute | SUST storage-image support and compute dispatch handling have been implemented; continued validation is in progress. |
 
-<p align="center">
-  <img src="docs/screenshots/05_android_start.jpg" width="720" alt="The Android app's start screen: choosing the game files folder"><br>
-  <sub>The Android app (alpha 1): setting the game up from your own files.</sub>
-</p>
+### Recent graphics and runtime progress
 
-## Download
+- Implemented `nvnCommandBufferClearBuffer` using Vulkan buffer clearing for guest heap buffers. This addresses GPU-culling counters/indirect arguments that were not being reset between frames.
+- Added execution of `DrawElementsIndirect`, `DrawArraysIndirect` and `DispatchComputeIndirect`, which the game uses for GPU-driven vegetation such as trees and grass.
+- Added periodic diagnostics for indirect draw/dispatch counts, zero-instance draws and flushes.
+- Corrected Maxwell lane operations for AMD wave64 GPUs: real lane IDs and lane masks, with ballot/vote/shuffle operations kept in 32-lane groups to match the Switch GPU's warp behavior. This is particularly relevant to the RX 580 (GCN).
+- Improved the Windows watchdog and kernel synchronization handling to help diagnose and mitigate intermittent stalls.
 
-**[Latest release](https://github.com/Nycolazs/EoWRecomp/releases/latest)** - *alpha 1, a preview: the start screen and
-the game setup, not the game yet* (see the warning above).
+**Validation note:** GitHub Actions runs for these recent changes completed successfully, but that confirms compilation and automated checks only. Vegetation rendering, frame pacing and freeze behavior still require confirmation in a real game session on Windows/Radeon.
 
-| | File | Needs |
-|---|---|---|
-| **macOS** | `EoWRecomp-alpha_1-macOS-arm64.zip` | Apple Silicon (M1 or later), macOS 15+. Not notarized: the first time, right-click the app -> **Open**. |
-| **Android** | `EoWRecomp-alpha_1-Android-arm64.apk` | arm64 phone, Android 11+, Vulkan 1.3. Builds the game code on the phone from your files. |
+### Known issues and work in progress
 
-Neither contains anything from the game: you choose the folder with your own `.nsp` / `.xci` and `prod.keys`, and the
-game code is recompiled on your device. Checksums: `SHA256SUMS.txt` in the release.
+- Character skinning and some models can still appear stretched.
+- Some HUD elements, heart transparency/colors and visual effects may still be incorrect.
+- GPU-driven vegetation and the latest indirect-draw path need in-game verification.
+- Intermittent stalls are being investigated; the watchdog is a mitigation, not a confirmed root-cause fix.
 
-## Features
+See [docs/STATUS.md](docs/STATUS.md) for the detailed technical log, test observations, logs, open bugs and next steps.
 
-- **Set up from your own package**: choose the folder with your `.nsp` / `.xci` and `prod.keys`. Only the game's code
-  (~40 MB) is written out; the 7.5 GB of game data is read **straight from your package**, decrypted and decompressed
-  on the fly ([runtime/nxpkg.c](runtime/nxpkg.c)) - no second copy of the game on your disk or phone.
-- **Built on your machine**: the start screen recompiles the game code locally (generator + bundled `zig` compiler);
-  nothing derived from the game is ever distributed.
-- **One renderer everywhere**: NVN reimplemented on Vulkan - natively on Linux / Windows / Android, through
-  [MoltenVK](https://github.com/KhronosGroup/MoltenVK) on Apple Silicon. The game's Maxwell GPU shaders are translated
-  to GLSL at run time (and tested against Metal's compiler for MoltenVK).
-- **Android**: touch controls with every Switch button, controllers, a pre-rotated swapchain (no compositor rotation
-  pass), Android performance hints, and the game code built on the phone itself (Python + clang inside the APK).
-- Upscaling (AMD FSR 1), SMAA, unlocked aspect ratio, control remapping, in-game settings menu (`F1` / `Esc`).
+</details>
 
-## Platforms
+## Windows build
 
-| | Build | Start screen & setup | The game |
-|---|---|---|---|
-| **Linux** (x86-64) | ✅ | ✅ | ✅ opening + first scene (Vulkan, Intel Iris Xe) |
-| **macOS** (Apple Silicon, 15+) | ✅ `.app` with MoltenVK | ✅ tested on an M1 | ⏳ next |
-| **Android** (arm64, Vulkan 1.3) | ✅ APK | ✅ tested on the Android 15 emulator | ⏳ next |
-| **Windows** (x86-64) | ✅ cross-compiled from Linux | - | untested |
+The repository includes a Windows x64 GitHub Actions workflow:
 
-## Progress
+- Open the repository's **Actions** tab.
+- Select the Windows build workflow and run it, or push a change that triggers it.
+- Download the `EoWRecomp-windows-x64` artifact from a successful workflow run.
 
-| Milestone | State |
-|---|---|
-| M1 - all game code recompiles to C (4 modules, ~296,000 functions, 0 unsupported instructions) | ✅ |
-| M2 - the runtime links and boots into the game | ✅ |
-| M3 - first frame presented | ✅ |
-| M4 - first correct image | ✅ the opening |
-| M5 - title screen, audio, input, new game, first playable scene | 🔶 input works, first scene reachable |
-| M6 - playable start to finish, saves | ⬜ |
-| M7 - PC features: resolution, free aspect ratio, unlocked frame rate, remapping, button icons | ⬜ |
+The package contains the application and build tools, but **does not contain game data**. The game code is generated and compiled on the user's PC from their own game package.
 
-## Building
-
-- **macOS** (Apple Silicon): [docs/BUILD-macos.md](docs/BUILD-macos.md) - `tools/macos/dev_deps.sh`, `make gen`,
-  `make`; `make app` makes the shippable `EoWRecomp.app`.
-- **Android**: [docs/BUILD-android.md](docs/BUILD-android.md) - the APK (with or without the on-phone builder) and a
-  personal APK with the game code built on your computer.
-- **Linux**: `tools/linux/dev_deps.sh`, then `make gen` and
-  `PATH=$PWD/build/bin:$PATH make -j$(nproc) DEPS=$PWD/build/deps-linux GENARCH=-mcpu=x86_64_v3`.
-- **Windows**: `tools/windows/fetch_deps.sh` and `tools/windows/build.sh all` (cross-compiled from Linux).
-
-Your game files, everywhere: `tools/venv/bin/python -I tools/nca_extract.py <prod.keys> <game.nsp | program.nca>
-extracted --no-romfs --romfs-image` - or let the start screen do it.
-
-### Tests that need no game files
-
-| | |
-|---|---|
-| `tools/test_nxpkg.sh` | the package reader: AES (FIPS-197, SP 800-38A), XTS (IEEE 1619), LZ4 |
-| `tools/test_translate.sh` | the Maxwell shader translator: random programs -> GLSL -> SPIR-V, validated |
-| `tools/test_moltenvk.sh` | ... on through SPIRV-Cross to MSL, compiled by Metal (MoltenVK's path) |
-| `tools/test_lift.py --synth` | the ARM64 lifter against Unicorn, instruction by instruction |
-| `tools/test_lse.c` | the ARMv8.1 atomics against the CPU's own instructions (ARM64 hosts) |
+For build details, see the scripts under `tools/windows/` and the workflow at `.github/workflows/build-windows.yml`.
 
 ## How it works
 
-- **Recompiler** (`tools/`, Python): reads the ExeFS modules (`main`, `sdk`, `subsdk0` - the GLSL compiler,
-  `subsdk1` - multimedia), finds every function (`.eh_frame`, symbols, relocations, call targets), resolves jump tables
-  by running the code in [Unicorn](https://www.unicorn-engine.org), and emits C for each function. Integer and memory
-  instructions become C; FP/SIMD becomes inline assembly on ARM64 hosts or portable C elsewhere. ARMv8.1 atomics and
-  128-bit exclusive pairs used by the SDK 16.2 are supported.
-- **Runtime** (`runtime/`, C): a small Horizon kernel (threads, mutexes and condition variables with Horizon
-  semantics, memory, events), IPC with the system services the game uses (file system, input, audio renderer, applet
-  manager, time, settings...), and NVN on top of Vulkan.
-- **Packages** (`runtime/nxpkg.c`, `tools/nca_extract.py`): NSP / XCI / NCA with the player's keys, including the
-  compressed RomFS this game uses (which hactool can't read).
+- **Recompiler** (`tools/`): analyzes the game's ARM64 modules, resolves functions and jump tables, and generates C code.
+- **Runtime** (`runtime/`): implements the Horizon services used by the game, including threads, synchronization, filesystem, input and audio.
+- **Graphics**: reimplements NVN on Vulkan and translates Maxwell GPU shaders to GLSL.
+- **Game package reader** (`runtime/nxpkg.c`): reads NSP/XCI/NCA packages using the user's keys. The RomFS can be read directly from the package instead of requiring a second multi-gigabyte copy.
 
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains the pipeline and what was reused, adapted or written new.
+## Latest development updates
+
+The latest Windows/Vulkan work focuses on restoring GPU-driven vegetation and improving AMD compatibility:
+
+- **Indirect GPU commands:** clear-buffer, indirect draw and indirect compute command handling.
+- **AMD wave64 compatibility:** lane ID/mask and 32-lane ballot/vote/shuffle semantics for GCN GPUs.
+- **Diagnostics and stability:** indirect-draw statistics and watchdog improvements for intermittent stalls.
+
+The corresponding GitHub Actions builds (#62–#66) completed successfully. These results do not replace in-game testing; the rendering and stability changes are still awaiting confirmation on the target PC.
+
+## Development status
+
+See **[docs/STATUS.md](docs/STATUS.md)** for the detailed technical log:
+- Windows test results and performance observations
+- Vulkan/Radeon shader and pipeline investigations
+- SUST and compute-shader progress
+- Remaining graphics bugs and diagnostic instructions
 
 ## Credits
 
-- **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai and its contributors - the base of this project
-  (MIT). The recompiler, the Horizon runtime, the NVN implementation, the Maxwell shader translator and the Vulkan
-  renderer all started there.
-- **[LASRecomp-Android-Plus](https://github.com/Nycolazs/LASRecomp-Android-Plus)** (MIT) - the Android platform
-  layer, the on-phone game code build, touch / pre-rotation / performance-hint techniques.
-- [SDL 3](https://libsdl.org) (zlib), [FFmpeg](https://ffmpeg.org) (LGPL 2.1+, linked dynamically, LGPL-only build),
-  [Dear ImGui](https://github.com/ocornut/imgui) (MIT), [MoltenVK](https://github.com/KhronosGroup/MoltenVK) and the
-  [Vulkan loader](https://github.com/KhronosGroup/Vulkan-Loader) (Apache 2.0),
-  [volk](https://github.com/zeux/volk) (MIT),
-  [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) (MIT),
-  [shaderc](https://github.com/google/shaderc) (Apache 2.0), [SMAA](https://github.com/iryoku/smaa) (MIT),
-  [AMD FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (MIT),
-  [Baloo 2](https://github.com/EkType/Baloo2) (SIL OFL 1.1) and [DejaVu Sans](https://dejavu-fonts.github.io)
-  (Bitstream Vera license) fonts
-- Build-time and on-phone tools: [Capstone](https://www.capstone-engine.org) (BSD),
-  [Unicorn](https://www.unicorn-engine.org) (GPL 2.0; Python bindings BSD), [python-lz4](https://github.com/python-lz4/python-lz4)
-  (BSD), [cryptography](https://cryptography.io) (Apache 2.0 / BSD), [CPython](https://www.python.org) (PSF),
-  [Zig](https://ziglang.org) as C compiler (MIT; LLVM: Apache 2.0 with LLVM exceptions), Android NDK pieces (Apache 2.0)
-- Documentation: [Switchbrew](https://switchbrew.org), [envytools](https://github.com/envytools/envytools),
-  Atmosphère's kernel and file system sources, and the instruction decoders of Ryujinx and yuzu as references for
-  Maxwell and Horizon behaviour.
+- **[EoWRecomp original project](https://github.com/Nycolazs/EoWRecomp)** by **Nycolazs** — original project and foundation this fork builds upon.
+- **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai and contributors — the foundation for the recompiler, runtime, NVN implementation, Maxwell shader translator and Vulkan renderer.
+- [SDL 3](https://libsdl.org), [FFmpeg](https://ffmpeg.org), [Dear ImGui](https://github.com/ocornut/imgui), [Vulkan](https://www.vulkan.org), [volk](https://github.com/zeux/volk), [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator), [shaderc](https://github.com/google/shaderc), [SMAA](https://github.com/iryoku/smaa) and [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR).
+- Documentation and research references: [Switchbrew](https://switchbrew.org), [envytools](https://github.com/envytools/envytools), and the instruction decoders of Ryujinx and yuzu.
 
-This project is developed almost entirely with AI (Anthropic's Claude, through Claude Code), directed and tested by a
-human - the same way as the projects it is based on.
+This project is developed with AI-assisted tools under human direction and testing.
 
 ## Legal
 
-EoWRecomp is a fan project. It is not affiliated with, endorsed by or sponsored by Nintendo. *The Legend of Zelda* and
-*Echoes of Wisdom* are trademarks of Nintendo. No game files, game code, assets, keys or fonts are included - not in
-this repository and not in any build. The screenshots above are captures of the running game, shown for documentation.
-You must provide your own legally obtained copy of the game.
+EoWRecomp is an independent fan project and is not affiliated with, endorsed by, or sponsored by Nintendo. *The Legend of Zelda* and *Echoes of Wisdom* are trademarks of Nintendo. No game files, game code, assets or keys are included. You must provide your own legally obtained copy of the game.
 
 ## License
 
-EoWRecomp's own code is MIT licensed ([LICENSE](LICENSE), which keeps LAS Recomp's copyright notice). Third-party
-components keep their own licenses, listed above. The license covers EoWRecomp's code only - it grants nothing for
-Nintendo's game.
+EoWRecomp's original code is licensed under MIT. Third-party components retain their respective licenses. This license grants no rights to Nintendo's game or other copyrighted content.
