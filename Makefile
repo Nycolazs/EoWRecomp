@@ -126,7 +126,7 @@ LDFLAGS  := -fuse-ld=lld -Wl,--stack,16777216 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3
             $(if $(RELEASE),-Wl$(comma)--subsystem$(comma)windows)  # release: no console window (log -> eowrecomp.log)
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
-BACKEND_OBJ += $(if $(wildcard docs/icon/icon.ico),$(B)/rt/platform/windows_rc.o)  # the .exe's icon (none yet)
+BACKEND_OBJ += $(if $(WINCROSS),,$(if $(wildcard docs/icon/icon.ico),$(B)/rt/platform/windows_rc.o))  # the .exe's icon (native builds: windres; WINCROSS: zig compiles windows_manifest.rc, which carries the icon too - the runner has no windres)
 WINDRES  ?= windres
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
 UIFLAGS  := -x c++ $(OSFLAGS)  # the .mm UI sources are plain C++ apart from __APPLE__ blocks
@@ -189,9 +189,9 @@ $(B)/rt/%.o: runtime/%.m $(RT_HDRS)
 # linked to a temp file, then renamed over: a copy of the game still running keeps its (old) file - relinking in
 # place gets running copies killed by macOS (code signature of the changed pages). The temp file keeps the real name
 # (in a folder of its own): on Windows the import library records the name the game code library loads it by.
-$(EXE): $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ) $(IMGUI_OBJ) $(MANIFEST_RC) $(if $(MANIFEST_RC),runtime/platform/eowrecomp.manifest)
+$(EXE): $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ) $(IMGUI_OBJ) $(MANIFEST_RC) $(if $(MANIFEST_RC),runtime/platform/eowrecomp.manifest docs/icon/icon.ico)
 	@mkdir -p $(dir $@)link
-	$(CXX) -o $(dir $@)link/$(notdir $@) $(filter-out %.manifest,$^) $(LDFLAGS)
+	$(CXX) -o $(dir $@)link/$(notdir $@) $(filter-out %.manifest %.ico,$^) $(LDFLAGS)
 	mv -f $(dir $@)link/$(notdir $@) $@
 
 ifeq ($(PLATFORM),windows)

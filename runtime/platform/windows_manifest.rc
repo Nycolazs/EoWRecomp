@@ -1,3 +1,5 @@
 // The application manifest (eowrecomp.manifest): resource type 24 (RT_MANIFEST), ID 1. Linked into the .exe by the cross
 // build (Makefile, WINCROSS=1: zig compiles .rc files itself).
 1 24 "eowrecomp.manifest"
+// The .exe's icon (same one windows.rc embeds for the native build): ID 1, the first icon resource Explorer and the taskbar use.
+1 ICON "../../docs/icon/icon.ico"
