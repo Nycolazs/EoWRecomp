@@ -568,6 +568,14 @@ static const char *alayer(Ctx *c, const char *r, int slot, char *buf) {
 // reference or NULL, lod_kind 0 implicit / 1 level / 2 bias (lod), off: ivec2 texel offset or NULL.
 // GLSL offsets must be constants, so register offsets move the coordinates by offset / size of the level
 // (level 0 for implicit-LOD lookups). Non-fragment stages have no implicit LOD: level 0 (+ bias).
+// The texture reads the stencil aspect of a depth-stencil image (ShaderKey.stencil_tex, by handle slot).
+static bool tex_stencil(const Ctx *c, const ShaderTexture *t) {
+    if (!c->key || !c->key->stencil_tex || t->is_image || t->bindless || t->shadow || t->type != TEXTYPE_2D) return false;
+    if (t->handle_offset < 0x20) return false;
+    uint32_t s = (t->handle_offset - 0x20) / 8;
+    return s < 32 && (c->key->stencil_tex >> s & 1);
+}
+
 static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, const char *layer, const char *dref,
                         int lod_kind, const char *lod, const char *off) {
     if (c->fail) { strcpy(out, "vec4(0.0f)"); return; }  // e.g. a type conflict: tex[slot] is not this lookup's type
@@ -617,6 +625,7 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
     else if (lod_kind == 1) snprintf(e, sizeof e, "textureLod(t%d, %s%s, %s)", slot, P, ex, lod);
     else snprintf(e, sizeof e, "texture(t%d, %s%s, %s)", slot, P, ex, lod);
     if (t->shadow) sprintf(out, "vec4(%s)", e);
+    else if (tex_stencil(c, t)) sprintf(out, "uintBitsToFloat(%s)", e);  // usampler2D: uvec4 -> the raw bits as a vec4
     else strcpy(out, e);
 }
 
@@ -682,6 +691,11 @@ static bool glsl_texs(Ctx *c, uint64_t w, bool fetch, int *slot_out, char *call,
             sprintf(call, "texelFetch(t%d, ivec2(%s), int(%s))", slot, RSC2(c, slot, "uint2(int2(%s, %s) + int2(int(%s << 28) >> 28, int(%s << 24) >> 28))", A, A1, B1, B1), Bv); break;
         default: fail(c, "tlds info %d", info); return false;
         }
+    }
+    if (fetch && tex_stencil(c, &c->info->tex[slot])) {  // texelFetch on a usampler2D returns uvec4
+        char w_[1024];
+        snprintf(w_, sizeof w_, "uintBitsToFloat(%s)", call);
+        strcpy(call, w_);
     }
     *slot_out = slot;
     return true;
@@ -2080,7 +2094,8 @@ static const char glsl_prelude[] =
     "uint hpack(vec2 r, uint merge, uint old) { if (merge == 1u) return floatBitsToUint(r.x); uint lo = packHalf2x16(vec2(r.x, 0.0f)), hi = packHalf2x16(vec2(r.y, 0.0f)); if (merge == 2u) return (old & 0xFFFF0000u) | lo; if (merge == 3u) return (old & 0xFFFFu) | (hi << 16); return lo | (hi << 16); }\n"
     "uint prmt(uint a, uint b, uint sel) { uint r = 0u; for (uint i = 0u; i < 4u; i++) { uint s = (sel >> (i * 4u)) & 7u; uint bt = s < 4u ? (a >> (s * 8u)) & 0xFFu : (b >> ((s - 4u) * 8u)) & 0xFFu; r |= bt << (i * 8u); } return r; }\n";
 
-static const char *glsl_sampler_type(const ShaderTexture *t) {
+static const char *glsl_sampler_type(const Ctx *c, const ShaderTexture *t) {
+    if (tex_stencil(c, t)) return "usampler2D";
     static const char *const names[][2] = {
         {"sampler1D", "sampler1DShadow"}, {"sampler2D", "sampler2DShadow"}, {"sampler3D", "sampler3D"},
         {"samplerCube", "samplerCubeShadow"}, {"sampler2DArray", "sampler2DArrayShadow"},
@@ -2138,7 +2153,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             sp(&s, "layout(set = %d, binding = %d) uniform writeonly image2D t%d;\n", set, 32 + i, i);
             continue;
         }
-        sp(&s, "layout(set = %d, binding = %d) uniform %s t%d;\n", set, 32 + i, glsl_sampler_type(t), i);
+        sp(&s, "layout(set = %d, binding = %d) uniform %s t%d;\n", set, 32 + i, glsl_sampler_type(c, t), i);
         // size of level l as (width, height, depth or layers)
         switch (t->type) {
         case TEXTYPE_1D: sp(&s, "ivec3 tsize%d(int l) { return ivec3(textureSize(t%d, l), 1, 1); }\n", i, i); break;
