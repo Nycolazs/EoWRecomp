@@ -137,7 +137,8 @@ jobs:
 
       - name: Montar o pacote
         run: |
-          OUT=EoWRecomp
+          mkdir dist
+          OUT=dist/EoWRecomp
           cp -r pkg-in/exe/EoWRecomp "$OUT"
           cp pkg-in/exe/eowrecomp.lib "$OUT/eowrecomp.dll.a"  # (a biblioteca de importação, com o nome que gamebuild.c procura)
           cp -r pkg-in/eowgen "$OUT/eowgen"
@@ -148,14 +149,12 @@ jobs:
           for f in eowrecomp.exe eowrecomp.dll.a eowgen/eowgen.exe zig/zig.exe gamelib-src/cpu.h gamelib-src/hle_symbols.txt; do
             [ -f "$OUT/$f" ] || { echo "falta $OUT/$f"; exit 1; }
           done
-          zip -qr EoWRecomp-windows-x64.zip "$OUT"
-          sha256sum EoWRecomp-windows-x64.zip | tee SHA256SUMS.txt
-          du -sh "$OUT" EoWRecomp-windows-x64.zip
+          du -sh "$OUT"
 
       - uses: actions/upload-artifact@v4
         with:
+          # the folder itself, not a .zip inside the artifact's own .zip: one download, one extract, and the files are in an
+          # EoWRecomp/ folder (the artifact root is dist/, so the folder name is kept)
           name: EoWRecomp-windows-x64
-          path: |
-            EoWRecomp-windows-x64.zip
-            SHA256SUMS.txt
+          path: dist
           if-no-files-found: error
