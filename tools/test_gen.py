@@ -29,6 +29,8 @@ CASES = [
     ('table, br right after', [ADR_X10, LDRH, ADD, BR_X10], True),
     # main 7001a657e0: four moves scheduled between the add and the br (7 instructions: past the old window of 6)
     ('table, br 7 instructions on', [ADR_X10, LDRH, ADD, MOV, MOV, MOV, MOV, BR_X10], True),
+    # main 70018100d0: 17 instructions (FP math) between them
+    ('table, br 17 instructions on', [ADR_X10, LDRH, ADD] + [MOV] * 13 + [BR_X10], True),
     ('callback passed to a call', [ADR_X1, BL, BR_X1], False),
     ('conditional branch first', [ADR_X10, LDRH, ADD, BCOND, BR_X10], False),
     ('register overwritten', [ADR_X10, MOV_X10, BR_X10], False),
