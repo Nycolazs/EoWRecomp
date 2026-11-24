@@ -1,6 +1,7 @@
 // Windows host layer (runtime/platform.h).
 #include <windows.h>
 #include "cpu_check.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -323,6 +324,13 @@ static ssize_t prw(int fd, void *buf, size_t n, off_t off, bool write) {
 }
 ssize_t pread(int fd, void *buf, size_t n, off_t off) { return prw(fd, buf, n, off, false); }
 ssize_t pwrite(int fd, const void *buf, size_t n, off_t off) { return prw(fd, (void *)buf, n, off, true); }
+#undef rename
+int plat_rename(const char *from, const char *to) {  // (ANSI paths, as the CRT's open / fopen / rename take them)
+    if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING)) return 0;
+    DWORD e = GetLastError();
+    errno = e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND ? ENOENT : e == ERROR_ALREADY_EXISTS ? EEXIST : EACCES;
+    return -1;
+}
 
 // ---- child processes
 PlatProc plat_spawn(const char *const argv[], const char *log_path, bool append_log) {
