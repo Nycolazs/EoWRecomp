@@ -133,8 +133,10 @@ GAMELIB  := $(B)/eowgame.dll
 # the runtime functions it calls (RT_API in runtime/cpu.h): exported by the .exe, imported through an import library
 # made from tools/windows/eowrecomp.def
 IMPLIB   := $(B)/eowrecomp.lib
-GAMELIB_LDFLAGS := -shared -fuse-ld=lld $(IMPLIB) -Wl,--out-implib,$(B)/eowgame.dll.lib  # (its own import library, unused:
-                   # left to lld it was written over eowrecomp.lib, and the next library link failed: rt_dispatch undefined)
+GAMELIB_LDFLAGS := -shared -fuse-ld=lld
+# after the objects: zig names the library's own import library after its first input (--out-implib is ignored).
+# Listed first, eowrecomp.lib was overwritten by eowgame.dll's, and the next link failed (rt_dispatch undefined).
+GAMELIB_LIBS := $(IMPLIB)
 GAMELIB_SHARED := -shared  # (+ the import library: runtime/gamebuild.c)
 endif
 
@@ -203,7 +205,7 @@ endif
 
 # its id file (<library>.id) says what it was built from without loading it (runtime/gamelib.c)
 $(GAMELIB): $(GEN_OBJ) | $(EXE)
-	$(CC) $(GAMELIB_LDFLAGS) -o $@.tmp $(GEN_OBJ)
+	$(CC) $(GAMELIB_LDFLAGS) -o $@.tmp $(GEN_OBJ) $(GAMELIB_LIBS)
 	mv -f $@.tmp $@
 	echo $(GAMELIB_ID) > $@.id
 
