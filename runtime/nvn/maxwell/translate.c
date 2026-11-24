@@ -920,13 +920,18 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int n = sz == 5 ? 2 : 1;
         char rb[16];
         const char *dyn = a == RZ ? NULL : reg(c, a, rb);
+        // LDC.64 R6, c[i][R6 + x]: the address is read once, before either destination is written. Reading it again
+        // for the second word took it from the first word's value (Link's 4-bone skinning got bone 4's z translation
+        // from a junk offset: his body stretched into a strip across the screen).
+        bool alias = dyn && n > 1 && a >= d && a < d + n;
+        if (alias) sp(&c->body, "    { uint ldc_a = %s;\n", dyn), dyn = "ldc_a";
         for (int i = 0; i < n; i++) {
             char cb[256];
             cbuf_ref(c, idx, off + 4 * i, dyn, cb);
-            if (!dyn && (off + 4 * i) & 0) {}
             if (dyn) c->info->cbuf_size[idx] = 0x10000;
             set_reg(c, d + i, cb);
         }
+        if (alias) sp(&c->body, "    }\n");
     } else if (OPM(0xd000000000000000ull, 0xf600000000000000ull)) {  // TEXS
         emit_texs(c, w, false);
     } else if (OPM(0xd200000000000000ull, 0xf600000000000000ull)) {  // TLDS
