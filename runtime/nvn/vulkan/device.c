@@ -262,6 +262,7 @@ static void create_device(void) {
 void vk_pipeline_cache_save(void) {
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&lock);
+    uint64_t t0 = SDL_GetTicksNS();
     size_t sz = 0;
     if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz) { pthread_mutex_unlock(&lock); return; }
     void *data = malloc(sz);
@@ -275,6 +276,7 @@ void vk_pipeline_cache_save(void) {
         }
     }
     free(data);
+    LOG("[vk] pipeline cache saved: %.1f MB in %.0f ms\n", sz / 1048576.0, (SDL_GetTicksNS() - t0) / 1e6);
     pthread_mutex_unlock(&lock);
 }
 
