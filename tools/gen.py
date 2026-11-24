@@ -483,16 +483,24 @@ class Module:
 from patches import PATCHES
 
 
-def adr_feeds_br(m, i, rd, window=6):
+def adr_feeds_br(m, i, rd, window=16):
     """ADR whose register reaches a `br` within a few instructions: the base of a compact jump table's cases
     (LLVM: adr xB, cases ; ldrb/ldrh wO, [table, idx] ; add xB, xB, xO, lsl #2 ; br xB), code inside the same
     function - not a callback. Treating it as a function start split the function at its cases, so its table
-    couldn't be resolved (main: 71 tables resolved, 1832 left to the all-instruction fallback)."""
+    couldn't be resolved (main: 71 tables resolved, 1832 left to the all-instruction fallback).
+    The scheduler can put unrelated moves between them: main 7001a657e0 has its `br` 7 instructions after the `adr`
+    (the window was 6) - its cases became a function, and case 8 ended in "no function at 7001a65870" after the
+    Ganon fight (46 tables across main / sdk / subsdk). The scan stops at any other branch, call or return, so an
+    address passed to a call stays a function start."""
     regs = {rd}
     for k in range(i + 1, min(i + 1 + window, len(m.words))):
         w = m.words[k]
         if (w & 0xFFFFFC1F) == 0xD61F0000:  # br xN
             return ((w >> 5) & 31) in regs
+        if (w & 0x7C000000) == 0x14000000 or (w & 0xFE000000) == 0xD6000000:  # b / bl, br / blr / ret
+            return False
+        if (w & 0x7E000000) in (0x34000000, 0x36000000) or (w & 0xFF000010) == 0x54000000:  # cbz / tbz / b.cond
+            return False
         if (w & 0x7F200000) == 0x0B000000 and ((w >> 5) & 31) in regs:  # add (shifted register) from a tracked reg
             regs.add(w & 31)
         elif (w & 31) in regs and (w & 0x7F200000) != 0x0B000000:
