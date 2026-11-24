@@ -133,7 +133,8 @@ GAMELIB  := $(B)/eowgame.dll
 # the runtime functions it calls (RT_API in runtime/cpu.h): exported by the .exe, imported through an import library
 # made from tools/windows/eowrecomp.def
 IMPLIB   := $(B)/eowrecomp.lib
-GAMELIB_LDFLAGS := -shared -fuse-ld=lld $(IMPLIB)
+GAMELIB_LDFLAGS := -shared -fuse-ld=lld $(IMPLIB) -Wl,--out-implib,$(B)/eowgame.dll.lib  # (its own import library, unused:
+                   # left to lld it was written over eowrecomp.lib, and the next library link failed: rt_dispatch undefined)
 GAMELIB_SHARED := -shared  # (+ the import library: runtime/gamebuild.c)
 endif
 
