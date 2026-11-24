@@ -65,6 +65,12 @@ static inline char *strsep(char **sp, const char *delim) {
 static inline int plat_mkdir(const char *p, int mode) { (void)mode; return _mkdir(p); }
 #define mkdir(p, m) plat_mkdir(p, m)
 
+// POSIX rename(from, to): replaces an existing `to` (the CRT's fails with EEXIST, which broke every write-to-tmp
+// then rename-over update: romfs.src on a second setup, eowgame.dll on a rebuild).
+#include <stdio.h>
+int plat_rename(const char *from, const char *to);
+#define rename(a, b) plat_rename(a, b)
+
 // realpath(path, out[PATH_MAX]): absolute form of an existing path (links not resolved; callers check them).
 #ifndef PATH_MAX
 #define PATH_MAX 260

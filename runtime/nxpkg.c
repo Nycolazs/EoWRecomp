@@ -5,6 +5,7 @@
 //   -> PFS0 (ExeFS) / RomFS.
 // Hashes are not verified (the files are the player's own dump; a bad one shows up as a game error).
 #include "nxpkg.h"
+#include "platform.h"  // (Windows: pread, mkdir(path, mode))
 
 #include <errno.h>
 #include <fcntl.h>
