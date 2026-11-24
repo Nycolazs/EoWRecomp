@@ -78,6 +78,10 @@ typedef struct NvnWindow {
     uint64_t textures[8];  // guest NVNtexture*
     int num, active, interval, next;
     int crop[4];
+    // The display queue (objects.c nvnQueuePresentTexture): the vsync (hle/vi.c's count) each texture is free again
+    // from - when a newer one is shown, as the Switch's buffer queue releases it - and the front texture's own.
+    uint64_t free_at[8], shown_at;
+    int front;  // texture on screen, -1 none
 } NvnWindow;
 
 typedef struct NvnSync {

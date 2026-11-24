@@ -10,6 +10,28 @@ static KEvent *vsync_event;
 uint32_t vi_vsync_handle(void) { return vsync_r; }
 volatile uint64_t g_vsync_count;  // vsyncs signalled so far (runtime/hle/framepace.c)
 uint64_t g_native_window;
+static pthread_mutex_t vsync_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t vsync_cond = PTHREAD_COND_INITIALIZER;
+
+uint64_t vi_vsync_count(void) { return __atomic_load_n(&g_vsync_count, __ATOMIC_ACQUIRE); }
+
+// Block until vsync n has been signalled (nvn/objects.c: the window's display queue). Counted as blocked time, as a
+// kernel wait is (the frame pacer's busy time, nvn/vulkan/exec.c); gives up when guest threads are being stopped.
+void vi_wait_vsync(uint64_t n) {
+    if (vi_vsync_count() >= n) return;
+    extern __thread uint64_t g_blocked_ns;
+    uint64_t t0 = plat_now_ns();
+    pthread_mutex_lock(&vsync_lock);
+    while (vi_vsync_count() < n && !g_rt_unwind) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 50000000;  // (re-check the unwind flag now and then)
+        if (ts.tv_nsec >= 1000000000) ts.tv_sec++, ts.tv_nsec -= 1000000000;
+        pthread_cond_timedwait(&vsync_cond, &vsync_lock, &ts);
+    }
+    pthread_mutex_unlock(&vsync_lock);
+    g_blocked_ns += plat_now_ns() - t0;
+}
 
 static void *vsync_thread(void *arg) {
     (void)arg;
@@ -25,7 +47,10 @@ static void *vsync_thread(void *arg) {
             if (warned++ < 20) LOG("[vi] vsync timer late by %llums (host throttling?)\n", (unsigned long long)((now - next) / 1000000));
             next = now;  // don't burst-signal to catch up
         }
-        __atomic_add_fetch(&g_vsync_count, 1, __ATOMIC_RELAXED);
+        pthread_mutex_lock(&vsync_lock);
+        __atomic_add_fetch(&g_vsync_count, 1, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&vsync_cond);
+        pthread_mutex_unlock(&vsync_lock);
         pthread_mutex_lock(&g_klock);
         kernel_signal(vsync_event);
         pthread_mutex_unlock(&g_klock);

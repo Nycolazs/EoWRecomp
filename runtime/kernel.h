@@ -62,3 +62,7 @@ void kernel_signal(KObject *o);  // caller holds g_klock
 KEvent *kernel_create_event_pair(uint32_t *writable, uint32_t *readable);
 KThread *kernel_current_thread(void);
 uint64_t kernel_heap_size(void);  // bytes from HEAP_BASE set by SetHeapSize
+
+// hle/vi.c: the emulated 60 Hz vsync - signalled so far, and wait until vsync n (nvn/objects.c's window queue)
+uint64_t vi_vsync_count(void);
+void vi_wait_vsync(uint64_t n);
