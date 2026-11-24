@@ -1219,11 +1219,15 @@ static void translate_program(void *arg) {
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
     pthread_mutex_lock(&translate_lock);
+    // c[1] (BRX jump tables) follows the code when the program gave its constants' offset (cmax is that offset)
+    maxwell_cb1 = p->cmax[0] != 0x10000 ? (const uint8_t *)(uintptr_t)(p->code[0] + p->cmax[0]) : NULL;
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
+        maxwell_cb1 = p->cmax[1] != 0x10000 ? (const uint8_t *)(uintptr_t)(p->code[1] + p->cmax[1]) : NULL;
         p->fi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[1], p->cmax[1], STAGE_FRAGMENT, &p->fkey);
     }
+    maxwell_cb1 = NULL;
     pthread_mutex_unlock(&translate_lock);
     if (!p->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", p->vi->error, (unsigned long long)p->code[0]);
@@ -2465,7 +2469,9 @@ static CsProg *compute_program(NvnProgram *np) {
     ShaderKey k = {0};
     k.glsl = 1;
     pthread_mutex_lock(&translate_lock);
+    maxwell_cb1 = ss->const_offset ? (const uint8_t *)(uintptr_t)(ss->code_addr + ss->const_offset) : NULL;
     cp->si = maxwell_translate((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k);
+    maxwell_cb1 = NULL;
     pthread_mutex_unlock(&translate_lock);
     cp->p.vi = cp->si;
     if (!cp->si->msl) {

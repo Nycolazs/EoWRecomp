@@ -23,6 +23,8 @@
 #include "shader.h"
 
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
+const uint8_t *maxwell_cb1;
+
 // Iteration limit of a branching shader's dispatch loop (a mistranslated branch can't hang the GPU forever).
 // EOWRECOMP_SHADER_GUARD overrides it (backends read it): a small one shows which shaders loop.
 uint32_t maxwell_loop_guard = 100000;
@@ -117,6 +119,44 @@ static const char *reg(Ctx *c, int r, char *buf) {
 #define R(r) reg(c, (r), alloca(16))
 #define F(expr) fmt_f(alloca(512), (expr))
 static char *fmt_f(char *b, const char *e) { sprintf(b, "as_type<float>(%s)", e); return b; }
+
+// BRX Ra + imm whose Ra was just loaded from a jump table in c[1] (the compiler's switch: IMNMX clamp, SHL by 2,
+// LDC c[1][idx + table], BRX): mark the table's targets. Every instruction was a label before - a switch over all
+// ~1300 instructions of a shader, which NVIDIA's compiler took 10-30 s a pipeline to build (Hyrule Castle Town
+// stayed black for ~15 s on first entry: its draws wait for their pipelines). The table is read from its start while
+// its words give aligned targets inside the program - the real entries are such a run, so none is missed (a word
+// past the end that happens to qualify only adds a label). false: not that pattern, the caller labels everything.
+static bool brx_table_targets(const uint64_t *code, size_t i, size_t end, uint8_t *label) {
+    if (!maxwell_cb1) return false;
+    uint64_t w = code[i];
+    int ra = (int)bits(w, 8, 8);
+    if (ra == RZ) return false;
+    // the last instruction before it naming Ra as its destination must be the LDC (32-bit, c[1], dynamic index)
+    int64_t off = -1;
+    for (size_t k = i, n = 0; k-- > 0 && n < 12;) {
+        if (k % 4 == 0) continue;
+        n++;
+        uint64_t x = code[k];
+        if ((int)bits(x, 0, 8) != ra) continue;
+        bool ldc = (x & 0xfff8000000000000ull) == 0xef90000000000000ull;
+        if (!ldc || bits(x, 36, 5) != 1 || bits(x, 48, 3) != 4 || bits(x, 8, 8) == RZ) return false;
+        off = (int64_t)bits(x, 20, 16);
+        break;
+    }
+    if (off < 0) return false;
+    uint32_t pc = (uint32_t)(i * 8);
+    int64_t imm = sbits(w, 20, 24);
+    int n = 0;
+    for (; n < 256; n++) {
+        uint32_t v;
+        memcpy(&v, maxwell_cb1 + off + 4 * n, 4);
+        uint32_t t = pc + 8u + v + (uint32_t)imm;
+        if (((t >> 3) & 3u) == 0u) t += 8u;  // (as the BRX itself: a scheduling word's slot runs the next one)
+        if (t % 8 || t / 8 >= end) break;
+        label[t / 8] = 1;
+    }
+    return n > 0;
+}
 
 static const char *pred(Ctx *c, int p, bool neg, char *buf) {
     if (p == PT) return neg ? "false" : "true";
@@ -920,13 +960,18 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int n = sz == 5 ? 2 : 1;
         char rb[16];
         const char *dyn = a == RZ ? NULL : reg(c, a, rb);
+        // LDC.64 R6, c[i][R6 + x]: the address is read once, before either destination is written. Reading it again
+        // for the second word took it from the first word's value (Link's 4-bone skinning got bone 4's z translation
+        // from a junk offset: his body stretched into a strip across the screen).
+        bool alias = dyn && n > 1 && a >= d && a < d + n;
+        if (alias) sp(&c->body, "    { uint ldc_a = %s;\n", dyn), dyn = "ldc_a";
         for (int i = 0; i < n; i++) {
             char cb[256];
             cbuf_ref(c, idx, off + 4 * i, dyn, cb);
-            if (!dyn && (off + 4 * i) & 0) {}
             if (dyn) c->info->cbuf_size[idx] = 0x10000;
             set_reg(c, d + i, cb);
         }
+        if (alias) sp(&c->body, "    }\n");
     } else if (OPM(0xd000000000000000ull, 0xf600000000000000ull)) {  // TEXS
         emit_texs(c, w, false);
     } else if (OPM(0xd200000000000000ull, 0xf600000000000000ull)) {  // TLDS
@@ -2111,10 +2156,10 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
                 }
             }
         }
-        if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) {  // BRX: any instruction may be a target
+        if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) {  // BRX: its jump table's targets, or any instruction
             any_branch = true;
             forward = false;
-            memset(label, 1, end);
+            if (!brx_table_targets((const uint64_t *)code, i, end, label)) memset(label, 1, end);
         }
         if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull || (w & 0xfff0000000000000ull) == 0xe340000000000000ull ||
             (w & 0xfff0000000000000ull) == 0xe350000000000000ull)
