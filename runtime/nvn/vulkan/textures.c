@@ -13,7 +13,7 @@
 #include "../texpatch.h"
 
 // ================================================================== formats
-typedef struct { VkFormat vf; uint8_t expand_rgb, alpha_one; } VkFmt;
+typedef struct { VkFormat vf; uint8_t expand_rgb, alpha_one, swap_rb; } VkFmt;  // swap_rb: sampled views swap R and B
 
 // DEPTH24_STENCIL8 as itself where the GPU has it for everything the game does with depth (NVIDIA, Intel): half the
 // bytes of D32_SFLOAT_S8_UINT (4 instead of 8 per pixel) for every depth test, clear and copy - the game copies its
@@ -32,6 +32,23 @@ static VkFormat depth24_stencil8(void) {
         LOG("[vk] depth24 stencil8: %s\n", ok ? "D24_UNORM_S8_UINT" : "D32_SFLOAT_S8_UINT");
     }
     return f;
+}
+
+// NVN RGB565 (0x3C) keeps red in the low 5 bits, like Metal's B5G6R5Unorm (metal.m) and Vulkan's B5G6R5_UNORM_PACK16;
+// it was mapped to R5G6B5_UNORM_PACK16 (red in the high bits), which swapped red and blue. The life hearts sample a
+// 565 mask whose red and green make the alpha: the hearts came out clear on a solid red block (also in the session-2
+// Linux screenshot). B5G6R5 isn't required for sampling by Vulkan: where it's missing, R5G6B5 with R and B swapped
+// in the view.
+static VkFmt rgb565(void) {
+    static int ok = -1;
+    if (ok < 0) {
+        VkFormatProperties p;
+        vkGetPhysicalDeviceFormatProperties(g_vk.phys, VK_FORMAT_B5G6R5_UNORM_PACK16, &p);
+        VkFormatFeatureFlags want = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        ok = (p.optimalTilingFeatures & want) == want;
+        if (!ok) LOG("[vk] no B5G6R5 textures: RGB565 as R5G6B5 with red and blue swapped in its views\n");
+    }
+    return ok ? (VkFmt){VK_FORMAT_B5G6R5_UNORM_PACK16} : (VkFmt){VK_FORMAT_R5G6B5_UNORM_PACK16, 0, 0, 1};
 }
 
 static VkFmt fmt_of(uint32_t f) {
@@ -84,7 +101,7 @@ static VkFmt fmt_of(uint32_t f) {
     case 0x39: return (VkFmt){VK_FORMAT_R4G4B4A4_UNORM_PACK16};   // Metal ABGR4Unorm
     case 0x3A: return (VkFmt){VK_FORMAT_R5G6B5_UNORM_PACK16};     // Metal B5G6R5Unorm
     case 0x3B: return (VkFmt){VK_FORMAT_R5G5B5A1_UNORM_PACK16};   // Metal A1BGR5Unorm
-    case 0x3C: return (VkFmt){VK_FORMAT_R5G6B5_UNORM_PACK16};
+    case 0x3C: return rgb565();                                   // Metal B5G6R5Unorm
     case 0x3D: return (VkFmt){VK_FORMAT_A2B10G10R10_UNORM_PACK32};
     case 0x3E: return (VkFmt){VK_FORMAT_A2B10G10R10_UINT_PACK32};
     case 0x3F: return (VkFmt){VK_FORMAT_B10G11R11_UFLOAT_PACK32};
@@ -717,6 +734,13 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
                                       (VkComponentSwizzle)(c[3] + 1)};
         } else if (fmt_of(t->format).alpha_one) {
             sw.a = VK_COMPONENT_SWIZZLE_ONE;
+        }
+        if (fmt_of(t->format).swap_rb) {  // (rgb565: the data's red is in the image's blue channel)
+            VkComponentSwizzle *m[4] = {&sw.r, &sw.g, &sw.b, &sw.a};
+            for (int i = 0; i < 4; i++) {
+                VkComponentSwizzle x = *m[i] == VK_COMPONENT_SWIZZLE_IDENTITY ? (VkComponentSwizzle)(VK_COMPONENT_SWIZZLE_R + i) : *m[i];
+                *m[i] = x == VK_COMPONENT_SWIZZLE_R ? VK_COMPONENT_SWIZZLE_B : x == VK_COMPONENT_SWIZZLE_B ? VK_COMPONENT_SWIZZLE_R : x;
+            }
         }
     }
     VkImageViewType want = view_type_for(want_textype);
