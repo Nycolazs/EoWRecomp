@@ -660,8 +660,9 @@ NVN(nvnWindowInitialize) {
     memcpy(w->textures, (void *)(uintptr_t)G(uint64_t, A(1), 0x18), w->num * 8);
     w->interval = (int)G(uint32_t, A(1), 0x20);
     w->active = G(uint32_t, A(1), 0x24) ? (int)G(uint32_t, A(1), 0x24) : w->num;
+    w->front = -1;
     SET_HOST(A(0), w);
-    LOG("[nvn] window with %d textures\n", w->num);
+    LOG("[nvn] window with %d textures (%d active), present interval %d\n", w->num, w->active, w->interval);
     RET(1);
 }
 NVN(nvnWindowFinalize) { (void)c; }
@@ -675,17 +676,24 @@ NVN(nvnWindowGetPresentInterval) { RET(WIN->interval); }
 NVN(nvnWindowSetPresentInterval) { WIN->interval = (int)A(1); }
 NVN(nvnWindowSetCrop) { int *cr = WIN->crop; cr[0] = (int)A(1); cr[1] = (int)A(2); cr[2] = (int)A(3); cr[3] = (int)A(4); }
 NVN(nvnWindowGetCrop) { memcpy(AP(1), WIN->crop, 16); }
+// The Switch's window paces the game: a presented texture is shown at a vsync, at least `interval` vsyncs after the
+// one before it, and stays on screen until a newer one is shown; acquiring a texture that is queued or on screen
+// blocks until then. Without that the game ran as fast as the host could present (117 fps on an RTX 3070, the world
+// at ~2x speed: its own vsync waits don't hold every frame) - unseen while every GPU was slower than 60 fps.
+static void window_acquire(NvnWindow *w, int32_t *out) {
+    int i = w->next;
+    w->next = (w->next + 1) % (w->active ? w->active : 1);
+    if (i != w->front) vi_wait_vsync(w->free_at[i]);  // (the one on screen: only a newer present frees it - none comes)
+    *out = i;
+}
 NVN(nvnWindowAcquireTexture) {
     NvnWindow *w = WIN;
+    window_acquire(w, AP(2));
     if (A(1)) sync_of(A(1))->signaled = 1;
-    *(int32_t *)AP(2) = w->next;
-    w->next = (w->next + 1) % (w->active ? w->active : 1);
     RET(0);  // NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS
 }
 NVN(nvnQueueAcquireTexture) {
-    NvnWindow *w = HOST(NvnWindow, A(1));
-    *(int32_t *)AP(2) = w->next;
-    w->next = (w->next + 1) % (w->active ? w->active : 1);
+    window_acquire(HOST(NvnWindow, A(1)), AP(2));
     RET(0);
 }
 NVN(nvnQueuePresentTexture) {
@@ -693,7 +701,14 @@ NVN(nvnQueuePresentTexture) {
     int i = (int)A(2);
     static int first = 1;  // (milestone marker: the game got as far as showing a frame)
     if (first) { first = 0; LOG("[nvn] first nvnQueuePresentTexture (window %llx, texture %d of %d)\n", A(1), i, w->num); }
-    if (i >= 0 && i < w->num) backend_present(HOST(NvnTexture, w->textures[i]));
+    if (i < 0 || i >= w->num) return;
+    // shown at the next vsync, `interval` after the texture before it (0: at once); that one is free from then
+    uint64_t now = vi_vsync_count(), at = w->interval > 0 ? now + 1 : now;
+    if (w->front >= 0 && w->interval > 0 && at < w->shown_at + (uint64_t)w->interval) at = w->shown_at + (uint64_t)w->interval;
+    if (w->front >= 0 && w->front != i) w->free_at[w->front] = at;
+    w->free_at[i] = UINT64_MAX;  // (until a newer one replaces it)
+    w->front = i, w->shown_at = at;
+    backend_present(HOST(NvnTexture, w->textures[i]));
 }
 
 // ================================================================== small state objects
