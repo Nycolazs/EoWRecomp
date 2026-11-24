@@ -87,6 +87,9 @@ typedef struct {
 #define GMAP_MAX 16  // ranges in the table (GMap { uvec4 gmap[GMAP_MAX + 1]; }: [i] = addr lo, addr hi, size, word offset;
                      // [GMAP_MAX].x = count)
 extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
+// The program's compiler constants (c[1], after its code), when the caller knows them: BRX jump tables are read from
+// there so only their targets become labels. NULL: every instruction may be a BRX target (as before).
+extern const uint8_t *maxwell_cb1;
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;
