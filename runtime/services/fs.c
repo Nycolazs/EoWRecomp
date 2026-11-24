@@ -355,6 +355,19 @@ const char *romfs_file_at(uint64_t off) {
     return NULL;
 }
 
+// A RomFS file by path ("region_common/movie/x.webm"): its offset in the image and size, once the game has opened the
+// RomFS (hle/movie.c: the movie player reads through here - the image can be the package itself, with no loose files)
+bool romfs_file_find(const char *path, uint64_t *off, uint64_t *size) {
+    for (int i = 0; i < rom_nfiles; i++)
+        if (!strcmp(rom_files[i].path, path)) { *off = rom_files[i].off, *size = rom_files[i].size; return true; }
+    return false;
+}
+
+// RomFS image bytes [off, off+n), as the game's own storage reads see them (mods included)
+ssize_t romfs_image_read(void *dst, uint64_t n, uint64_t off) {
+    return romfs_fd < 0 ? -1 : romfs_read(romfs_fd, dst, n, off);
+}
+
 // ------------------------------------------------------------------ IStorage (raw RomFS image)
 typedef struct { int fd; uint64_t size; } Storage;
 
