@@ -37,6 +37,7 @@ uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
 #define PROF_T0() uint64_t prof_t0_ = prof ? SDL_GetTicksNS() : 0
 #define PROF_ADD(v) do { if (prof) v += SDL_GetTicksNS() - prof_t0_; } while (0)
 static _Atomic int stat_compiles;
+static _Atomic int pcache_new;  // pipelines built since the pipeline cache was last saved
 static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
 static char stats_text[2048];
@@ -711,6 +712,21 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
     last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits;
 }
 
+// The pipeline cache was only written at a clean exit: a session that froze or was killed lost every pipeline it had
+// built, and the next run compiled them all again - draws wait for their pipeline (skipped meanwhile), so objects
+// showed up late on first sight (the user's relaunch after a freeze: 493 programs pending at once). Now it is also
+// saved in the background, at most once a minute, while new pipelines appear.
+static void pcache_save_job(void *a) { (void)a; extern void vk_pipeline_cache_save(void); vk_pipeline_cache_save(); }
+static void pcache_tick(void) {
+    static uint64_t last;
+    uint64_t now = SDL_GetTicksNS();
+    if (!last) last = now;
+    if (now - last < 60000000000ull || !atomic_load(&pcache_new)) return;
+    last = now;
+    atomic_store(&pcache_new, 0);
+    run_job(pcache_save_job, NULL);
+}
+
 const char *renderer_stats(void) {
     static int dumps;
     if (dumps++ < 3) {
@@ -724,6 +740,7 @@ const char *renderer_stats(void) {
              (unsigned long long)stat_dispatches, (unsigned long long)stat_flushes, (double)stat_wait_ns / 1e6,
              atomic_exchange(&stat_compiles, 0), (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0);
     stat_feedback_copies = stat_upload_bytes = 0;
+    pcache_tick();
     if (stat_skipped) {
         size_t n = strlen(stats_text);
         n += snprintf(stats_text + n, sizeof stats_text - n, " | skipped:");
@@ -1537,6 +1554,7 @@ static void build_pipeline(void *arg) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
     }
+    else atomic_fetch_add(&pcache_new, 1);
     atomic_fetch_add(&stat_compiles, 1);
     atomic_store(&pp->state, r == VK_SUCCESS ? 1 : 2);
 }
@@ -2445,6 +2463,7 @@ static void build_compute(void *arg) {
                                                 .pSpecializationInfo = &spec},
                                       .layout = cp->p.layout};
     VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
+    if (r == VK_SUCCESS) atomic_fetch_add(&pcache_new, 1);
     atomic_fetch_add(&stat_compiles, 1);
     atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
     if (r != VK_SUCCESS) LOG("[compute] pipeline failed: %d\n", r);
